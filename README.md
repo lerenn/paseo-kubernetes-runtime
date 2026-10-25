@@ -93,6 +93,13 @@ for `CLAUDE_CODE_OAUTH_TOKEN`. New workspace gets a **Pod** location (with the b
 Settings and the credential flags that were kept under the plugin's old id `kube-agents` are copied over on first
 start (originals backed up under `~/.paseo/backups/`, never overwritten, never deleted).
 
+## Pod image
+
+The default image is built from `image/Dockerfile` (node 22, git, gh, jq, ripgrep, claude, codex) by the `image` workflow and
+published to `ghcr.io/lerenn/paseo-kubernetes-runtime-default`; `DEFAULT_IMAGE` in `shared/settings.ts` pins it by digest
+(the workflow prints the new digest in its summary). A custom image needs node and git; claude, codex and a verified jq are
+installed on first use when missing.
+
 ## Cluster requirements
 
 See [docs/rbac-and-network.md](docs/rbac-and-network.md): Role for the daemon ServiceAccount, the credentials Secret,
