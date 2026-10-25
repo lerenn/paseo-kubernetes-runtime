@@ -188,6 +188,14 @@ describe("inherited runtimes and command execs", () => {
     expect((t.kube.applied[0] as any).metadata.annotations["paseo.sh/cwd"]).toBe("/home/me/.paseo/worktrees/x/feature");
   });
 
+  it("a workspace created with just the runtime id (no options) uses its own directory", async () => {
+    const seen: string[] = [];
+    const t = setup({}, { seeder: async (cwd: string) => (seen.push(cwd), fakeSeeder(cwd, null, "main")) });
+    await t.reg.create!({ workspaceId: "wks_bare", cwd: "/home/me/other" } as never, t.ctx);
+    await t.reg.prepare!({ workspaceId: "wks_bare", workspaceCwd: "/home/me/other", purpose: "session", argv: ["claude"], env: {}, mcpServers: {} } as never, t.ctx);
+    expect(seen).toEqual(["/home/me/other"]);
+  });
+
   it("runs Git-style commands without a prepare, never installs a CLI for them, and does not wake a suspended pod for a background refresh", async () => {
     const t = setup({ podIdleMinutes: 30 });
     const exec = (over: object) => t.reg.exec!({ ...t.base, purpose: "command", argv: ["git", "status"], env: {}, ...over } as never, t.ctx);

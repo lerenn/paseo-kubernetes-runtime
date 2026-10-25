@@ -186,8 +186,12 @@ export class KubernetesRuntime {
   }
 
   private workspace(request: WorkspaceRuntimeWorkspaceRequest): WorkspaceState {
-    const given = parseRuntimeOptions(request.options);
     let ws = this.states.get(request.workspaceId);
+    // A workspace created with just `--runtime kubernetes` has no options: its directory is all there is.
+    const dir = request.workspaceCwd ?? request.cwd;
+    const given: RuntimeOptions = request.options
+      ? parseRuntimeOptions(request.options)
+      : parseRuntimeOptions({ cwd: ws?.options.cwd ?? dir, slug: ws?.options.slug ?? (dir ? slugFor(dir) : undefined), ref: null });
     // A workspace that inherited its runtime from the caller comes with the caller's options; its own directory is
     // what `create` was told, so that wins, and the caller's branch choice and name do not apply to it.
     const cwd = request.workspaceCwd ?? request.cwd;
