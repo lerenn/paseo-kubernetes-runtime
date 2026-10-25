@@ -12,7 +12,8 @@ export interface GitResult {
 /** Runs git on the daemon with the daemon's own credentials, never prompting. */
 export type GitRunner = (args: string[], options?: { cwd?: string; input?: Buffer; binary?: boolean }) => Promise<GitResult>;
 
-const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+// never wait for a prompt: ssh would stop at an unknown host or a passphrase
+const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? "ssh -o BatchMode=yes -o ConnectTimeout=20" };
 
 export const runGit: GitRunner = (args, { cwd, input, binary } = {}) =>
   new Promise((resolve, reject) => {

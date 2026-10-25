@@ -47,6 +47,12 @@ Paseo daemon                                   cluster (paseo-agents)
   pushes). Git in the pod uses the daemon's `user.name`/`user.email`. A submodule is checked out detached, as git does:
   `git switch -c <branch>` in it before committing (or check out the branch `.gitmodules` tracks). Seeded branches track
   their remote branch, so a plain `git pull` works, and the first push of a new branch sets its upstream. Limits: 64MB per fetch, no nested submodules, pull request refs (`refs/pull/*`) are not mirrored.
+- **Other repositories** (a plugin change plus a lab config PR): any URL of an allowed host (default `github.com`: https,
+  `git@` and `ssh://`) is turned by a global `insteadOf` rule into `paseo://host/owner/repo`, which the pod's
+  `git-remote-paseo` helper serves from a bare mirror made on demand. `git clone`, `fetch`, `pull`, `ls-remote` and a branch
+  `push` work for any repository the daemon's git credentials reach (it tries its ssh key, then https), through the same
+  bridge and with the same protections: branches only, no deletions, and the remote still refuses non-fast-forward
+  pushes. The "Other repositories" setting turns it off or restricts it to `owner/*` or `owner/repo` patterns.
 - **Push-back.** `git push` goes to a local "outbox" repository whose `pre-receive` hook asks the plugin, over the
   same bridge, to push the new commits from the daemon with the daemon's git credentials (branches only, no
   deletions). `gh` and GitHub tools go through the GitHub Proxy plugin if it is installed and the agent is opted in

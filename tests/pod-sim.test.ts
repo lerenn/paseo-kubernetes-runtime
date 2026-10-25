@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ConfigSchema } from "../shared/settings.js";
 import { KubernetesRuntime } from "../server/runtime.js";
+import { runGit } from "../server/git.js";
 import { LocalPodKube } from "./local-pod.js";
 
 const ID = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
@@ -55,11 +56,12 @@ afterEach(() => {
   while (cleanups.length) cleanups.pop()!();
 });
 
-async function openSession(argv0 = "sh", mcpServers: Record<string, any> = {}, tunnel?: { pod: number; daemon: number }, env: Record<string, string> = {}, withSubmodule = false) {
+async function openSession(argv0 = "sh", mcpServers: Record<string, any> = {}, tunnel?: { pod: number; daemon: number }, env: Record<string, string> = {}, withSubmodule = false, extra: { config?: object; git?: (args: string[], o?: any) => Promise<any> } = {}) {
   const { origin, project, sub, root } = repos(withSubmodule);
   const kube = new LocalPodKube(project);
   const runtime = new KubernetesRuntime({
-    getConfig: async () => ConfigSchema.parse({ readyTimeoutSeconds: 5 }),
+    getConfig: async () => ConfigSchema.parse({ readyTimeoutSeconds: 5, ...extra.config }),
+    ...(extra.git ? { git: extra.git as never } : {}),
     kubeFor: () => kube,
     daemonId: "srv_ME",
     log: () => undefined,
@@ -202,6 +204,69 @@ describe("fetching through the daemon (real git, real pod scripts)", () => {
     const del = await kube.as(["git", "push", "origin", ":pod-branch"], { cwd: lib });
     expect(del.code).not.toBe(0);
     expect(del.stderr).toMatch(/not supported/);
+  });
+});
+
+describe("other repositories through the daemon (real git, real pod scripts)", () => {
+  /** A bare repo standing in for git@example.test:o/r.git, reached by the daemon through an insteadOf rule. */
+  function otherRepo() {
+    const root = mkdtempSync(join(tmpdir(), "kube-other-"));
+    const bare = join(root, "r.git");
+    mkdirSync(bare);
+    sh(bare, "init", "-q", "--bare", "-b", "main");
+    const work = join(root, "w");
+    sh(root, "clone", "-q", bare, work);
+    writeFileSync(join(work, "readme.txt"), "other repo\n");
+    sh(work, "add", ".");
+    sh(work, "commit", "-qm", "first");
+    sh(work, "push", "-q", "origin", "main");
+    const git = (args: string[], o?: any) => runGit(["-c", `url.${bare}.insteadOf=git@example.test:o/r.git`, ...args], o);
+    return { bare, git };
+  }
+  const session = (git: (a: string[], o?: any) => Promise<any>, allow = ["o/*"], enabled = true) =>
+    openSession("sh", {}, undefined, {}, false, { config: { otherRepos: { enabled, hosts: ["example.test"], allow } }, git });
+  const asAgent = (kube: any, argv: string[], cwd?: string) => kube.as(argv, { cwd, env: { PATH: `${kube.home}/bin:${process.env.PATH}` } });
+
+  it("clones, fetches and pushes a branch of a repository nobody mentioned, with no credential in the pod", async () => {
+    const { bare, git } = otherRepo();
+    const { kube, root: _r } = await session(git);
+    const dest = join(kube.root, "other-clone");
+    const cloned = await asAgent(kube, ["git", "clone", "https://example.test/o/r", dest]);
+    expect(cloned.code, cloned.stderr).toBe(0);
+    expect(sh(dest, "log", "-1", "--format=%s")).toBe("first");
+
+    // upstream moves on, the pod fetches it through the daemon
+    const other = join(mkdtempSync(join(tmpdir(), "kube-up-")), "u");
+    sh(tmpdir(), "clone", "-q", bare, other);
+    writeFileSync(join(other, "more.txt"), "more\n");
+    sh(other, "add", ".");
+    sh(other, "commit", "-qm", "second");
+    sh(other, "push", "-q", "origin", "main");
+    const pulled = await asAgent(kube, ["git", "pull", "--ff-only"], dest);
+    expect(pulled.code, pulled.stderr).toBe(0);
+    expect(sh(dest, "log", "-1", "--format=%s")).toBe("second");
+
+    // a branch pushed from the pod is pushed by the daemon; a deletion is refused
+    writeFileSync(join(dest, "pod.txt"), "from the pod\n");
+    for (const argv of [["git", "switch", "-q", "-c", "pod-branch"], ["git", "add", "."], ["git", "commit", "-qm", "pod change"], ["git", "push", "origin", "pod-branch"]]) {
+      const r = await asAgent(kube, argv, dest);
+      expect(r.code, `${argv.join(" ")}: ${r.stderr}`).toBe(0);
+    }
+    expect(sh(bare, "log", "-1", "--format=%s", "refs/heads/pod-branch")).toBe("pod change");
+    const del = await asAgent(kube, ["git", "push", "origin", ":pod-branch"], dest);
+    expect(del.code).not.toBe(0);
+    expect(del.stderr).toMatch(/not supported/);
+  });
+
+  it("refuses repositories outside the allowlist, and everything when the setting is off", async () => {
+    const { git } = otherRepo();
+    const allowed = await session(git, ["o/other-only"]);
+    const denied = await asAgent(allowed.kube, ["git", "clone", "https://example.test/o/r", join(allowed.kube.root, "nope")]);
+    expect(denied.code).not.toBe(0);
+    expect(denied.stderr).toMatch(/not in the allowed repositories/);
+    const off = await session(git, [], false);
+    const refused = await asAgent(off.kube, ["git", "ls-remote", "https://example.test/o/r"]);
+    expect(refused.code).not.toBe(0);
   });
 });
 

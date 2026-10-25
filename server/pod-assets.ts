@@ -38,7 +38,10 @@ if (mode === "call") {
         for (const h of tips(path.dirname(alt))) haves.add(h);
       }
     } catch {}
-    msg.mirror = path.basename(dir, ".git");
+    let target = "";
+    try { target = git(dir, ["config", "paseo.target"]).trim(); } catch {}
+    // a mirror made on demand for any repository names it; the project's own mirrors are named by their directory
+    msg.mirror = target ? "x:" + target : path.basename(dir, ".git");
     msg.haves = [...haves];
   }
   const conn = net.connect(sock);
@@ -182,7 +185,8 @@ exec git-upload-pack "$dir"
  */
 export const MIRROR_PRE_RECEIVE = String.raw`#!/bin/sh
 ZERO=0000000000000000000000000000000000000000
-id=$(basename "$(pwd)" .git)
+id=$(git config paseo.target 2>/dev/null)
+if [ -n "$id" ]; then id="x:$id"; else id=$(basename "$(pwd)" .git); fi
 while read old new ref; do
   if [ "$new" = "$ZERO" ]; then
     echo "kube-agents: deleting remote branches from a pod is not supported" >&2
@@ -350,4 +354,34 @@ process.stdout.write(JSON.stringify({ ok: true, result }));
 } catch (e) {
   process.stdout.write(JSON.stringify({ ok: false, error: String(e.message || e) }));
 }
+`;
+
+/**
+ * `git-remote-paseo`: the remote helper behind `paseo://host/owner/repo` URLs, which global `insteadOf` rules make
+ * of every URL for an allowed host. It keeps a bare mirror per repository, asks the plugin (over the bridge) to refresh
+ * it with the daemon's credentials before serving a fetch or clone, and serves git's protocol from it; a push lands in
+ * the mirror, whose pre-receive hook has the plugin push the branch for real.
+ */
+export const GIT_REMOTE_HELPER = String.raw`#!/bin/sh
+url="$2"
+target=$(printf '%s' "$url" | sed -e 's|^paseo://||' -e 's|\.git$||')
+dir="$HOME/gh/$target.git"
+while read -r cmd arg; do
+  case "$cmd" in
+    capabilities) printf 'connect\n\n' ;;
+    connect)
+      if [ ! -d "$dir" ]; then
+        mkdir -p "$dir" && git init -q --bare "$dir" || exit 1
+        git --git-dir "$dir" config paseo.target "$target"
+        mkdir -p "$dir/hooks" && cp "$HOME/mirror-pre-receive" "$dir/hooks/pre-receive"
+      fi
+      if [ "$arg" = git-upload-pack ]; then
+        node "$HOME/bridge.mjs" call fetch "$dir" </dev/null >&2 || exit 1
+      fi
+      printf '\n'
+      exec "$arg" "$dir"
+      ;;
+    "") exit 0 ;;
+  esac
+done
 `;

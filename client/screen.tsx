@@ -422,6 +422,20 @@ export function KubernetesRuntimeScreen({ theme, layout }: PluginScreenProps) {
                 }}
               />
               <SettingsSwitch
+                label="Other repositories"
+                hint="Lets pods clone, fetch and push branches to other repositories through the daemon, with its git credentials."
+                value={draft.otherRepos.enabled}
+                onValueChange={(enabled) => setDraft({ ...draft, otherRepos: { ...draft.otherRepos, enabled } })}
+              />
+              {draft.otherRepos.enabled ? (
+                <SettingsInput
+                  label="Allowed repositories"
+                  hint="Comma-separated owner/* or owner/repo. Empty allows every repository the daemon can reach."
+                  initialValue={draft.otherRepos.allow.join(",")}
+                  onChangeText={(t) => setDraft({ ...draft, otherRepos: { ...draft.otherRepos, allow: t.split(",").map((k) => k.trim()).filter(Boolean) } })}
+                />
+              ) : null}
+              <SettingsSwitch
                 label="Remove unlabelled leftovers"
                 hint="Also delete this plugin's old sandboxes that match no agent. Turn off if daemons share a namespace."
                 value={draft.sweepUnlabelled}
