@@ -11,10 +11,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
  && echo "deb [signed-by=/usr/share/keyrings/gh.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/gh.list \
  && apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
 
-# Agent CLIs and their ACP adapters (the pod speaks ACP over stdio via `kubectl exec`).
+# The provider CLIs the runtime starts with `kubectl exec` (it installs them on first use only if they are missing).
 RUN npm install -g @anthropic-ai/claude-code @openai/codex
 
-RUN useradd -m -u 1000 agent && mkdir -p /workspace && chown agent /workspace
-USER agent
+# The node image already has uid 1000 ("node"), which the pod runs as; HOME is set to the workspace volume by the runtime.
+RUN mkdir -p /workspace && chown node:node /workspace
+USER node
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
