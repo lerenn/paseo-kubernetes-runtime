@@ -91,6 +91,12 @@ kubectl -n paseo-agents get pods -L paseo.sh/workspace,paseo.sh/agent,paseo.sh/s
 `paseo.sh/workspace-id` and `paseo.sh/daemon` are what the orphan reconciler goes by. Updating the labels of an
 existing pod and claim needs `patch` on them in the daemon's Role; without it only the Sandbox's labels stay current.
 
+## In the sidebar and the workspace header
+
+The runtime's badge shows the pod's image name beside the ship wheel, with the pod name, state, full image reference and
+repository on hover, and a one-line detail in the workspace header (`image · pod · running`). It is answered from what
+the plugin already knows, so showing a workspace never starts or reads a pod; the state follows suspend and resume.
+
 ## The Pods table
 
 The Kubernetes Runtime screen lists the pods, one row per workspace: its title (opens the workspace), the pod name, the
