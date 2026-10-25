@@ -244,6 +244,8 @@ export class KubernetesRuntime {
         newBranch: plan?.action === "branch-off" && plan.slug ? plan.slug : undefined,
       });
       await made.done;
+      // origin/<branch> exists from the start (no "gone" upstream in git status); best effort
+      await kube.exec(pod, ["git", "-C", cwd, "fetch", "-q", "origin"]).catch(() => undefined);
       const subs = await initSubmodules(kube, pod, cwd, ws.targets);
       if (!subs.ok) ctx.notice(`Could not fetch the submodules (run \`git submodule update --init\` in the pod to retry): ${subs.message}`, "warning");
     } finally {
