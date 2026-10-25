@@ -51,7 +51,7 @@ Paseo daemon                                   cluster (paseo-agents)
   `git@` and `ssh://`) is turned by a global `insteadOf` rule into `paseo://host/owner/repo`, which the pod's
   `git-remote-paseo` helper serves from a bare mirror made on demand. `git clone`, `fetch`, `pull`, `ls-remote` and a branch
   `push` work for any repository the daemon's git credentials reach (it tries its ssh key, then https), through the same
-  bridge and with the same protections: branches only, no deletions, and the remote still refuses non-fast-forward
+  bridge and with the same protections: branches and new tags only, no deletions, and the remote still refuses non-fast-forward
   pushes. The "Other repositories" setting turns it off or restricts it to `owner/*` or `owner/repo` patterns.
 - **Push-back.** `git push` goes to a local "outbox" repository whose `pre-receive` hook asks the plugin, over the
   same bridge, to push the new commits from the daemon with the daemon's git credentials (branches only, no
@@ -66,7 +66,8 @@ Paseo daemon                                   cluster (paseo-agents)
   `podIdleMinutes` (default 30, 0 = never) the pod is deleted (`operatingMode: Suspended`); the volume, with the
   checkout and the agents' session state, stays. The next input (`beforeInput`) recreates the pod on the same volume with
   the current image, and the provider resumes its own session. A process that ends because the pod went away is
-  reported as `runtime-lost`, so the agent run fails like any process exit and the next message relaunches it.
+  reported as `runtime-lost`, so the agent run fails like any process exit and the next message relaunches it. Our own idle
+  suspension is reported as the planned `suspended` exit, which idle agents drop quietly instead of showing an error.
 - **Archive.** Archiving the workspace (`destroy`) deletes the Sandbox and its volume claim. There is no expiry on a
   workspace's storage.
 - **Orphans.** A reconciler (at start, then every 10 minutes) deletes the Sandbox and claim of any workspace Paseo no

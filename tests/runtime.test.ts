@@ -168,6 +168,16 @@ describe("exec: real provider processes in the pod", () => {
     expect(await c.exit).toMatchObject({ reason: "runtime-lost", message: expect.stringContaining("next message brings it back") });
   });
 
+  it("reports a process that ended because the plugin suspended the idle workspace as a planned stop", async () => {
+    const t = setup({ podIdleMinutes: 30 });
+    const p = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.advance(31 * MIN);
+    await t.tick(); // suspends: the phase changes before the pod goes
+    t.kube.pods = [{ uid: "x", ready: false, terminating: true }];
+    t.kube.procs[0]!.end(137);
+    expect(await p.exit).toMatchObject({ reason: "suspended", message: expect.stringContaining("idle pod was suspended") });
+  });
+
   it("stops the process when Paseo aborts the launch or signals it", async () => {
     const t = setup();
     const abort = new AbortController();

@@ -140,10 +140,51 @@ describe("seeded pod workspace and push-back (real git, real pod scripts)", () =
     const del = await kube.as(["git", "push", "origin", ":refs/heads/throwaway"], { cwd: podDir });
     expect(del.code).not.toBe(0);
     expect(del.stderr).toMatch(/not supported/);
+    const notes = await kube.as(["git", "push", "origin", "HEAD:refs/notes/x"], { cwd: podDir });
+    expect(notes.code).not.toBe(0);
+    expect(notes.stderr).toMatch(/only branches and new tags/);
+  });
+
+  it("pushes a new tag, but never moves or deletes one", async () => {
+    const { origin, kube, podDir } = await openSession();
     sh(podDir, "tag", "v1");
-    const tag = await kube.as(["git", "push", "origin", "refs/tags/v1"], { cwd: podDir });
-    expect(tag.code).not.toBe(0);
-    expect(tag.stderr).toMatch(/only branches/);
+    const created = await kube.as(["git", "push", "origin", "refs/tags/v1"], { cwd: podDir });
+    expect(created.code, created.stderr).toBe(0);
+    expect(sh(origin, "rev-parse", "refs/tags/v1")).toBe(sh(podDir, "rev-parse", "HEAD"));
+    sh(podDir, "tag", "-a", "-m", "annotated", "v2");
+    expect((await kube.as(["git", "push", "origin", "refs/tags/v2"], { cwd: podDir })).code).toBe(0);
+    expect(sh(origin, "cat-file", "-t", "refs/tags/v2")).toBe("tag");
+
+    writeFileSync(join(podDir, "t.txt"), "t\n");
+    sh(podDir, "add", ".");
+    sh(podDir, "commit", "-qm", "later");
+    sh(podDir, "tag", "-f", "v1");
+    const moved = await kube.as(["git", "push", "--force", "origin", "refs/tags/v1"], { cwd: podDir });
+    expect(moved.code).not.toBe(0);
+    expect(moved.stderr).toMatch(/moving the existing tag|not supported/);
+    const del = await kube.as(["git", "push", "origin", ":refs/tags/v1"], { cwd: podDir });
+    expect(del.code).not.toBe(0);
+    expect(del.stderr).toMatch(/not supported/);
+  });
+
+  it("leaves repositories that have nothing to do with the daemon alone (local bare repos work)", async () => {
+    const { kube, podDir } = await openSession();
+    const bare = join(kube.root, "tmp-bare.git");
+    sh(kube.root, "init", "-q", "--bare", "-b", "main", bare);
+    const work = join(kube.root, "tmp-work");
+    for (const argv of [["git", "clone", "-q", bare, work]]) {
+      const r = await kube.as(argv);
+      expect(r.code, r.stderr).toBe(0);
+    }
+    writeFileSync(join(work, "a.txt"), "a\n");
+    for (const argv of [["git", "add", "."], ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "local"], ["git", "push", "-q", "origin", "HEAD:main"], ["git", "fetch", "origin"], ["git", "pull", "--ff-only", "origin", "main"]]) {
+      const r = await kube.as(argv, { cwd: work });
+      expect(r.code, `${argv.join(" ")}: ${r.stderr}`).toBe(0);
+    }
+    const again = join(kube.root, "tmp-again");
+    const cloned = await kube.as(["git", "clone", "-q", bare, again]);
+    expect(cloned.code, cloned.stderr).toBe(0);
+    expect(podDir).toBeTruthy();
   });
 });
 

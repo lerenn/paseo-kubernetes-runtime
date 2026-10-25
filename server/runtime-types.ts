@@ -100,10 +100,13 @@ export interface WorkspaceRuntimeActivityEvent extends WorkspaceRuntimeInputRequ
 }
 
 /**
- * Why an exec ended. `runtime-lost` means the sandbox went away (evicted, suspended) rather than
- * the process finishing; Paseo then reconciles the runtime and the next input relaunches.
+ * Why an exec ended. `runtime-lost` means the sandbox went away unexpectedly (evicted, node
+ * failure) rather than the process finishing; Paseo then reconciles the runtime and the next input
+ * relaunches. `suspended` is the runtime's own planned stop of an idle workspace: nothing went
+ * wrong, so an idle agent shows no error and the next input relaunches. A turn that is running
+ * when its process ends is a failure whatever the reason.
  */
-export type WorkspaceRuntimeExitReason = "exited" | "runtime-lost";
+export type WorkspaceRuntimeExitReason = "exited" | "runtime-lost" | "suspended";
 
 export interface WorkspaceRuntimeExit {
   code: number | null;
