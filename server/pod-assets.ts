@@ -119,43 +119,6 @@ if (mode === "call") {
 }
 `;
 
-/** `gh` in the pod: same contract as the GitHub Proxy plugin's shim, pointed at its loopback URL. */
-export const GH_SHIM_SCRIPT = String.raw`#!/usr/bin/env node
-const { spawnSync } = require("node:child_process");
-const url = process.env.PASEO_GITHUB_PROXY_URL;
-const capability = process.env.PASEO_GITHUB_PROXY_CAPABILITY;
-if (!url || !capability) {
-  process.stderr.write("gh: no GitHub access is configured for this pod (enable the GitHub Proxy plugin for this agent).\n");
-  process.exit(1);
-}
-(async () => {
-  let res;
-  try {
-    res = await fetch(url + "/gh", {
-      method: "POST",
-      headers: { authorization: "Bearer " + capability, "content-type": "application/json" },
-      body: JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }),
-    });
-  } catch (err) {
-    process.stderr.write("gh: cannot reach the GitHub proxy: " + err.message + "\n");
-    process.exit(1);
-  }
-  if (!res.ok) {
-    process.stderr.write("gh: proxy answered HTTP " + res.status + ": " + (await res.text()) + "\n");
-    process.exit(1);
-  }
-  const out = await res.json();
-  let stdout = out.stdout;
-  if (out.jq && out.code === 0) {
-    const r = spawnSync("jq", ["-r", out.jq], { input: stdout, encoding: "utf8" });
-    if (!r.error) stdout = r.stdout;
-  }
-  if (stdout) process.stdout.write(stdout);
-  if (out.stderr) process.stderr.write(out.stderr);
-  process.exit(out.code ?? 0);
-})();
-`;
-
 /**
  * Stands in for `git-upload-pack` (the global `remote.origin.uploadpack`) on the pod's local mirrors of the
  * project's remote and its submodules: asks the plugin to refresh the mirror from the real remote with the

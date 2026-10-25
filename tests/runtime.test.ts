@@ -97,8 +97,8 @@ describe("prepare: the pod is created when the first process is about to start",
     const t = setup();
     await t.prepare({ mcpServers: { inbox: { type: "http", url: "http://127.0.0.1:47825/mcp" }, remote: { type: "http", url: "https://example.com/mcp" } } });
     expect(t.kube.streams[0]!.argv.at(-1)).toBe("47825");
-    await t.prepare({ mcpServers: { leases: { type: "http", url: "http://localhost:47826/mcp" } }, env: { PASEO_GITHUB_PROXY_URL: "http://127.0.0.1:47821" } });
-    expect(t.kube.streams.at(-1)!.argv.at(-1)).toBe("47825,47826,47821");
+    await t.prepare({ mcpServers: { leases: { type: "http", url: "http://localhost:47826/mcp" } } });
+    expect(t.kube.streams.at(-1)!.argv.at(-1)).toBe("47825,47826");
     expect(t.kube.streams).toHaveLength(2);
   });
 
