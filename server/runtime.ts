@@ -10,10 +10,12 @@ import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
 import { ensureCommand, ensureJq, initSubmodules, installAssets, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
 import { paseoWorkspaceBusy } from "./orphans.js";
+import { shortImage } from "./status.js";
 import { PodRegistry, type PodState } from "./registry.js";
 import type {
   WorkspaceRuntimeActivityEvent,
   WorkspaceRuntimeCommandRequest,
+  WorkspaceRuntimeDisplay,
   WorkspaceRuntimeReconcileRequest,
   WorkspaceRuntimeContext,
   WorkspaceRuntimeExecRequest,
@@ -109,6 +111,8 @@ interface WorkspaceState {
   labelled?: string;
   /** When labelling the pod or claim last failed (missing `patch` in the Role); retried after a while. */
   labelFailedAt?: number;
+  /** The image the pod was started with, for the sidebar badge; known once the Sandbox has been read or created. */
+  image?: string;
   /** The submodule checkout running in the background, if any. */
   submodulesJob?: Promise<void>;
   /** Consecutive reconnects of the bridge channel, for backoff. */
@@ -174,6 +178,7 @@ export class KubernetesRuntime {
       if (!id || !cwd || this.states.has(id)) continue;
       const ws = this.newState(id, { cwd });
       ws.sandbox = sandbox.name;
+      ws.image = sandbox.image;
       ws.cwdFixed = true;
       this.setPhase(ws, sandbox.operatingMode === "Suspended" ? "suspended" : "running");
       // A pod that runs when the plugin starts had its bridge (and with it the loopback tunnels its agents' MCP
@@ -248,7 +253,10 @@ export class KubernetesRuntime {
   }
 
   private setPhase(ws: WorkspaceState, phase: PodState): void {
+    const before = ws.phase;
     ws.phase = phase;
+    // Paseo asks `describeWorkspace` again after a notice for the workspace: this keeps the badge's state current
+    if (before !== "none" && before !== phase && (phase === "running" || phase === "suspended")) this.stateChanged(ws, `The pod is ${phase}.`);
     if (ws.sandbox) this.deps.registry?.set(ws.id, ws.sandbox, phase, this.now());
   }
 
@@ -410,13 +418,16 @@ export class KubernetesRuntime {
       await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running") }));
       ws.labelled = this.metaKey(this.meta(ws, "running"));
       ws.sandbox = name;
+      ws.image = config.image;
     } else {
       ws.sandbox = sandbox.name;
+      ws.image = sandbox.image ?? ws.image;
       ws.repo ??= sandbox.labels[REPO_LABEL];
       if (sandbox.operatingMode === "Suspended") {
         ctx.notice("Resuming the pod...");
         this.setPhase(ws, "resuming");
         await kube.patchSandbox(sandbox.name, resumePatch(config, cwd));
+        ws.image = config.image; // a resumed pod starts with the current image
       }
     }
     this.setPhase(ws, "resuming");
@@ -578,6 +589,33 @@ export class KubernetesRuntime {
     }
   }
 
+  /**
+   * What the sidebar shows beside the runtime icon: the image's short name, with the pod and its state in the tooltip
+   * and the header. Answered from what is already known: it never starts or reads the pod.
+   */
+  describeWorkspace(request: WorkspaceRuntimeWorkspaceRequest): WorkspaceRuntimeDisplay | null {
+    const ws = this.states.get(request.workspaceId);
+    if (!ws?.sandbox) return { label: "no pod yet", detail: "Kubernetes pod · not started yet" };
+    const short = shortImage(ws.image);
+    const name = short?.split("@")[0]?.split(":")[0];
+    const state = ws.phase === "resuming" ? "starting" : ws.phase === "none" ? "unknown" : ws.phase;
+    return {
+      label: name ?? "pod",
+      tooltip: [
+        `Pod ${ws.sandbox}`,
+        `State: ${state}`,
+        ...(ws.image ? [`Image: ${ws.image}`] : []),
+        ...(ws.repo ? [`Repository: ${ws.repo}`] : []),
+      ].join("\n"),
+      detail: [name ?? "pod", ws.sandbox, state].join(" · "),
+    };
+  }
+
+  /** Tells Paseo to ask `describeWorkspace` again: the pod changed state. */
+  private stateChanged(ws: WorkspaceState, message: string): void {
+    ws.notice?.(message);
+  }
+
   /** Whether a provider process in the pod has live child processes (background shells and timers of an idle agent). */
   private async hasBackgroundWork(ws: WorkspaceState): Promise<boolean> {
     if (!ws.sandbox) return false;
@@ -598,6 +636,7 @@ export class KubernetesRuntime {
         this.workspace(request); // validates the options; nothing exists in the cluster until a process is about to start
       },
       inspect: (request) => this.inspect(request),
+      describeWorkspace: (request) => this.describeWorkspace(request),
       destroy: (request) => this.destroy(request),
       reconcile: (request) => this.reconcile(request),
       checkCommand: (request) => this.checkCommand(request),

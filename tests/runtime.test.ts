@@ -289,6 +289,27 @@ describe("submodules do not hold the agent back", () => {
   });
 });
 
+describe("describeWorkspace for the sidebar badge", () => {
+  it("answers without touching the cluster: no pod yet, then image/pod/state, following suspension", async () => {
+    const t = setup({ image: "ghcr.io/lerenn/paseo-kubernetes-runtime-default@sha256:f4aedb1145658527f3e43dd1ae6d95a917b39e94799491eae6f9c400ccd8e3b5", podIdleMinutes: 30 });
+    const describe = () => t.reg.describeWorkspace!({ ...t.base } as never);
+    expect(await describe()).toMatchObject({ label: "no pod yet" });
+    await t.prepare();
+    const calls = t.kube.calls.length;
+    const running = await describe();
+    expect(t.kube.calls).toHaveLength(calls); // nothing read or started
+    expect(running).toMatchObject({ label: "paseo-kubernetes-runtime-default" });
+    expect(running!.tooltip).toContain("State: running");
+    expect(running!.tooltip).toMatch(/Pod pka-/);
+    expect(running!.tooltip).toContain("Image: ghcr.io/lerenn/paseo-kubernetes-runtime-default@sha256:f4aedb11");
+    expect(running!.detail).toMatch(/^paseo-kubernetes-runtime-default · pka-.* · running$/);
+    t.advance(31 * MIN);
+    await t.tick();
+    expect((await describe())!.detail).toMatch(/· suspended$/);
+    expect(t.notices.map((n) => n[0])).toContain("The pod is suspended."); // makes Paseo ask again
+  });
+});
+
 describe("the pod actions of the screen", () => {
   async function running(extra: object = {}) {
     const archived: string[] = [];
