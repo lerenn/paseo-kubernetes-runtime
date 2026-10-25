@@ -1,6 +1,6 @@
 import { Readable } from "node:stream";
 import { HOME_DIR } from "./sandbox.js";
-import { BRIDGE_SCRIPT, FS_SCRIPT, GH_SHIM_SCRIPT, INSTALLABLE_CLIS, MIRROR_PRE_RECEIVE, PRE_RECEIVE_HOOK, UPLOAD_PACK_WRAPPER, envFile } from "./pod-assets.js";
+import { BRIDGE_SCRIPT, FS_SCRIPT, GH_SHIM_SCRIPT, INSTALLABLE_CLIS, GIT_REMOTE_HELPER, MIRROR_PRE_RECEIVE, PRE_RECEIVE_HOOK, UPLOAD_PACK_WRAPPER, envFile } from "./pod-assets.js";
 import { MIRROR_SETUP_SCRIPT, mirrorSetupArgs, type FetchTarget } from "./mirrors.js";
 import type { Kube } from "./kube.js";
 import type { Seed } from "./seed.js";
@@ -21,12 +21,13 @@ export async function installAssets(kube: Kube, pod: string): Promise<void> {
   await write(kube, pod, "fs.mjs", FS_SCRIPT, "644");
   await write(kube, pod, "outbox.git/hooks/pre-receive", PRE_RECEIVE_HOOK, "755");
   await write(kube, pod, "bin/paseo-upload-pack", UPLOAD_PACK_WRAPPER, "755");
+  await write(kube, pod, "bin/git-remote-paseo", GIT_REMOTE_HELPER, "755");
   await write(kube, pod, "mirror-pre-receive", MIRROR_PRE_RECEIVE, "755");
 }
 
 /** Points git in the pod at local mirrors of the project's remote and its submodules, refreshed through the bridge. */
-export async function setupMirrors(kube: Kube, pod: string, cwd: string, identity: { name: string; email: string }, targets: readonly FetchTarget[]): Promise<void> {
-  const r = await kube.exec(pod, ["sh", "-c", MIRROR_SETUP_SCRIPT, "sh", ...mirrorSetupArgs(cwd, identity, targets)]);
+export async function setupMirrors(kube: Kube, pod: string, cwd: string, identity: { name: string; email: string }, targets: readonly FetchTarget[], hosts: readonly string[] = []): Promise<void> {
+  const r = await kube.exec(pod, ["sh", "-c", MIRROR_SETUP_SCRIPT, "sh", ...mirrorSetupArgs(cwd, identity, targets, hosts)]);
   if (r.code !== 0) throw new Error(`could not set up fetching in the pod: ${r.stderr.trim()}`);
 }
 

@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import { parseRuntimeOptions, type RuntimeOptions } from "../shared/runtime-options.js";
-import { applyFetch, fetchTargets, pushToMirror, type FetchTarget } from "./mirrors.js";
+import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, type FetchTarget } from "./mirrors.js";
 import { applyPush, loopbackPorts, startBridge, type RunningBridge } from "./bridge.js";
 import type { KubernetesRuntimeConfig } from "./config.js";
 import { type GitRunner, runGit, scrub } from "./git.js";
@@ -265,7 +265,8 @@ export class KubernetesRuntime {
     const raw = await this.git(["remote", "get-url", "origin"], { cwd }).catch(() => null);
     const originUrl = raw?.code === 0 && raw.stdout.trim() ? raw.stdout.trim() : (await (this.deps.detectRepo ?? detectRepo)(cwd)).url;
     ws.targets = await fetchTargets(this.git, cwd, originUrl, all);
-    await setupMirrors(kube, pod, cwd, await this.identity(cwd), ws.targets);
+    const access = (await this.deps.getConfig()).otherRepos;
+    await setupMirrors(kube, pod, cwd, await this.identity(cwd), ws.targets, access.enabled ? access.hosts : []);
   }
 
   private defaultSeeder = async (cwd: string, plan: ClonePlan | null, currentBranch: string): Promise<SeedBundle> => {
@@ -282,12 +283,20 @@ export class KubernetesRuntime {
       ws.sandbox!,
       [...ports],
       {
-        handle: (request) =>
-          request.op === "fetch"
-            ? applyFetch(this.git, ws.options.cwd, request, ws.targets)
-            : request.mirror
-              ? pushToMirror(this.git, ws.options.cwd, request, ws.targets)
-              : applyPush(this.git, ws.options.cwd, request),
+        handle: async (request) => {
+          if (request.op === "push" && !request.mirror) return applyPush(this.git, ws.options.cwd, request);
+          // a repository a pod asked for by name is checked against the "Other repositories" setting
+          const mirror = request.mirror;
+          let targets = ws.targets;
+          if (mirror?.startsWith("x:")) {
+            const target = otherRepoTarget(mirror, (await this.deps.getConfig()).otherRepos);
+            if ("refused" in target) return { ok: false, message: `kube-agents: ${target.refused}` };
+            targets = [target];
+          }
+          return request.op === "fetch"
+            ? applyFetch(this.git, ws.options.cwd, request, targets)
+            : pushToMirror(this.git, ws.options.cwd, request, targets);
+        },
       },
       { mapPort: this.deps.mapTunnelPort },
     );

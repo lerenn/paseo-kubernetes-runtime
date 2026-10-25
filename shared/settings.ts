@@ -42,6 +42,19 @@ export const ConfigSchema = z.object({
    * agent of this daemon, after 15 minutes. Turn off where several daemons share one namespace.
    */
   sweepUnlabelled: z.boolean().default(true),
+  /**
+   * Repositories other than the workspace's own (and its submodules) that a pod may `git clone`, fetch and push
+   * branches to, through the daemon and with its git credentials.
+   */
+  otherRepos: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** Git hosts the pods may reach this way. */
+      hosts: z.array(z.string()).default(["github.com"]),
+      /** `owner/*` or `owner/repo` patterns; empty allows every repository the daemon can reach. */
+      allow: z.array(z.string()).default([]),
+    })
+    .default({ enabled: true, hosts: ["github.com"], allow: [] }),
   /** A workspace whose agents have all been idle this long has its pod deleted (the volume stays); any input brings it back. 0 = never. */
   podIdleMinutes: z.number().int().min(0).default(30),
 });

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runGit } from "../server/git.js";
-import { applyFetch, fetchTargets, resolveSubmoduleUrl } from "../server/mirrors.js";
+import { applyFetch, fetchTargets, otherRepoTarget, repoAllowed, resolveSubmoduleUrl } from "../server/mirrors.js";
 
 const sh = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" }, encoding: "utf8" }).trim();
@@ -39,5 +39,26 @@ describe("fetch targets", () => {
     expect(refused.message).toMatch(/not part of the project/);
     const malformed = await applyFetch(runGit, project, { op: "fetch", mirror: targets[0]!.id, haves: ["--upload-pack=x"] }, targets);
     expect(malformed.ok).toBe(false);
+  });
+});
+
+describe("other repositories", () => {
+  const access = { enabled: true, hosts: ["github.com"], allow: [] as string[] };
+  it("matches owner/* and owner/repo patterns, case-insensitively; empty allows all", () => {
+    expect(repoAllowed("Acme/App", [])).toBe(true);
+    expect(repoAllowed("acme/app", ["ACME/*"])).toBe(true);
+    expect(repoAllowed("acme/app", ["acme/other"])).toBe(false);
+    expect(repoAllowed("evil/app", ["acme/*"])).toBe(false);
+  });
+
+  it("builds ssh-then-https targets for allowed hosts and refuses the rest", () => {
+    const ok = otherRepoTarget("x:github.com/anyshift-io/lfradin-lab", access);
+    expect(ok).toMatchObject({ daemonUrl: "git@github.com:anyshift-io/lfradin-lab.git", fallbackUrls: ["https://github.com/anyshift-io/lfradin-lab.git"] });
+    expect(otherRepoTarget("x:gitlab.com/o/r", access)).toHaveProperty("refused");
+    expect(otherRepoTarget("x:github.com/o/r", { ...access, allow: ["acme/*"] })).toHaveProperty("refused");
+    expect(otherRepoTarget("x:github.com/o/r", { ...access, enabled: false })).toHaveProperty("refused");
+    for (const bad of ["x:github.com/o", "x:github.com/../r", "x:github.com/o/r --upload-pack=x", "github.com/o/r", "x:github.com/o/.hidden"]) {
+      expect(otherRepoTarget(bad, access), bad).toHaveProperty("refused");
+    }
   });
 });
