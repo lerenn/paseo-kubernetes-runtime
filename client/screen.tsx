@@ -13,7 +13,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Linking, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { CREDENTIAL_KEYS, type CredentialKey, credentialsRemove, credentialsSet, credentialsStatus } from "../shared/credentials.js";
 import { type KubernetesRuntimeConfig, kubeSettings } from "../shared/settings.js";
-import { kubeStatus } from "../shared/status.js";
+import { PodsTable } from "./pods-table.js";
 
 /** Optional host components; older apps may not provide them, so never render an undefined element. */
 const optionalUi = hostUi as unknown as Partial<{
@@ -208,61 +208,6 @@ function Credential({
   );
 }
 
-function ago(iso: string): string {
-  const minutes = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60_000));
-  if (minutes < 1) return "just now";
-  if (minutes < 60) return `${minutes} min ago`;
-  const hours = Math.round(minutes / 60);
-  return hours < 48 ? `${hours} h ago` : `${Math.round(hours / 24)} d ago`;
-}
-
-function reaperLine(r: { lastRunAt?: string; removed: number; error?: string; unlabelled: string[] }): string {
-  if (r.error && !r.lastRunAt) return `Orphan cleanup: ${r.error}`;
-  if (!r.lastRunAt) return "Orphan cleanup: not run yet";
-  const unlabelled = r.unlabelled.length ? `; ${r.unlabelled.length} unlabelled left alone` : "";
-  return `Last reconcile: ${r.removed} orphan${r.removed === 1 ? "" : "s"} removed (${ago(r.lastRunAt)})${unlabelled}${r.error ? `; failed: ${r.error}` : ""}`;
-}
-
-/** The workspaces this plugin runs pods for (running or suspended) and the last orphan cleanup. Refreshes while visible. */
-function StatusSection({ theme }: { theme: PluginScreenProps["theme"] }) {
-  const load = useRpc(kubeStatus);
-  const [status, setStatus] = useState<Awaited<ReturnType<typeof load>> | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = () =>
-      load({}).then(
-        (s) => !cancelled && (setStatus(s), setError(null)),
-        (e: Error) => !cancelled && setError(e.message),
-      );
-    void refresh();
-    const timer = setInterval(refresh, 10_000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  const { colors } = theme;
-  const line = (text: string, muted = false) => (
-    <Text key={text} style={{ color: muted ? colors.foregroundMuted : colors.foreground, fontSize: 13 }}>
-      {text}
-    </Text>
-  );
-  return (
-    <SettingsSection title="Status">
-      <SettingsCard>
-        <View style={{ paddingHorizontal: 14, paddingVertical: 12, gap: 4 }}>
-          {status ? line(reaperLine(status.reaper), true) : null}
-          {(status?.pods ?? []).map((p) => line(`${p.sandbox}: ${p.state} since ${ago(p.since)}`, true))}
-          {status && status.pods.length === 0 ? line("No workspaces running.", true) : null}
-          {error ? line(`Status unavailable: ${error}`, true) : null}
-        </View>
-      </SettingsCard>
-    </SettingsSection>
-  );
-}
-
 function CredentialsSection({ theme }: { theme: PluginScreenProps["theme"] }) {
   const status = useRpc(credentialsStatus);
   const [open, setOpen] = useState(false);
@@ -332,7 +277,7 @@ function CredentialsSection({ theme }: { theme: PluginScreenProps["theme"] }) {
   );
 }
 
-export function KubernetesRuntimeScreen({ theme, layout }: PluginScreenProps) {
+export function KubernetesRuntimeScreen({ theme, layout, navigation }: PluginScreenProps) {
   const settings = useSettings(kubeSettings);
   const [draft, setDraft] = useState<KubernetesRuntimeConfig | null>(null);
   const [revision, setRevision] = useState<string | null>(null);
@@ -446,7 +391,7 @@ export function KubernetesRuntimeScreen({ theme, layout }: PluginScreenProps) {
         </SettingsCard>
       </SettingsSection>
 
-      <StatusSection theme={theme} />
+      <PodsTable theme={theme} layout={layout} navigation={navigation} />
 
       <CredentialsSection theme={theme} />
 

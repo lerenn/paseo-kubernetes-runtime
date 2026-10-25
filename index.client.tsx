@@ -6,7 +6,7 @@ import { contributePodLocation } from "./client/pod-location.js";
 function KubernetesRuntimeItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
   return (
     <SidebarRow
-      icon="Container"
+      icon="ShipWheel"
       active={currentScreen?.screenId === "settings"}
       onPress={() => openScreen({ screenId: "settings" })}
     />

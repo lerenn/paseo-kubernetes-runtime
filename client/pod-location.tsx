@@ -68,7 +68,7 @@ export function contributePodLocation(client: PluginClientContext): () => void {
   return host.addWorkspaceLocation({
     id: "pod",
     title: "Pod",
-    icon: "Container",
+    icon: "ShipWheel",
     usesRef: true,
     isAvailable() {
       if (Date.now() - lastRefresh > REFRESH_MS) refresh();

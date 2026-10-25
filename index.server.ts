@@ -1,7 +1,9 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { credentialsRemove, credentialsSet, credentialsStatus } from "./shared/credentials.js";
 import { ConfigSchema, kubeSettings } from "./shared/settings.js";
-import { kubeStatus } from "./shared/status.js";
+import { kubePodAction, kubeReconcile, kubeStatus } from "./shared/status.js";
+import { paseoWorkspaces } from "./server/orphans.js";
+import { paseoAgents, readPodRows } from "./server/status.js";
 import { readDaemonId } from "./server/daemon.js";
 import { readStatus, removeCredential, setCredential } from "./server/credentials.js";
 import { Kubectl } from "./server/kube.js";
@@ -58,10 +60,15 @@ export default function contribute(server: PluginServerContext) {
     const config = await getConfig();
     return { set: await removeCredential(kubeFor(config), config.credentialsSecret, key) };
   });
-  server.handle(kubeStatus, async () => ({
-    reaper: reaper.current(),
-    pods: registry.list().map((p) => ({ workspaceId: p.workspaceId, sandbox: p.sandbox, state: p.state, since: new Date(p.since).toISOString() })),
-  }));
+  server.handle(kubeStatus, async () => {
+    const config = await getConfig();
+    const [titles, agents] = await Promise.all([paseoWorkspaces(), paseoAgents()]);
+    const pods = await readPodRows(kubeFor(config), daemonId, registry.list(), titles, agents);
+    return { reaper: reaper.current(), pods };
+  });
+  server.handle(kubePodAction, ({ workspaceId, action, force, archive }) => runtime.podAction(workspaceId, action, { force, archive }));
+  server.handle(kubeReconcile, async () => ({ reaper: await reaper.run() }));
+
 
   return () => {
     runtime.stop();

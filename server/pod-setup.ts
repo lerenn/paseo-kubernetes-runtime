@@ -37,16 +37,29 @@ export async function initSubmodules(
   pod: string,
   cwd: string,
   targets: readonly FetchTarget[],
+  concurrency = 6,
 ): Promise<{ ok: boolean; message: string }> {
   const present = await kube.exec(pod, ["test", "-f", `${cwd}/.gitmodules`]);
   if (present.code !== 0) return { ok: true, message: "" };
-  // `git clone` does not run the fetch wrapper, so fill the submodules' mirrors first
-  for (const target of targets.filter((t) => !t.origin)) {
-    const r = await kube.exec(pod, ["sh", "-c", 'node "$HOME/bridge.mjs" call fetch "$HOME/mirrors/$1.git" </dev/null', "sh", target.id]);
-    if (r.code !== 0) return { ok: false, message: r.stderr.trim() };
-  }
-  const r = await kube.exec(pod, ["git", "-C", cwd, "submodule", "update", "--init"]);
+  // `git clone` does not run the fetch wrapper, so fill the submodules' mirrors first, several at a time
+  const queue = targets.filter((t) => !t.origin);
+  let failure = "";
+  const worker = async () => {
+    for (let target = queue.shift(); target && !failure; target = queue.shift()) {
+      const r = await kube.exec(pod, ["sh", "-c", 'node "$HOME/bridge.mjs" call fetch "$HOME/mirrors/$1.git" </dev/null', "sh", target.id]);
+      if (r.code !== 0) failure = r.stderr.trim() || "fetch failed";
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, worker));
+  if (failure) return { ok: false, message: failure };
+  const r = await kube.exec(pod, ["git", "-C", cwd, "submodule", "update", "--init", "--jobs", String(concurrency + 2)]);
   return { ok: r.code === 0, message: r.code === 0 ? "" : r.stderr.trim() };
+}
+
+/** Whether the checkout has submodules that are not checked out yet (`git submodule status` marks them with `-`). */
+export async function submodulesPending(kube: Kube, pod: string, cwd: string): Promise<boolean> {
+  const r = await kube.exec(pod, ["sh", "-c", 'test -f "$1/.gitmodules" && git -C "$1" submodule status', "sh", cwd]);
+  return r.code === 0 && r.stdout.split("\n").some((line) => line.startsWith("-"));
 }
 
 const SEED_SCRIPT = `set -e
