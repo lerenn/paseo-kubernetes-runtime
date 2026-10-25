@@ -107,6 +107,8 @@ interface WorkspaceState {
   labelled?: string;
   /** When labelling the pod or claim last failed (missing `patch` in the Role); retried after a while. */
   labelFailedAt?: number;
+  /** Consecutive reconnects of the bridge channel, for backoff. */
+  bridgeRetries: number;
   /** The pod the pod-side setup was last verified for; a replacement pod has another uid and is set up again. */
   readyUid?: string;
   commands: Set<string>;
@@ -125,6 +127,7 @@ export const RUNTIME_LABEL = "Kubernetes Runtime";
  * idle for a while, resumed by the next input, and deleted when the workspace is archived.
  */
 export class KubernetesRuntime {
+  private stopped = false;
   private readonly states = new Map<string, WorkspaceState>();
   private stopTicker: () => void = () => undefined;
   private readonly git: GitRunner;
@@ -151,6 +154,7 @@ export class KubernetesRuntime {
   }
 
   stop(): void {
+    this.stopped = true;
     this.stopTicker();
     for (const ws of this.states.values()) ws.bridge?.close();
   }
@@ -168,7 +172,34 @@ export class KubernetesRuntime {
       ws.sandbox = sandbox.name;
       ws.cwdFixed = true;
       this.setPhase(ws, sandbox.operatingMode === "Suspended" ? "suspended" : "running");
+      // A pod that runs when the plugin starts had its bridge (and with it the loopback tunnels its agents' MCP
+      // servers use) die with the previous plugin process: bring it back without waiting for the next launch.
+      if (sandbox.operatingMode !== "Suspended") void this.restoreBridge(kube, ws).catch(() => undefined);
     }
+  }
+
+  /** Ports the pod's processes still point at (`http://127.0.0.1:<port>` in their arguments or environment). */
+  private async tunnelPortsInUse(kube: Kube, pod: string): Promise<number[]> {
+    const r = await kube.exec(pod, [
+      "sh",
+      "-c",
+      `for f in /proc/[0-9]*/cmdline /proc/[0-9]*/environ; do tr '\\0' '\\n' < "$f" 2>/dev/null; done | grep -o 'http://127\\.0\\.0\\.1:[0-9]*' | sed 's/.*://' | sort -u`,
+    ]);
+    return r.code === 0 ? r.stdout.split("\n").map((l) => Number(l.trim())).filter((n) => Number.isInteger(n) && n > 0 && n < 65536) : [];
+  }
+
+  private async restoreBridge(kube: Kube, ws: WorkspaceState): Promise<void> {
+    const pod = ws.sandbox;
+    if (!pod || ws.bridge) return;
+    const info = await kube.podInfo(pod).catch(() => null);
+    if (!info?.ready || info.terminating) return;
+    await this.serial(ws, async () => {
+      if (ws.bridge || ws.phase !== "running") return;
+      for (const port of await this.tunnelPortsInUse(kube, pod)) ws.wantPorts.add(port);
+      ws.readyUid = info.uid;
+      this.startBridge(kube, ws, new Set([...ws.ports, ...ws.wantPorts]));
+      await this.refreshTargets(kube, ws, pod).catch(() => undefined);
+    });
   }
 
   private newState(id: string, options: RuntimeOptions): WorkspaceState {
@@ -178,6 +209,7 @@ export class KubernetesRuntime {
       phase: "none",
       ports: new Set(),
       wantPorts: new Set(),
+      bridgeRetries: 0,
       targets: [],
       commands: new Set(),
       agents: new Map(),
@@ -281,6 +313,7 @@ export class KubernetesRuntime {
   private startBridge(kube: Kube, ws: WorkspaceState, ports: Set<number>): void {
     ws.bridge?.close();
     ws.ports = ports;
+    const startedAt = this.now();
     ws.bridge = startBridge(
       kube,
       ws.sandbox!,
@@ -301,8 +334,22 @@ export class KubernetesRuntime {
             : pushToMirror(this.git, ws.options.cwd, request, targets);
         },
       },
-      { mapPort: this.deps.mapTunnelPort },
+      {
+        mapPort: this.deps.mapTunnelPort,
+        onEnd: () => {
+          // the channel to the pod's bridge ended (a network blip, a restarted API server): bring it back while the pod runs
+          if (ws.bridge !== bridge || ws.phase !== "running" || this.stopped) return;
+          ws.bridge = undefined;
+          // one that lived a while was healthy: start the backoff over
+          if (this.now() - startedAt > 60_000) ws.bridgeRetries = 0;
+          const attempt = ws.bridgeRetries++;
+          const delay = Math.min(30_000, 2_000 * 2 ** attempt);
+          const timer = setTimeout(() => void this.restoreBridge(kube, ws).catch(() => undefined), delay);
+          (timer as { unref?: () => void }).unref?.();
+        },
+      },
     );
+    const bridge = ws.bridge;
   }
 
   /** Brings the workspace's pod to a state where a provider process can start; cheap once it already is. */

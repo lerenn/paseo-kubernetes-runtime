@@ -240,6 +240,26 @@ describe("idle suspension asks Paseo before ending a pod", () => {
   });
 });
 
+describe("the tunnels survive a plugin restart", () => {
+  it("restarts the bridge of a running pod when the plugin starts, with the ports its processes still use", async () => {
+    const t = setup();
+    t.kube.sandboxes = [{ name: "pka-running", labels: { "paseo.sh/daemon": "srv_ME", "paseo.sh/workspace-id": "wks_1" }, annotations: { "paseo.sh/cwd": CWD }, operatingMode: "Running" as const, createdAt: new Date(0).toISOString() }];
+    t.kube.execResult = { code: 0, stdout: "8123\n9000\nnot-a-port\n", stderr: "" };
+    await t.runtime.start();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(t.kube.streams).toHaveLength(1);
+    expect(t.kube.streams[0]!.argv.at(-1)).toBe("8123,9000");
+  });
+
+  it("does not start a bridge for a suspended pod", async () => {
+    const t = setup();
+    t.kube.sandboxes = [{ name: "pka-s", labels: { "paseo.sh/daemon": "srv_ME", "paseo.sh/workspace-id": "wks_1" }, annotations: { "paseo.sh/cwd": CWD }, operatingMode: "Suspended" as const, createdAt: new Date(0).toISOString() }];
+    await t.runtime.start();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(t.kube.streams).toHaveLength(0);
+  });
+});
+
 describe("the 30 second limit on prepare", () => {
   it("returns from prepare when the window ends while the pod is still starting, and exec waits for the rest", async () => {
     const t = setup({}, { startWindowMs: 0 });
