@@ -25,6 +25,7 @@ function setup(settings: object = {}, extra: object = {}, kube = new FakeKube())
     now: () => clock++, // every read moves the clock a little, so a pod that never becomes ready times out
     ticker: () => () => undefined,
     log: () => undefined,
+    workspaceBusy: async () => false,
     ...extra,
   });
   const reg: WorkspaceRuntimeRegistration = runtime.registration();
@@ -207,6 +208,25 @@ describe("inherited runtimes and command execs", () => {
     t.advance(31 * MIN);
     await t.tick();
     await expect(exec({ interactive: false })).rejects.toThrow(/background refreshes/);
+  });
+});
+
+describe("idle suspension asks Paseo before ending a pod", () => {
+  it("does not suspend while Paseo says an agent is running in the workspace (a turn the plugin never saw start)", async () => {
+    let busy: boolean | null = true;
+    const t = setup({ podIdleMinutes: 30 }, { workspaceBusy: async () => busy });
+    await t.prepare();
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running"); // an agent is running: left alone, and the idle clock restarts
+    busy = null;
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running"); // unknown counts as busy
+    busy = false;
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("suspended");
   });
 });
 

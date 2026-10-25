@@ -9,6 +9,7 @@ import type { Kube, SandboxInfo } from "./kube.js";
 import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
 import { ensureCommand, ensureJq, initSubmodules, installAssets, seedWorkspace, setupMirrors, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
+import { paseoWorkspaceBusy } from "./orphans.js";
 import { PodRegistry, type PodState } from "./registry.js";
 import type {
   WorkspaceRuntimeActivityEvent,
@@ -71,6 +72,8 @@ export interface RuntimeDeps {
   /** Calls `fn` every `ms` until the returned stop function runs (injected for tests). */
   ticker?: (fn: () => void, ms: number) => () => void;
   sleep?: (ms: number) => Promise<void>;
+  /** Whether Paseo has an agent running a turn in this workspace directory; null when it cannot tell (injected for tests). */
+  workspaceBusy?: (cwd: string) => Promise<boolean | null>;
   /** How long `prepare` and `beforeInput` wait for the pod before returning and letting `exec` wait (Paseo gives them 15 minutes). */
   startWindowMs?: number;
   now?: () => number;
@@ -489,6 +492,13 @@ export class KubernetesRuntime {
     for (const ws of this.states.values()) {
       const busy = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
       if (ws.phase === "running" && !busy && this.now() - ws.lastActivity >= limit) {
+        // The activity events this plugin saw are not the whole story: after a plugin reload it has seen none, and a
+        // turn that started before it keeps running. Ask Paseo; if an agent is running (or it cannot say), wait.
+        const running = await (this.deps.workspaceBusy ?? paseoWorkspaceBusy)(ws.options.cwd).catch(() => null);
+        if (running !== false) {
+          ws.lastActivity = this.now();
+          continue;
+        }
         await this.serial(ws, () => this.suspend(ws)).catch(() => undefined);
       }
     }
