@@ -85,6 +85,8 @@ describe("seeded pod workspace and push-back (real git, real pod scripts)", () =
     expect(sh(podDir, "log", "-1", "--format=%s")).toBe("one");
     expect(sh(podDir, "branch", "--show-current")).toBe("main");
     expect(sh(podDir, "config", "remote.origin.pushurl")).toContain("outbox.git");
+    expect(sh(podDir, "status", "-sb")).not.toContain("gone"); // origin/main was fetched after the seed
+    expect(sh(podDir, "rev-parse", "origin/main")).toBe(sh(podDir, "rev-parse", "HEAD"));
     expect(sh(podDir, "config", "user.name")).toBeTruthy();
     expect(sh(project, "for-each-ref", "refs/kube-seed")).toBe(""); // temporary ref cleaned up
     expect((await kube.as(["sh", "-c", "env | grep -c GH_TOKEN || true"])).stdout.trim()).toBe("0");
