@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { KubernetesRuntime } from "../server/runtime.js";
+import { KubernetesRuntime, liveProviderChildren } from "../server/runtime.js";
 import { PodRegistry } from "../server/registry.js";
 import type { WorkspaceRuntimeRegistration } from "../server/runtime-types.js";
 import { ConfigSchema } from "../shared/settings.js";
@@ -234,6 +234,35 @@ describe("idle suspension asks Paseo before ending a pod", () => {
     await t.tick();
     expect(t.registry.list()[0]!.state).toBe("running"); // unknown counts as busy
     busy = false;
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+});
+
+describe("idle suspension and background work inside an agent's process", () => {
+  const idleTree = [
+    "    1     0 Ss   sleep infinity",
+    " 6433     0 Ssl  claude --output-format stream-json --verbose",
+    " 6345     0 Ssl  node /workspace/.home/bridge.mjs serve 47821",
+    "  974     1 Z    [esbuild] <defunct>",
+  ].join("\n");
+
+  it("sees a live child of the provider process as background work, and zombies and the bridge as nothing", () => {
+    expect(liveProviderChildren(idleTree)).toBe(false);
+    expect(liveProviderChildren(`${idleTree}\n15452  6433 Ss   /bin/bash -c sleep 240\n15483 15452 S    sleep 240`)).toBe(true);
+    expect(liveProviderChildren(`${idleTree}\n15452  6433 Z    [bash] <defunct>`)).toBe(false);
+    expect(liveProviderChildren("    1     0 Ss   sleep infinity\n 2 1 S unrelated")).toBe(false); // no provider process at all
+  });
+
+  it("does not suspend a workspace whose idle agent still has a background command running", async () => {
+    const t = setup({ podIdleMinutes: 30 });
+    await t.prepare();
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json\n15483  6433 S    sleep 240", stderr: "" };
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running");
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json", stderr: "" };
     t.advance(31 * MIN);
     await t.tick();
     expect(t.registry.list()[0]!.state).toBe("suspended");

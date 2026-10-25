@@ -542,13 +542,25 @@ export class KubernetesRuntime {
         // The activity events this plugin saw are not the whole story: after a plugin reload it has seen none, and a
         // turn that started before it keeps running. Ask Paseo; if an agent is running (or it cannot say), wait.
         const running = await (this.deps.workspaceBusy ?? paseoWorkspaceBusy)(ws.options.cwd).catch(() => null);
-        if (running !== false) {
+        // An agent between turns can still be waiting on a background shell, a timer or a watch inside its process
+        // (it shows as idle); suspending would kill that work. Live children of a claude/codex process mean busy.
+        const background = running === false ? await this.hasBackgroundWork(ws).catch(() => true) : false;
+        if (running !== false || background) {
           ws.lastActivity = this.now();
           continue;
         }
         await this.serial(ws, () => this.suspend(ws)).catch(() => undefined);
       }
     }
+  }
+
+  /** Whether a provider process in the pod has live child processes (background shells and timers of an idle agent). */
+  private async hasBackgroundWork(ws: WorkspaceState): Promise<boolean> {
+    if (!ws.sandbox) return false;
+    const config = await this.deps.getConfig();
+    const r = await this.deps.kubeFor(config).exec(ws.sandbox, ["ps", "-eo", "pid=,ppid=,stat=,args="]);
+    if (r.code !== 0) return true; // cannot tell: keep the pod
+    return liveProviderChildren(r.stdout);
   }
 
   /** The registration Paseo's fork takes. */
@@ -755,4 +767,26 @@ export class KubernetesRuntime {
 function slugFor(cwd: string): string {
   const base = cwd.split("/").filter(Boolean).pop() ?? "workspace";
   return base.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[^A-Za-z0-9]+/, "").slice(0, 63) || "workspace";
+}
+
+/**
+ * True when a `claude` or `codex` process listed by `ps -eo pid=,ppid=,stat=,args=` has a living (not zombie)
+ * descendant: its agent is running background work even if Paseo shows it idle.
+ */
+export function liveProviderChildren(psOutput: string): boolean {
+  const rows = psOutput
+    .split("\n")
+    .map((line) => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line))
+    .filter((m): m is RegExpExecArray => m !== null)
+    .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), stat: m[3]!, args: m[4]! }));
+  const provider = new Set(rows.filter((r) => /^(claude|codex)(\s|$)/.test(r.args)).map((r) => r.pid));
+  if (provider.size === 0) return false;
+  const byPid = new Map(rows.map((r) => [r.pid, r]));
+  return rows.some((r) => {
+    if (r.stat.startsWith("Z") || provider.has(r.pid)) return false;
+    for (let at = byPid.get(r.ppid), hops = 0; at && hops < 20; at = byPid.get(at.ppid), hops++) {
+      if (provider.has(at.pid)) return true;
+    }
+    return false;
+  });
 }
