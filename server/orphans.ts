@@ -60,6 +60,22 @@ export const paseoWorkspaceIds = async (exec?: Exec): Promise<Set<string> | null
   return found && new Set(found.keys());
 };
 
+/**
+ * Whether Paseo has an agent in `running` state in this workspace directory (including its subdirectories), from
+ * `paseo agent ls`. Null when the answer cannot be had, which callers treat as "busy".
+ */
+export async function paseoWorkspaceBusy(cwd: string, exec: Exec = execFileAsync as unknown as Exec): Promise<boolean | null> {
+  try {
+    const { stdout } = await exec("paseo", ["agent", "ls", "--json", "--global", "--background"], { timeout: 20_000 });
+    const agents = JSON.parse(stdout) as { status?: string; cwd?: string }[];
+    if (!Array.isArray(agents)) return null;
+    const root = cwd.replace(/\/+$/, "");
+    return agents.some((a) => a.status === "running" && typeof a.cwd === "string" && (a.cwd === root || a.cwd.startsWith(`${root}/`)));
+  } catch {
+    return null;
+  }
+}
+
 export interface ReapStatus {
   /** ISO time of the last run. */
   lastRunAt?: string;
