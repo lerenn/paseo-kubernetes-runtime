@@ -175,7 +175,11 @@ if (!url || !capability) {
  */
 export const UPLOAD_PACK_WRAPPER = String.raw`#!/bin/sh
 dir="$1"
-node "$HOME/bridge.mjs" call fetch "$dir" </dev/null >&2 || exit 1
+# remote.origin.uploadpack is global, so it also runs for a repository that has nothing to do with the daemon (a bare
+# repository a test made in /tmp): only the plugin's own mirrors are refreshed through the bridge
+case "$dir" in
+  "$HOME"/mirrors/*|"$HOME"/gh/*) node "$HOME/bridge.mjs" call fetch "$dir" </dev/null >&2 || exit 1 ;;
+esac
 exec git-upload-pack "$dir"
 `;
 
@@ -189,9 +193,16 @@ id=$(git config paseo.target 2>/dev/null)
 if [ -n "$id" ]; then id="x:$id"; else id=$(basename "$(pwd)" .git); fi
 while read old new ref; do
   if [ "$new" = "$ZERO" ]; then
-    echo "kube-agents: deleting remote branches from a pod is not supported" >&2
+    echo "kube-agents: deleting remote branches or tags from a pod is not supported" >&2
     exit 1
   fi
+  case "$ref" in
+    refs/tags/*)
+      if [ "$old" != "$ZERO" ]; then
+        echo "kube-agents: moving an existing tag from a pod is not supported" >&2
+        exit 1
+      fi ;;
+  esac
   { echo "$new"; git for-each-ref --format='^%(objectname)'; } | git pack-objects --revs --stdout --thin 2>/dev/null \
     | node "$HOME/bridge.mjs" call push "$ref" "$old" "$new" "$old" "$id" || exit 1
 done
@@ -207,9 +218,16 @@ export const PRE_RECEIVE_HOOK = String.raw`#!/bin/sh
 ZERO=0000000000000000000000000000000000000000
 while read old new ref; do
   if [ "$new" = "$ZERO" ]; then
-    echo "kube-agents: deleting remote branches from a pod is not supported" >&2
+    echo "kube-agents: deleting remote branches or tags from a pod is not supported" >&2
     exit 1
   fi
+  case "$ref" in
+    refs/tags/*)
+      if [ "$old" != "$ZERO" ]; then
+        echo "kube-agents: moving an existing tag from a pod is not supported" >&2
+        exit 1
+      fi ;;
+  esac
   base="$old"
   [ "$old" = "$ZERO" ] && base=$(cat "$HOME/seed.sha")
   { echo "$new"; echo "^$base"; } | git pack-objects --revs --stdout --thin 2>/dev/null \

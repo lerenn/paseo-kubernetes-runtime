@@ -29,6 +29,8 @@ export interface TcpFrame {
 
 const SHA = /^[0-9a-f]{40}$/;
 const BRANCH_REF = /^refs\/heads\/[A-Za-z0-9._/-]+$/;
+const TAG_REF = /^refs\/tags\/[A-Za-z0-9._/-]+$/;
+const ZERO_SHA = "0".repeat(40);
 const MAX_PACK_BYTES = 64 * 1024 * 1024;
 
 /**
@@ -43,7 +45,9 @@ export async function applyPush(
   destination: { dir: string; remote: string } = { dir: projectDir, remote: "origin" },
 ): Promise<BridgeReply> {
   const { ref, new: sha, old, base } = request;
-  if (!BRANCH_REF.test(ref) || ref.includes("..")) return { ok: false, message: `kube-agents: refusing to push ${ref}: only branches are pushed from pods` };
+  if (!(BRANCH_REF.test(ref) || TAG_REF.test(ref)) || ref.includes("..")) return { ok: false, message: `kube-agents: refusing to push ${ref}: only branches and new tags are pushed from pods` };
+  // a tag is only ever created: moving one is refused here as well as in the pod's hook
+  if (TAG_REF.test(ref) && old !== ZERO_SHA) return { ok: false, message: `kube-agents: moving the existing tag ${ref.replace("refs/tags/", "")} from a pod is not supported` };
   if (![sha, old, base].every((v) => SHA.test(v))) return { ok: false, message: "kube-agents: malformed push request" };
   const pack = Buffer.from(request.pack, "base64");
   if (pack.length > MAX_PACK_BYTES) return { ok: false, message: "kube-agents: push is too large to relay (over 64MB)" };

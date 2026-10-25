@@ -694,7 +694,9 @@ export class KubernetesRuntime {
           this.log(`[kubernetes-runtime] ${request.argv[0]} in ${pod} exited with ${code ?? signal}${lost ? " (pod lost or suspended)" : ""}${stderrTail.trim() ? `: ${scrub(stderrTail.trim())}` : ""}`);
         }
         if (lost && code !== 0) {
-          return { code, signal, reason: "runtime-lost" as const, message: "The pod was suspended or lost; the next message brings it back" };
+          // Our own idle suspension is a planned, clean stop (agents drop it quietly); a pod that vanished is not.
+          if (ws.phase === "suspended") return { code, signal, reason: "suspended" as const, message: "The idle pod was suspended; the next message brings it back" };
+          return { code, signal, reason: "runtime-lost" as const, message: "The pod was lost; the next message brings it back" };
         }
         return { code, signal, reason: "exited" as const };
       }),
