@@ -48,12 +48,16 @@ export interface SandboxInfo {
   annotations: Record<string, string>;
   operatingMode: "Running" | "Suspended";
   createdAt?: string;
+  /** The workspace container's image as the Sandbox asks for it. */
+  image?: string;
 }
 
 export interface ClaimInfo {
   name: string;
   labels: Record<string, string>;
   createdAt?: string;
+  /** Requested size, e.g. 10Gi. */
+  size?: string;
 }
 
 export function parseClaimList(json: any): ClaimInfo[] {
@@ -61,6 +65,7 @@ export function parseClaimList(json: any): ClaimInfo[] {
     name: item.metadata.name,
     labels: item.metadata.labels ?? {},
     createdAt: item.metadata.creationTimestamp,
+    ...(item.spec?.resources?.requests?.storage ? { size: item.spec.resources.requests.storage } : {}),
   }));
 }
 
@@ -71,6 +76,7 @@ export function parseSandboxList(json: any): SandboxInfo[] {
     annotations: item.metadata.annotations ?? {},
     operatingMode: item.spec?.operatingMode === "Suspended" ? "Suspended" : "Running",
     createdAt: item.metadata.creationTimestamp,
+    ...(item.spec?.podTemplate?.spec?.containers?.[0]?.image ? { image: item.spec.podTemplate.spec.containers[0].image } : {}),
   }));
 }
 

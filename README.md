@@ -36,7 +36,8 @@ Paseo daemon                                   cluster (paseo-agents)
   branch-off, a pull request head, or the checkout's own branch: the remote tip when the daemon's copy is behind, the
   local tip when it has unpushed commits), then bundles it from the project's own checkout (`git bundle`) and streams
   it into the pod over `pods/exec` stdin. Nothing is cloned from GitHub in the pod. The submodules recorded in the
-  seeded commit are checked out too, through the fetch bridge below.
+  seeded commit are fetched through the bridge below in the background (several at a time) while the agent starts, with
+  a notice when they are ready; an interrupted checkout resumes the next time the pod wakes.
 - **Fetch bridge (`git fetch`, `git pull`, `git submodule update`).** The pod has no GitHub credential. Git there is
   pointed at local mirror repositories (a global `url.<mirror>.insteadOf`) for the project's origin and each
   submodule, with `remote.origin.uploadpack` set to a wrapper that, before serving a fetch, asks the plugin over the
@@ -89,6 +90,14 @@ kubectl -n paseo-agents get pods -L paseo.sh/workspace,paseo.sh/agent,paseo.sh/s
 `paseo.sh/state` is `running` or `suspended` (a suspended workspace has no pod; its volume claim shows the state).
 `paseo.sh/workspace-id` and `paseo.sh/daemon` are what the orphan reconciler goes by. Updating the labels of an
 existing pod and claim needs `patch` on them in the daemon's Role; without it only the Sandbox's labels stay current.
+
+## The Pods table
+
+The Kubernetes Runtime screen lists the pods, one row per workspace: its title (opens the workspace), the pod name, the
+agents running in it, a state badge (running, suspended, creating, error), since when, the image (short name and digest)
+and the volume size. Per row: Suspend and Restart (running), Resume (suspended), and Delete, which asks first and offers to
+archive the workspace too. A pod with a running agent or a background command is only touched after a second
+confirmation that names what is running. Above the table, "Last reconcile" and a "Reconcile now" button.
 
 ## Settings
 

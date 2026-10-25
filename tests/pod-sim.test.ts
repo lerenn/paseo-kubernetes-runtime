@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -219,7 +219,11 @@ describe("fetching through the daemon (real git, real pod scripts)", () => {
 
   it("checks out the submodules of the seeded commit and updates them through the daemon", async () => {
     const { sub, root, kube, podDir, notices } = await openSession("sh", {}, undefined, {}, true);
-    expect(notices.join("\n")).not.toMatch(/submodules/);
+    // the agent can start before the submodules are in: they are fetched in the background
+    await wait(() => existsSync(join(podDir, "vendor/lib/lib.txt")));
+    await wait(() => notices.some((n) => /Submodules are ready/.test(n)));
+    expect(notices.join("\n")).toMatch(/Fetching the submodules in the background/);
+    expect(notices.join("\n")).not.toMatch(/Could not fetch/);
     expect(sh(podDir, "submodule", "status")).toContain("vendor/lib");
     expect(sh(join(podDir, "vendor/lib"), "log", "-1", "--format=%s")).toBe("lib one");
 

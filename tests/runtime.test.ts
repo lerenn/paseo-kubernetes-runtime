@@ -269,6 +269,76 @@ describe("idle suspension and background work inside an agent's process", () => 
   });
 });
 
+describe("submodules do not hold the agent back", () => {
+  it("returns from prepare while the submodule checkout is still running, then reports it", async () => {
+    const t = setup();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const exec = t.kube.exec.bind(t.kube);
+    t.kube.exec = async (pod: string, argv: string[]) => {
+      if (argv.includes("submodule") && argv.includes("update")) await gate; // a slow checkout
+      if (argv[2]?.includes("submodule status")) return { code: 0, stdout: "-abc123 vendor/lib\n", stderr: "" };
+      return exec(pod, argv);
+    };
+    await t.prepare(); // does not wait for the gate
+    expect(t.notices.map((n) => n[0])).toContain("Fetching the submodules in the background...");
+    expect(t.notices.map((n) => n[0])).not.toContain("Submodules are ready.");
+    release();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(t.notices.map((n) => n[0])).toContain("Submodules are ready.");
+  });
+});
+
+describe("the pod actions of the screen", () => {
+  async function running(extra: object = {}) {
+    const archived: string[] = [];
+    const t = setup({ podIdleMinutes: 30 }, { workspaceBusy: async () => false, archiveWorkspace: async (id: string) => void archived.push(id), ...extra });
+    await t.prepare();
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json", stderr: "" }; // no background work
+    return { t, archived };
+  }
+
+  it("suspends a quiet pod and resumes it", async () => {
+    const { t } = await running();
+    expect(await t.runtime.podAction("wks_1", "suspend")).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+    expect(await t.runtime.podAction("wks_1", "resume")).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("running");
+    expect(await t.runtime.podAction("wks_1", "resume")).toMatchObject({ ok: true, message: expect.stringContaining("already") });
+  });
+
+  it("refuses to touch a pod with a running agent or background work unless forced, and says why", async () => {
+    let busy: boolean | null = true;
+    const { t } = await running({ workspaceBusy: async () => busy });
+    expect(await t.runtime.podAction("wks_1", "suspend")).toMatchObject({ ok: false, busy: expect.stringContaining("agent is running") });
+    expect(await t.runtime.podAction("wks_1", "delete")).toMatchObject({ ok: false, busy: expect.stringContaining("agent is running") });
+    busy = null;
+    expect(await t.runtime.podAction("wks_1", "restart")).toMatchObject({ ok: false, busy: expect.stringContaining("could not say") });
+    busy = false;
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json\n15483  6433 S    sleep 240", stderr: "" };
+    expect(await t.runtime.podAction("wks_1", "suspend")).toMatchObject({ ok: false, busy: expect.stringContaining("background command") });
+    expect(t.registry.list()[0]!.state).toBe("running");
+    expect(await t.runtime.podAction("wks_1", "suspend", { force: true })).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+
+  it("restarts a quiet pod (suspend then resume on the same volume)", async () => {
+    const { t } = await running();
+    expect(await t.runtime.podAction("wks_1", "restart")).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("running");
+    const modes = t.kube.patches2.map((p) => p.patch.spec?.operatingMode).filter(Boolean);
+    expect(modes).toEqual(["Suspended", "Running"]);
+  });
+
+  it("deletes the Sandbox and volume, optionally archiving the workspace", async () => {
+    const { t, archived } = await running();
+    expect(await t.runtime.podAction("wks_1", "delete", { archive: true })).toEqual({ ok: true });
+    expect(t.kube.calls.filter((c) => c.startsWith("delete:"))).toEqual([expect.stringMatching(/^delete:sandbox\/pka-/), expect.stringMatching(/^delete:pvc\/workspace-pka-/)]);
+    expect(archived).toEqual(["wks_1"]);
+    expect(await t.runtime.podAction("wks_1", "suspend")).toMatchObject({ ok: false, message: expect.stringContaining("no pod") });
+  });
+});
+
 describe("the tunnels survive a plugin restart", () => {
   it("restarts the bridge of a running pod when the plugin starts, with the ports its processes still use", async () => {
     const t = setup();
