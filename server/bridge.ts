@@ -144,7 +144,7 @@ export function startBridge(
   pod: string,
   ports: readonly number[],
   handlers: BridgeHandlers,
-  options: { mapPort?: (port: number) => number } = {},
+  options: { mapPort?: (port: number) => number; /** Called when the channel ended without `close()` (the pod or the plugin's exec was lost). */ onEnd?: () => void } = {},
 ): RunningBridge {
   const stream = kube.execStream(pod, [
     "sh",
@@ -165,6 +165,7 @@ export function startBridge(
       const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true }));
       if (done || closed) {
         tunnels.closeAll();
+        if (!closed) options.onEnd?.();
         return;
       }
       if ((value as { tcp?: string }).tcp) {
