@@ -2,7 +2,8 @@ import { defineSettings } from "@getpaseo/plugin";
 import { z } from "zod";
 
 export const DEFAULT_NAMESPACE = "paseo-agents";
-export const DEFAULT_IMAGE = "ghcr.io/lerenn/paseo-kubernetes-runtime-default:latest";
+/** Pinned by digest, built by the image workflow from image/Dockerfile (bump it with each image release). */
+export const DEFAULT_IMAGE = "ghcr.io/lerenn/paseo-kubernetes-runtime-default@sha256:f4aedb1145658527f3e43dd1ae6d95a917b39e94799491eae6f9c400ccd8e3b5";
 
 /** Where a workspace pod's `/workspace` (the checkout, HOME and the agents' session state) lives. */
 export const StorageSchema = z.object({
