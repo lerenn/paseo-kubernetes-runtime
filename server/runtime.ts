@@ -666,6 +666,9 @@ export class KubernetesRuntime {
     for (const ws of this.states.values()) {
       const busy = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
       if (ws.phase === "running" && !busy && this.now() - ws.lastActivity >= limit) {
+        // What this decision is based on. The checks below take a while (Paseo's answer, a look inside the pod), and a
+        // prompt can arrive in the meantime: it moves `lastActivity`, and the suspend must not go ahead then.
+        const decidedAt = ws.lastActivity;
         // The activity events this plugin saw are not the whole story: after a plugin reload it has seen none, and a
         // turn that started before it keeps running. Ask Paseo; if an agent is running (or it cannot say), wait.
         const running = await (this.deps.workspaceBusy ?? paseoWorkspaceBusy)(ws.options.cwd).catch(() => null);
@@ -676,7 +679,11 @@ export class KubernetesRuntime {
           ws.lastActivity = this.now();
           continue;
         }
-        await this.serial(ws, () => this.suspend(ws)).catch(() => undefined);
+        await this.serial(ws, async () => {
+          const busyNow = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
+          if (ws.phase !== "running" || ws.lastActivity !== decidedAt || busyNow) return; // someone used it since: leave it running
+          await this.suspend(ws);
+        }).catch(() => undefined);
       }
     }
   }
