@@ -9,6 +9,7 @@ import { readStatus, removeCredential, setCredential } from "./server/credential
 import { Kubectl } from "./server/kube.js";
 import { migrateLegacyData } from "./server/migrate.js";
 import { OrphanReaper } from "./server/orphans.js";
+import { podOnlyAgent, podOnlyWorkspace } from "./server/pod-only.js";
 import { PodRegistry } from "./server/registry.js";
 import { KubernetesRuntime } from "./server/runtime.js";
 import type { WorkspaceRuntimeRegistration } from "./server/runtime-types.js";
@@ -57,6 +58,16 @@ export default function contribute(server: PluginServerContext) {
     } catch {
       // labels are an optimisation of access, never a reason to stop a session
     }
+  });
+
+  // Pod-only mode (off by default). A refusal is the hook's error, shown to whoever made the request.
+  server.before("workspace.create", async ({ request }) => {
+    const { podOnly } = await getConfig();
+    return podOnlyWorkspace(request as never, podOnly) as never;
+  });
+  server.before("agent.create", async ({ request }) => {
+    const { podOnly } = await getConfig();
+    podOnlyAgent(request as never, podOnly);
   });
 
   const reaper = new OrphanReaper({
