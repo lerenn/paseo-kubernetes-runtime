@@ -98,6 +98,8 @@ export function specHash(config: KubernetesRuntimeConfig, cwd: string): string {
     resources: config.resources ?? null,
     nodeSelector: config.nodeSelector,
     tolerationKeys: config.tolerationKeys,
+    tolerations: config.tolerations,
+    podAnnotations: config.podAnnotations,
     storage: config.storage,
     credentialsSecret: config.credentialsSecret,
     apiVersion: config.sandboxApiVersion,
@@ -127,10 +129,11 @@ export function warmSandboxName(): string {
 }
 
 /** Turns a warm pod into a workspace's pod: ownership and display labels on the Sandbox, its pod template (the controller copies them onto the running pod) and the directory annotation. */
-export function claimPatch(workspaceId: string, cwd: string, meta: PodMeta): Record<string, unknown> {
+export function claimPatch(workspaceId: string, cwd: string, meta: PodMeta, config?: KubernetesRuntimeConfig): Record<string, unknown> {
   const labels = { [WORKSPACE_ID_LABEL]: workspaceId, ...metaLabels(meta) };
   const annotations = { [CWD_ANNOTATION]: cwd, ...metaAnnotations(meta) };
-  return { metadata: { labels, annotations }, spec: { podTemplate: { metadata: { labels, annotations } } } };
+  // a pod that works for a workspace gets the annotations that keep the autoscaler off its node
+  return { metadata: { labels, annotations }, spec: { podTemplate: { metadata: { labels, annotations: { ...annotations, ...(config?.podAnnotations ?? {}) } } } } };
 }
 
 /** A `Sandbox` (agents.x-k8s.io) whose single container idles; provider processes are started in it by `kubectl exec`. */
@@ -166,7 +169,10 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
       service: false,
       ...volumeClaims(config, owner),
       podTemplate: {
-        metadata: { labels: podLabels, ...(meta ? { annotations: metaAnnotations(meta) } : {}) },
+        metadata: {
+          labels: podLabels,
+          ...(!warm && (meta || Object.keys(config.podAnnotations).length) ? { annotations: { ...(meta ? metaAnnotations(meta) : {}), ...config.podAnnotations } } : {}),
+        },
         spec: {
           restartPolicy: "Never",
           automountServiceAccountToken: false,
@@ -184,9 +190,12 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
   };
 }
 
-function placement(config: KubernetesRuntimeConfig) {
+export function placement(config: KubernetesRuntimeConfig) {
   const { nodeSelector } = config;
-  const tolerations = config.tolerationKeys.map((key) => ({ key, operator: "Exists" }));
+  const tolerations = [
+    ...config.tolerationKeys.map((key) => ({ key, operator: "Exists" })),
+    ...config.tolerations.map((t) => ({ key: t.key, operator: t.operator, ...(t.value !== undefined ? { value: t.value } : {}), ...(t.effect ? { effect: t.effect } : {}) })),
+  ];
   return {
     ...(Object.keys(nodeSelector).length > 0 ? { nodeSelector } : {}),
     ...(tolerations.length > 0 ? { tolerations } : {}),
@@ -239,7 +248,11 @@ export function resumePatch(config: KubernetesRuntimeConfig, cwd?: string) {
     metadata: { annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT) } },
     spec: {
       operatingMode: "Running",
-      podTemplate: { spec: { initContainers: [volumeInit(config)], containers: [workspaceContainer(config, cwd)] } },
+      // placement and annotations too: a resumed pod follows the settings of today (a node pool that changed, the autoscaler's hint)
+      podTemplate: {
+        ...(Object.keys(config.podAnnotations).length ? { metadata: { annotations: config.podAnnotations } } : {}),
+        spec: { ...placement(config), initContainers: [volumeInit(config)], containers: [workspaceContainer(config, cwd)] },
+      },
     },
   };
 }
