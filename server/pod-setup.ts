@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { HOME_DIR } from "./sandbox.js";
 import { BRIDGE_SCRIPT, FS_SCRIPT, INSTALLABLE_CLIS, GIT_REMOTE_HELPER, MIRROR_PRE_RECEIVE, PRE_RECEIVE_HOOK, UPLOAD_PACK_WRAPPER, envFile } from "./pod-assets.js";
@@ -201,4 +203,34 @@ export async function recordSubmoduleFailure(kube: Kube, pod: string, now: numbe
 
 export async function clearSubmoduleFailure(kube: Kube, pod: string): Promise<void> {
   await kube.exec(pod, ["rm", "-f", `${HOME_DIR}/${SUBMODULE_MARKER}`]).catch(() => undefined);
+}
+
+export interface SeedDir {
+  from: string;
+  to: string;
+  exclude: readonly string[];
+}
+
+const seedMarker = (seed: SeedDir) => `/workspace/.seeded/${createHash("sha1").update(`${seed.from}\n${seed.to}`).digest("hex").slice(0, 16)}`;
+
+/**
+ * Copies a daemon directory into the pod's volume once: `tar` on the daemon streams into `tar` in the pod over exec, so
+ * the data goes from where it is to the volume and nowhere else. A marker on the volume records that it was done;
+ * a failed copy leaves no marker and is tried again at the next start. Returns whether a copy ran.
+ */
+export async function seedDirectory(kube: Kube, pod: string, seed: SeedDir, onStart: () => void = () => undefined, spawnTar: typeof spawn = spawn): Promise<boolean> {
+  const marker = seedMarker(seed);
+  if ((await kube.exec(pod, ["test", "-e", marker])).code === 0) return false;
+  onStart();
+  const tar = spawnTar("tar", ["-C", seed.from, ...seed.exclude.map((e) => `--exclude=${e}`), "-cf", "-", "."], { stdio: ["ignore", "pipe", "pipe"] });
+  let tarError = "";
+  tar.stderr!.on("data", (d) => (tarError += d));
+  const tarExit = new Promise<number>((resolve) => tar.on("close", (code) => resolve(code ?? 1)).on("error", () => resolve(1)));
+  const target = `/workspace/${seed.to}`;
+  const r = await kube.execInput(pod, ["sh", "-c", 'mkdir -p "$1" && tar -C "$1" -xf -', "sh", target], tar.stdout as Readable);
+  const code = await tarExit;
+  if (r.code !== 0 || code !== 0) throw new Error(`could not copy ${seed.from} into the pod: ${(r.stderr.trim() || tarError.trim() || `exit ${r.code}/${code}`).split("\n")[0]}`);
+  const done = await kube.exec(pod, ["sh", "-c", 'mkdir -p "$(dirname "$1")" && date -u +%FT%TZ > "$1"', "sh", marker]);
+  if (done.code !== 0) throw new Error(`copied ${seed.to} but could not record it: ${done.stderr.trim()}`);
+  return true;
 }

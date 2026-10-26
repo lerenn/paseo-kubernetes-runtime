@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
+import { applyProfile } from "../shared/settings.js";
 import { parseRuntimeOptions, type RuntimeOptions } from "../shared/runtime-options.js";
 import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, serveFetchChunk, type FetchTarget } from "./mirrors.js";
 import { applyPush, loopbackPorts, startBridge, type RunningBridge } from "./bridge.js";
@@ -7,7 +8,7 @@ import type { KubernetesRuntimeConfig } from "./config.js";
 import { type GitRunner, runGit, scrub } from "./git.js";
 import type { Kube, PodProcess, SandboxInfo } from "./kube.js";
 import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
-import { ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, clearSubmoduleFailure, recordSubmoduleFailure, submoduleWait, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
+import { ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, clearSubmoduleFailure, recordSubmoduleFailure, submoduleWait, seedDirectory, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
 import { paseoWorkspaceBusy } from "./orphans.js";
 import { WARM_PREFIX, shortImage } from "./status.js";
@@ -308,6 +309,18 @@ export class KubernetesRuntime {
     return { name: await read("user.name", "Paseo Agent"), email: await read("user.email", "agent@paseo.invalid") };
   };
 
+  /** The directories a workspace's profile has copied into its volume, once (a marker on the volume). A failure is a warning: the agent can start and the copy is tried again at the next start. */
+  private async seedProfileDirs(kube: Kube, ws: WorkspaceState, pod: string, ctx: WorkspaceRuntimeContext): Promise<void> {
+    const profile = ws.options.profile ? (await this.deps.getConfig()).profiles[ws.options.profile] : undefined;
+    for (const seed of profile?.seed ?? []) {
+      try {
+        if (await seedDirectory(kube, pod, seed, () => ctx.notice(`Copying ${seed.from} into the pod as /workspace/${seed.to} (once)...`))) ctx.notice(`${seed.to} is in the pod.`);
+      } catch (error) {
+        ctx.notice(`Could not copy ${seed.to}: ${(error as Error).message}`, "warning");
+      }
+    }
+  }
+
   private async seedIfEmpty(kube: Kube, ws: WorkspaceState, pod: string, ctx: WorkspaceRuntimeContext): Promise<void> {
     const { cwd } = ws.options; // on the daemon
     const root = this.podRoot(ws); // in the pod
@@ -436,7 +449,7 @@ export class KubernetesRuntime {
     ctx: WorkspaceRuntimeContext,
     need: { command?: string; mcpServers?: Record<string, unknown>; env?: Record<string, string> } = {},
   ): Promise<void> {
-    const config = await this.deps.getConfig();
+    const config = applyProfile(await this.deps.getConfig(), ws.options.profile);
     const kube = this.deps.kubeFor(config);
     const { cwd } = ws.options;
     const ops = opsEnv(need.env);
@@ -466,7 +479,7 @@ export class KubernetesRuntime {
       ws.repoUrl = repo.url;
       const serviceAccount = serviceAccountFor(config, this.agentLabels(ws));
       // a running pod cannot change ServiceAccount, so only a pod without one is taken from the warm pool
-      const warm = layout === "mapped" && !serviceAccount ? await this.claimWarm(kube, config, ws) : undefined;
+      const warm = layout === "mapped" && !serviceAccount && !ws.options.profile ? await this.claimWarm(kube, config, ws) : undefined;
       if (warm) {
         ctx.notice("Using a pod that was already running...");
         ws.sandbox = warm.name;
@@ -511,6 +524,7 @@ export class KubernetesRuntime {
       await ensureJq(kube, pod);
       if (!ws.bridge || grows || ws.readyUid !== info.uid) this.startBridge(kube, ws, wanted); // before seeding: submodules are fetched through it
       await this.seedIfEmpty(kube, ws, pod, ctx);
+      await this.seedProfileDirs(kube, ws, pod, ctx);
       await this.refreshTargets(kube, ws, pod);
       this.startSubmodules(kube, ws, pod);
       if (need.command && !ws.commands.has(need.command)) {

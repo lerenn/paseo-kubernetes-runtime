@@ -15,6 +15,39 @@ export const StorageSchema = z.object({
   storageClassName: z.string().optional(),
 });
 
+/** A named variant of the pod configuration, chosen per workspace (runtime option `profile`). Only what is listed here changes. */
+/** A directory of the daemon copied once into the pod's volume (data that is not in git, such as a test corpus). */
+export const SeedDirSchema = z.object({
+  /** Absolute path on the daemon. */
+  from: z.string().startsWith("/"),
+  /** Directory under /workspace in the pod, `name` or `a/b`; it must not be `checkout` or `.home`. */
+  to: z
+    .string()
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/, "A relative path under /workspace")
+    .refine((t) => !t.split("/").includes("..") && !["checkout", ".home"].includes(t.split("/")[0]!), "Not the checkout or the home"),
+  /** `tar --exclude` patterns. */
+  exclude: z.array(z.string()).default([]),
+});
+
+export const ProfileSchema = z.object({
+  /** Copied into the volume the first time the workspace starts; a marker on the volume keeps it from being copied again. */
+  seed: z.array(SeedDirSchema).default([]),
+  image: z.string().min(1).optional(),
+  /** Overrides the size and storage class of a new workspace volume. An existing volume keeps its claim. */
+  storage: z
+    .object({
+      size: z.string().regex(/^[1-9][0-9]*(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$/, "Use a Kubernetes quantity such as 40Gi").optional(),
+      storageClassName: z.string().optional(),
+    })
+    .optional(),
+  resources: z
+    .object({
+      requests: z.record(z.string(), z.string()).optional(),
+      limits: z.record(z.string(), z.string()).optional(),
+    })
+    .optional(),
+});
+
 export const ConfigSchema = z.object({
   /** kubectl context. Unset uses the current context of the daemon's kubeconfig. */
   context: z.string().optional(),
@@ -32,6 +65,12 @@ export const ConfigSchema = z.object({
   /** Secret (keys become env vars: CLAUDE_CODE_OAUTH_TOKEN) mounted by envFrom. */
   credentialsSecret: z.string().default("paseo-agent-credentials"),
   readyTimeoutSeconds: z.number().int().positive().default(300),
+  /**
+   * Named variants for workspaces that need another image or a bigger volume (e.g. `prbr-picky`), chosen with the
+   * workspace's runtime option `profile`. A name that is not listed here refuses the workspace. Workspaces with a
+   * profile never take a warm pod.
+   */
+  profiles: z.record(z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), ProfileSchema).default({}),
   /** Pod placement (e.g. {"lab.anyshift.io/pool": "burst"}). */
   nodeSelector: z.record(z.string(), z.string()).default({}),
   /** Taint keys every pod tolerates (operator Exists). */
@@ -114,6 +153,19 @@ export const ConfigSchema = z.object({
 });
 
 export type KubernetesRuntimeConfig = z.infer<typeof ConfigSchema>;
+
+/** The configuration a workspace runs with: the settings, with its profile's image, storage and resources applied. */
+export function applyProfile(config: KubernetesRuntimeConfig, profile: string | undefined): KubernetesRuntimeConfig {
+  if (!profile) return config;
+  const p = config.profiles[profile];
+  if (!p) throw new Error(`This workspace asks for the pod profile "${profile}", which the Kubernetes Runtime settings do not define (profiles: ${Object.keys(config.profiles).join(", ") || "none"})`);
+  return {
+    ...config,
+    ...(p.image ? { image: p.image } : {}),
+    ...(p.resources ? { resources: { ...config.resources, ...p.resources } } : {}),
+    storage: { ...config.storage, ...(p.storage?.size ? { size: p.storage.size } : {}), ...(p.storage?.storageClassName ? { storageClassName: p.storage.storageClassName } : {}) },
+  };
+}
 
 /**
  * v1 had named templates and `defaultImage`. v2 is one flat pod configuration: the old `default`

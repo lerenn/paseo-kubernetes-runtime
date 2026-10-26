@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -57,7 +57,7 @@ afterEach(() => {
   while (cleanups.length) cleanups.pop()!();
 });
 
-async function openSession(argv0 = "sh", mcpServers: Record<string, any> = {}, tunnel?: { pod: number; daemon: number }, env: Record<string, string> = {}, withSubmodule = false, extra: { config?: object; git?: (args: string[], o?: any) => Promise<any> } = {}) {
+async function openSession(argv0 = "sh", mcpServers: Record<string, any> = {}, tunnel?: { pod: number; daemon: number }, env: Record<string, string> = {}, withSubmodule = false, extra: { config?: object; options?: object; git?: (args: string[], o?: any) => Promise<any> } = {}) {
   const { origin, project, sub, root } = repos(withSubmodule);
   const kube = new LocalPodKube(project);
   const runtime = new KubernetesRuntime({
@@ -76,7 +76,7 @@ async function openSession(argv0 = "sh", mcpServers: Record<string, any> = {}, t
   const notices: string[] = [];
   const ctx = { notice: (m: string) => void notices.push(m), signal: new AbortController().signal };
   await runtime.registration().prepare!(
-    { workspaceId: "wks_1", options: { cwd: project, slug: "brave-otter-12", ref: null }, purpose: "session", argv: [argv0], env, mcpServers } as never,
+    { workspaceId: "wks_1", options: { cwd: project, slug: "brave-otter-12", ref: null, ...extra.options }, purpose: "session", argv: [argv0], env, mcpServers } as never,
     ctx,
   );
   return { origin, project, sub, root, kube, podDir: kube.checkout, notices, runtime };
@@ -203,6 +203,39 @@ describe("seeded pod workspace and push-back (real git, real pod scripts)", () =
     const cloned = await kube.as(["git", "clone", "-q", bare, again]);
     expect(cloned.code, cloned.stderr).toBe(0);
     expect(podDir).toBeTruthy();
+  });
+});
+
+describe("pod profiles (real pod scripts)", () => {
+  it("copies a daemon directory into the volume once, honouring excludes, and says so", async () => {
+    const data = mkdtempSync(join(tmpdir(), "kube-corpus-"));
+    mkdirSync(join(data, "runs"));
+    writeFileSync(join(data, "corpus.json"), '{"cases":3}');
+    writeFileSync(join(data, "runs", "baseline.json"), "{}");
+    mkdirSync(join(data, "cache"));
+    writeFileSync(join(data, "cache", "junk"), "x");
+    const config = { profiles: { "prbr-picky": { seed: [{ from: data, to: "prbr-picky", exclude: ["./cache"] }] } } };
+    const first = await openSession("sh", {}, undefined, {}, false, { config, options: { profile: "prbr-picky" } });
+    const pod = join(first.kube.workspace, "prbr-picky");
+    expect(readFileSync(join(pod, "corpus.json"), "utf8")).toBe('{"cases":3}');
+    expect(existsSync(join(pod, "runs", "baseline.json"))).toBe(true);
+    expect(existsSync(join(pod, "cache"))).toBe(false);
+    expect(first.notices.join("\n")).toMatch(/Copying .* as \/workspace\/prbr-picky \(once\)/);
+    expect(first.notices.join("\n")).toContain("prbr-picky is in the pod.");
+    // the same volume, started again: the marker keeps it from being copied again, and what the agent changed stays
+    writeFileSync(join(pod, "corpus.json"), "changed by the agent");
+    const marker = (await first.kube.as(["sh", "-c", "ls /workspace/.seeded | wc -l"])).stdout.trim();
+    expect(marker).toBe("1");
+    const again = await import("../server/pod-setup.js").then((m) => m.seedDirectory(first.kube, "pod", { from: data, to: "prbr-picky", exclude: ["./cache"] }));
+    expect(again).toBe(false);
+    expect(readFileSync(join(pod, "corpus.json"), "utf8")).toBe("changed by the agent");
+  });
+
+  it("starts the workspace with a warning, and no marker, when the copy fails", async () => {
+    const config = { profiles: { broken: { seed: [{ from: "/does/not/exist", to: "corpus" }] } } };
+    const s = await openSession("sh", {}, undefined, {}, false, { config, options: { profile: "broken" } });
+    expect(s.notices.join("\n")).toMatch(/Could not copy corpus/);
+    expect((await s.kube.as(["sh", "-c", "ls /workspace/.seeded 2>/dev/null | wc -l"])).stdout.trim()).toBe("0");
   });
 });
 

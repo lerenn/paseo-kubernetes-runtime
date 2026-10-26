@@ -147,6 +147,31 @@ published to `ghcr.io/lerenn/paseo-kubernetes-runtime-default`; `DEFAULT_IMAGE` 
 (the workflow prints the new digest in its summary). A custom image needs node and git; claude, codex and a verified jq are
 installed on first use when missing.
 
+## Pod profiles (another image, a bigger volume, seeded data)
+
+A workspace that needs more than the default pod picks a named profile from the `profiles` setting, with the runtime option `profile`.
+A profile can change the image, the resources, the size and class of the volume (for a new volume: an existing claim keeps its size),
+and list daemon directories to copy into the volume once:
+
+```json
+"profiles": {
+  "prbr-picky": {
+    "image": "ghcr.io/lerenn/paseo-kubernetes-runtime-go@sha256:<digest>",
+    "storage": { "size": "10Gi" },
+    "resources": { "requests": { "cpu": "1", "memory": "4Gi" } },
+    "seed": [ { "from": "/home/paseo/prbr-picky", "to": "prbr-picky", "exclude": ["./runs/*/tmp"] } ]
+  }
+}
+```
+
+- A name that is not in `profiles` refuses the workspace with the list of known ones. A workspace with a profile never takes a warm pod.
+- `seed` streams `tar` from the daemon into the pod's volume (`/workspace/<to>`), so the data goes from where it is to the volume and nowhere
+  else (no bucket, no token). A marker on the volume (`/workspace/.seeded/`) stops a second copy; delete the marker to copy again.
+  A failed copy is a warning and is tried again at the next start. `to` cannot be `checkout` or `.home`.
+- `image/go/Dockerfile` is the default image plus Go 1.25, published by the `image` workflow as `ghcr.io/lerenn/paseo-kubernetes-runtime-go`.
+- Making such a workspace: create a Pod workspace on the project that holds the code (for prbr-picky, a pr-blast-reviewer checkout) with the
+  runtime options `{ "cwd": "<the daemon's checkout>", "profile": "prbr-picky" }`; the data appears next to the checkout at `/workspace/prbr-picky`.
+
 ## Cluster requirements
 
 See [docs/rbac-and-network.md](docs/rbac-and-network.md): Role for the daemon ServiceAccount, the credentials Secret,

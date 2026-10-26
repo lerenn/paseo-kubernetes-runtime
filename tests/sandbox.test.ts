@@ -1,7 +1,34 @@
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../server/config.js";
+import { applyProfile } from "../shared/settings.js";
 import { buildSandbox, resumePatch, sandboxName, serviceAccountFor } from "../server/sandbox.js";
 import { toHttpsRemote } from "../server/workspace.js";
+
+describe("pod profiles", () => {
+  const base = ConfigSchema.parse({ image: "default:1", storage: { mode: "persistent", size: "10Gi", storageClassName: "gp3" }, profiles: { "prbr-picky": { image: "go:1.25", storage: { size: "20Gi" }, resources: { requests: { memory: "4Gi" } } } } });
+
+  it("applies a profile's image, volume size and resources, keeping the rest", () => {
+    const c = applyProfile(base, "prbr-picky");
+    expect(c.image).toBe("go:1.25");
+    expect(c.storage).toEqual({ mode: "persistent", size: "20Gi", storageClassName: "gp3" });
+    const sb = buildSandbox({ name: "n", workspaceId: "wks_1", cwd: "/x/y", config: c }) as any;
+    expect(sb.spec.podTemplate.spec.containers[0].image).toBe("go:1.25");
+    expect(sb.spec.volumeClaimTemplates[0].spec.resources.requests.storage).toBe("20Gi");
+    expect(sb.spec.podTemplate.spec.containers[0].resources.requests.memory).toBe("4Gi");
+  });
+
+  it("changes nothing without a profile and refuses one the settings do not define", () => {
+    expect(applyProfile(base, undefined)).toBe(base);
+    expect(() => applyProfile(base, "nope")).toThrow(/profile "nope".*prbr-picky/);
+  });
+
+  it("refuses a seed that targets the checkout or the home", () => {
+    for (const to of ["checkout", ".home/x", "../x", "a/../b", "/abs"]) {
+      expect(ConfigSchema.safeParse({ profiles: { p: { seed: [{ from: "/data", to }] } } }).success, to).toBe(false);
+    }
+    expect(ConfigSchema.safeParse({ profiles: { p: { seed: [{ from: "/data", to: "prbr-picky" }] } } }).success).toBe(true);
+  });
+});
 
 describe("sandbox manifest", () => {
   const config = ConfigSchema.parse({ image: "go:1", nodeSelector: { pool: "burst" } });
