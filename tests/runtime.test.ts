@@ -380,6 +380,22 @@ describe("submodules do not hold the agent back", () => {
   });
 });
 
+describe("an idle suspend ends the agent's process itself", () => {
+  it("terminates the provider process and reports the planned exit before the pod is touched, so a resume right after cannot turn it into a lost pod", async () => {
+    const t = setup({ podIdleMinutes: 30 });
+    const p = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.advance(31 * MIN);
+    await t.tick(); // suspends: SIGTERM first, wait for the exit, then delete the pod
+    expect(t.kube.procs[0]!.killed).toEqual(["SIGTERM"]);
+    const order = t.kube.calls.filter((c) => c === "spawn" || c.startsWith("patch:"));
+    expect(order[order.length - 1]).toMatch(/^patch:/); // the pod went last
+    // a Git poll resumes the workspace while the old pod is still terminating
+    expect(await t.runtime.podAction("wks_1", "resume")).toEqual({ ok: true });
+    t.kube.pods = [{ uid: "old", ready: false, terminating: true }];
+    expect(await p.exit).toMatchObject({ reason: "suspended", message: expect.stringContaining("idle pod was suspended") });
+  });
+});
+
 describe("stopping the plugin", () => {
   it("ends the provider processes itself and reports each as a planned stop, so idle agents drop them quietly", async () => {
     const t = setup();
@@ -396,6 +412,7 @@ describe("stopping the plugin", () => {
 
   it("does not hang the shutdown on a process that will not die", async () => {
     const t = setup();
+    t.kube.killEnds = false;
     await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
     const started = Date.now();
     await t.runtime.stop(); // the fake process never ends: the wait is bounded
