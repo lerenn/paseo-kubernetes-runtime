@@ -1,13 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import { parseRuntimeOptions, type RuntimeOptions } from "../shared/runtime-options.js";
-import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, type FetchTarget } from "./mirrors.js";
+import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, serveFetchChunk, type FetchTarget } from "./mirrors.js";
 import { applyPush, loopbackPorts, startBridge, type RunningBridge } from "./bridge.js";
 import type { KubernetesRuntimeConfig } from "./config.js";
 import { type GitRunner, runGit, scrub } from "./git.js";
 import type { Kube, PodProcess, SandboxInfo } from "./kube.js";
 import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
-import { ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
+import { ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, clearSubmoduleFailure, recordSubmoduleFailure, submoduleWait, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
 import { paseoWorkspaceBusy } from "./orphans.js";
 import { WARM_PREFIX, shortImage } from "./status.js";
@@ -340,10 +340,21 @@ export class KubernetesRuntime {
     const notice = (message: string, level?: "info" | "warning" | "error") => ws.notice?.(message, level);
     ws.submodulesJob = (async () => {
       if (!(await submodulesPending(kube, pod, cwd))) return;
+      // a fetch that failed is not tried again at every start: the pod remembers it, with a growing wait
+      const wait = await submoduleWait(kube, pod, this.now());
+      if (wait.ms > 0) {
+        notice(`Fetching the submodules failed earlier; not trying again for ${Math.ceil(wait.ms / 60_000)} min. Run \`git submodule update --init\` in the pod to retry now.`, "warning");
+        return;
+      }
       notice("Fetching the submodules in the background...");
       const r = await initSubmodules(kube, pod, cwd, ws.targets);
-      if (r.ok) notice("Submodules are ready.");
-      else notice(`Could not fetch the submodules (run \`git submodule update --init\` in the pod to retry): ${r.message}`, "warning");
+      if (r.ok) {
+        await clearSubmoduleFailure(kube, pod);
+        notice("Submodules are ready.");
+      } else {
+        await recordSubmoduleFailure(kube, pod, this.now(), wait.attempts);
+        notice(`Could not fetch the submodules (run \`git submodule update --init\` in the pod to retry): ${r.message}`, "warning");
+      }
     })()
       .catch(() => undefined)
       .finally(() => {
@@ -383,6 +394,7 @@ export class KubernetesRuntime {
       [...ports],
       {
         handle: async (request) => {
+          if (request.op === "fetch-chunk") return serveFetchChunk(request);
           if (request.op === "push" && !request.mirror) return applyPush(this.git, ws.options.cwd, request);
           // a repository a pod asked for by name is checked against the "Other repositories" setting
           const mirror = request.mirror;
@@ -651,19 +663,20 @@ export class KubernetesRuntime {
   }
 
   /**
-   * What the sidebar shows beside the runtime icon: the image's short name, with the pod and its state in the tooltip
+   * What the sidebar shows for the runtime: the icon alone, with the image name, pod and state in the tooltip
    * and the header. Answered from what is already known: it never starts or reads the pod.
    */
   describeWorkspace(request: WorkspaceRuntimeWorkspaceRequest): WorkspaceRuntimeDisplay | null {
     const ws = this.states.get(request.workspaceId);
-    if (!ws?.sandbox) return { label: "no pod yet", detail: "Kubernetes pod · not started yet" };
+    if (!ws?.sandbox) return { tooltip: "Kubernetes pod\nNo pod yet", detail: "Kubernetes pod · not started yet" };
     const short = shortImage(ws.image);
     const name = short?.split("@")[0]?.split(":")[0];
     const state = ws.phase === "resuming" ? "starting" : ws.phase === "none" ? "unknown" : ws.phase;
+    // no `label`: the sidebar shows the runtime icon alone (a label beside it truncated the host name)
     return {
-      label: name ?? "pod",
       tooltip: [
         `Pod ${ws.sandbox}`,
+        ...(name ? [`Image name: ${name}`] : []),
         `State: ${state}`,
         ...(ws.image ? [`Image: ${ws.image}`] : []),
         ...(ws.repo ? [`Repository: ${ws.repo}`] : []),

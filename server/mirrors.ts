@@ -1,5 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { closeSync, openSync, readFileSync, readSync, rmSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyPush, type BridgeReply, type PushRequest } from "./bridge.js";
 import { type GitRunner, scrub } from "./git.js";
@@ -64,7 +66,13 @@ export function otherRepoTarget(id: string, access: RepoAccess): FetchTarget | {
 /** The URL that worked last for a target, so the next fetch and a push use it directly. */
 const workingUrls = new Map<string, string>();
 
-const MAX_PACK_BYTES = 64 * 1024 * 1024;
+/** Packs up to this size travel inside the fetch reply; bigger ones are spooled to a file and pulled in chunks. */
+const INLINE_PACK_BYTES = 4 * 1024 * 1024;
+/** One chunk of a spooled pack (about 8 MB as base64 in one bridge message). */
+export const CHUNK_BYTES = 6 * 1024 * 1024;
+/** The most one fetch relays; a bigger repository needs a shallower fetch, not a longer wait. */
+const MAX_FETCH_BYTES = 4 * 1024 * 1024 * 1024;
+const SPOOL_TTL_MS = 30 * 60_000;
 const SHA = /^[0-9a-f]{40}$/;
 
 export const mirrorId = (url: string): string => createHash("sha1").update(url).digest("hex").slice(0, 16);
@@ -167,6 +175,44 @@ export function mirrorSetupArgs(
 }
 
 export type FetchRequest = { op: "fetch"; mirror: string; haves: string[] };
+/** The pod asks for the next part of a spooled pack. */
+export type FetchChunkRequest = { op: "fetch-chunk"; /** Not `id`: the bridge numbers its messages with that. */ packId: string; offset: number };
+
+interface Spool {
+  file: string;
+  size: number;
+  at: number;
+}
+const spools = new Map<string, Spool>();
+
+const dropSpool = (id: string) => {
+  const spool = spools.get(id);
+  if (spool) rmSync(spool.file, { force: true });
+  spools.delete(id);
+};
+const sweepSpools = (now = Date.now()) => {
+  for (const [id, spool] of spools) if (now - spool.at > SPOOL_TTL_MS) dropSpool(id);
+};
+
+/** The next chunk of a spooled pack; the last one releases the file. */
+export function serveFetchChunk(request: FetchChunkRequest): BridgeReply & { data?: string; eof?: boolean } {
+  const spool = /^[0-9a-f]{12}$/.test(request.packId) ? spools.get(request.packId) : undefined;
+  if (!spool || !Number.isInteger(request.offset) || request.offset < 0 || request.offset > spool.size) {
+    return { ok: false, message: "kube-agents: that fetch is no longer available; run the command again" };
+  }
+  const length = Math.min(CHUNK_BYTES, spool.size - request.offset);
+  const buffer = Buffer.alloc(length);
+  const fd = openSync(spool.file, "r");
+  try {
+    readSync(fd, buffer, 0, length, request.offset);
+  } finally {
+    closeSync(fd);
+  }
+  const eof = request.offset + length >= spool.size;
+  spool.at = Date.now();
+  if (eof) dropSpool(request.packId);
+  return { ok: true, data: buffer.toString("base64"), eof };
+}
 
 export interface FetchReply {
   ok: boolean;
@@ -175,6 +221,9 @@ export interface FetchReply {
   /** The remote's default branch (`refs/heads/...`), so `origin/HEAD` resolves in the pod. */
   head?: string;
   pack?: string;
+  /** A pack too big for the reply: pull `packBytes` bytes of it with `fetch-chunk` requests. */
+  packId?: string;
+  packBytes?: number;
 }
 
 /** The daemon-side cache a target is fetched into (a bare repository next to the project's git dir). */
@@ -251,10 +300,27 @@ export async function applyFetch(
   let pack = "";
   if (wanted.length) {
     const input = Buffer.from([...wanted, ...known.map((h) => `^${h}`)].join("\n") + "\n");
-    const made = await git(["pack-objects", "--revs", "--thin", "--stdout", "-q"], { cwd: dir, input, binary: true });
-    if (made.code !== 0) return { ok: false, message: `kube-agents: could not pack the fetched commits: ${scrub(made.stderr.trim())}` };
-    pack = made.stdoutBuffer!.toString("base64");
-    if (pack.length > MAX_PACK_BYTES * 1.4) return { ok: false, message: "kube-agents: the fetch is too large to relay through the cluster API (over 64MB)" };
+    sweepSpools();
+    // to a file: a monorepo's history does not belong in the daemon's memory, nor in one message
+    const file = join(tmpdir(), `paseo-fetch-${randomBytes(6).toString("hex")}.pack`);
+    const made = await git(["pack-objects", "--revs", "--thin", "--stdout", "-q"], { cwd: dir, input, outFile: file });
+    if (made.code !== 0) {
+      rmSync(file, { force: true });
+      return { ok: false, message: `kube-agents: could not pack the fetched commits: ${scrub(made.stderr.trim())}` };
+    }
+    const size = made.stdoutBytes ?? 0;
+    if (size > MAX_FETCH_BYTES) {
+      rmSync(file, { force: true });
+      return { ok: false, message: `kube-agents: the fetch is ${Math.round(size / 1048576)} MB, over the ${MAX_FETCH_BYTES / 1048576} MB the relay carries` };
+    }
+    if (size <= INLINE_PACK_BYTES) {
+      pack = readFileSync(file).toString("base64");
+      rmSync(file, { force: true });
+    } else {
+      const id = randomBytes(6).toString("hex");
+      spools.set(id, { file, size, at: Date.now() });
+      return { ok: true, refs, ...(head ? { head } : {}), packId: id, packBytes: size };
+    }
   }
   return { ok: true, refs, ...(head ? { head } : {}), ...(pack ? { pack } : {}) };
 }

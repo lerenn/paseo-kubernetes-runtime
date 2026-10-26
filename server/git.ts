@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createWriteStream } from "node:fs";
 import { PassThrough, type Readable } from "node:stream";
 
 export interface GitResult {
@@ -7,17 +8,32 @@ export interface GitResult {
   stderr: string;
   /** Raw stdout, only with the `binary` option (for pack data). */
   stdoutBuffer?: Buffer;
+  /** Bytes written to `outFile`, only with that option. */
+  stdoutBytes?: number;
 }
 
 /** Runs git on the daemon with the daemon's own credentials, never prompting. */
-export type GitRunner = (args: string[], options?: { cwd?: string; input?: Buffer; binary?: boolean }) => Promise<GitResult>;
+export type GitRunner = (args: string[], options?: { cwd?: string; input?: Buffer; binary?: boolean; /** Write stdout to this file instead of keeping it in memory (large packs). */ outFile?: string }) => Promise<GitResult>;
 
 // never wait for a prompt: ssh would stop at an unknown host or a passphrase
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? "ssh -o BatchMode=yes -o ConnectTimeout=20" };
 
-export const runGit: GitRunner = (args, { cwd, input, binary } = {}) =>
+export const runGit: GitRunner = (args, { cwd, input, binary, outFile } = {}) =>
   new Promise((resolve, reject) => {
     const child = spawn("git", args, { cwd, env: GIT_ENV, stdio: ["pipe", "pipe", "pipe"] });
+    if (outFile) {
+      const out = createWriteStream(outFile, { mode: 0o600 });
+      let bytes = 0;
+      let stderr = "";
+      child.stdout.on("data", (d: Buffer) => (bytes += d.length));
+      child.stdout.pipe(out);
+      child.stderr.on("data", (d) => (stderr += d));
+      child.on("error", reject);
+      child.on("close", (code) => out.end(() => resolve({ code: code ?? 1, stdout: "", stderr, stdoutBytes: bytes })));
+      child.stdin.on("error", () => undefined);
+      child.stdin.end(input);
+      return;
+    }
     let stdout = "";
     const chunks: Buffer[] = [];
     let stderr = "";
