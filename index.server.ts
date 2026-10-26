@@ -42,6 +42,23 @@ export default function contribute(server: PluginServerContext) {
     console.log("[kubernetes-runtime] this Paseo has no workspace runtimes; update Paseo to run workspaces in pods");
   }
 
+  // The first agent of a workspace picks its pod's ServiceAccount by label. Its session opens before the pod is
+  // launched, so the labels are recorded then; the published SDK's hook payload has none, so they are read from
+  // the agent list (a fork that puts `labels` on the request is used directly).
+  server.before("agent.session_open", async ({ request }, { paseo }) => {
+    try {
+      if (!request.workspaceId) return;
+      let labels = (request as { labels?: Record<string, string> }).labels;
+      if (!labels) {
+        const list = (await paseo.agents.list()) as unknown as { agents?: { id: string; labels?: Record<string, string> }[] };
+        labels = list.agents?.find((a) => a.id === request.agentId)?.labels;
+      }
+      runtime.noteAgent(request.workspaceId, labels);
+    } catch {
+      // labels are an optimisation of access, never a reason to stop a session
+    }
+  });
+
   const reaper = new OrphanReaper({
     getConfig,
     kubeFor,

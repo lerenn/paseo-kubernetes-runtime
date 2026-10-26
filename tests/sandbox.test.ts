@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../server/config.js";
-import { buildSandbox, sandboxName } from "../server/sandbox.js";
+import { buildSandbox, resumePatch, sandboxName, serviceAccountFor } from "../server/sandbox.js";
 import { toHttpsRemote } from "../server/workspace.js";
 
 describe("sandbox manifest", () => {
@@ -28,6 +28,25 @@ describe("sandbox manifest", () => {
       { name: "CLAUDE_CODE_OAUTH_TOKEN", valueFrom: { secretKeyRef: { name: "paseo-agent-credentials", key: "CLAUDE_CODE_OAUTH_TOKEN", optional: true } } },
     ]);
     expect(JSON.stringify(sb)).not.toMatch(/GH_TOKEN|GITHUB_TOKEN/);
+  });
+
+  it("runs the pod as the ServiceAccount picked by the agent's labels, and as none otherwise", () => {
+    const c = ConfigSchema.parse({ serviceAccounts: [{ label: "paseo.ops=1", serviceAccount: "paseo-ops" }] });
+    const sa = serviceAccountFor(c, { "paseo.ops": "1" });
+    expect(sa).toBe("paseo-ops");
+    for (const labels of [undefined, {} as Record<string, string>, { "paseo.ops": "0" }]) expect(serviceAccountFor(c, labels)).toBeUndefined();
+    const spec = (sb: any) => sb.spec.podTemplate.spec;
+    const withSa = buildSandbox({ name: "n", workspaceId: "wks_1", cwd: "/x/y", config: c, serviceAccount: sa }) as any;
+    expect(spec(withSa)).toMatchObject({ serviceAccountName: "paseo-ops", automountServiceAccountToken: true });
+    expect(withSa.spec.podTemplate.metadata.labels["paseo.sh/service-account"]).toBe("paseo-ops");
+    const without = buildSandbox({ name: "n", workspaceId: "wks_1", cwd: "/x/y", config: c }) as any;
+    expect(spec(without).serviceAccountName).toBeUndefined();
+    expect(spec(without).automountServiceAccountToken).toBe(false);
+    // a warm pod waits for any workspace, so it never has one
+    const warm = buildSandbox({ name: "n", config: c, warm: true, serviceAccount: sa }) as any;
+    expect(spec(warm).serviceAccountName).toBeUndefined();
+    expect(resumePatch(c, undefined, sa).spec.podTemplate.spec).toMatchObject({ serviceAccountName: "paseo-ops" });
+    expect(resumePatch(c).spec.podTemplate.spec).toMatchObject({ serviceAccountName: null, automountServiceAccountToken: false });
   });
 
   it("applies the node selector and tolerations", () => {
