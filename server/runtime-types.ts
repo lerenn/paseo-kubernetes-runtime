@@ -52,6 +52,8 @@ export interface WorkspaceRuntimeReconcileRequest {
 export interface WorkspaceRuntimeDisplay {
   /** Short, one word or so, such as an image name. Shown beside the runtime icon. */
   label?: string;
+  /** Icon name for the host badge in the sidebar (the fork's `hostIcon`; a daemon without it ignores the field). */
+  hostIcon?: string;
   /** Several lines of facts (full image reference, instance name, state), shown on hover. */
   tooltip?: string;
   /** One line for the workspace header. */

@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
@@ -233,6 +234,21 @@ describe("fetching through the daemon (real git, real pod scripts)", () => {
     expect(pulled.code, pulled.stderr).toBe(0);
     expect(sh(podDir, "log", "-1", "--format=%s")).toBe("more upstream work");
   });
+
+  it("fetches a pack bigger than one bridge message in chunks (real pod scripts)", async () => {
+    const { origin, kube, podDir } = await openSession();
+    const other = join(mkdtempSync(join(tmpdir(), "kube-other-")), "o");
+    sh(tmpdir(), "clone", "-q", origin, other);
+    writeFileSync(join(other, "big.bin"), randomBytes(11 * 1024 * 1024)); // incompressible: two chunks
+    sh(other, "add", ".");
+    sh(other, "commit", "-qm", "big upstream work");
+    sh(other, "push", "-q", "origin", "main");
+
+    const fetched = await kube.as(["git", "fetch", "origin"], { cwd: podDir });
+    expect(fetched.code, fetched.stderr).toBe(0);
+    expect(sh(podDir, "log", "-1", "--format=%s", "origin/main")).toBe("big upstream work");
+    expect(sh(podDir, "cat-file", "-s", "origin/main:big.bin")).toBe(String(11 * 1024 * 1024));
+  }, 60_000);
 
   it("checks out the submodules of the seeded commit and updates them through the daemon", async () => {
     const { sub, root, kube, podDir, notices } = await openSession("sh", {}, undefined, {}, true);

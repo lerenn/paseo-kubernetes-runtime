@@ -500,12 +500,15 @@ describe("describeWorkspace for the sidebar badge", () => {
   it("answers without touching the cluster: no pod yet, then image/pod/state, following suspension", async () => {
     const t = setup({ image: "ghcr.io/lerenn/paseo-kubernetes-runtime-default@sha256:f4aedb1145658527f3e43dd1ae6d95a917b39e94799491eae6f9c400ccd8e3b5", podIdleMinutes: 30 });
     const describe = () => t.reg.describeWorkspace!({ ...t.base } as never);
-    expect(await describe()).toMatchObject({ label: "no pod yet" });
+    expect(await describe()).toMatchObject({ detail: "Kubernetes pod · not started yet" });
+    expect((await describe())!.label).toBeUndefined();
     await t.prepare();
     const calls = t.kube.calls.length;
     const running = await describe();
     expect(t.kube.calls).toHaveLength(calls); // nothing read or started
-    expect(running).toMatchObject({ label: "paseo-kubernetes-runtime-default" });
+    expect(running!.label).toBeUndefined(); // icon only in the sidebar
+    expect(running!.hostIcon).toBe("ship-wheel");
+    expect(running!.tooltip).toContain("Image name: paseo-kubernetes-runtime-default");
     expect(running!.tooltip).toContain("State: running");
     expect(running!.tooltip).toMatch(/Pod pka-/);
     expect(running!.tooltip).toContain("Image: ghcr.io/lerenn/paseo-kubernetes-runtime-default@sha256:f4aedb11");

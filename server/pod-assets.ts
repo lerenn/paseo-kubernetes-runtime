@@ -48,7 +48,16 @@ if (mode === "call") {
   let out = "";
   conn.on("error", (e) => { console.error("kube-agents: bridge unavailable: " + e.message); process.exit(1); });
   conn.on("data", (d) => (out += d));
-  conn.on("end", () => {
+  // one request on its own connection (the first reply of a big fetch names a pack that is then pulled in chunks)
+  const rpc = (m) => new Promise((resolve, reject) => {
+    const c = net.connect(sock);
+    let o = "";
+    c.on("error", reject);
+    c.on("data", (d) => (o += d));
+    c.on("end", () => { try { resolve(JSON.parse(o)); } catch { reject(new Error("bad bridge reply")); } });
+    c.end(JSON.stringify(m) + "\n");
+  });
+  conn.on("end", async () => {
     let r;
     try { r = JSON.parse(out); } catch { console.error("kube-agents: bad bridge reply"); process.exit(1); }
     if (r.message) console.error(r.message);
@@ -56,7 +65,23 @@ if (mode === "call") {
       const dir = path.resolve(args[1]);
       const git = (a, input) => execFileSync("git", ["--git-dir", dir, ...a], { encoding: "utf8", input, maxBuffer: 1 << 28 });
       try {
-        if (r.pack) execFileSync("git", ["--git-dir", dir, "index-pack", "--stdin", "--fix-thin"], { input: Buffer.from(r.pack, "base64"), stdio: ["pipe", "ignore", "inherit"] });
+        if (r.packId) {
+          const file = dir + "/incoming.pack";
+          const out = fs.openSync(file, "w");
+          try {
+            for (let offset = 0; offset < r.packBytes;) {
+              const k = await rpc({ op: "fetch-chunk", packId: r.packId, offset });
+              if (!k.ok) throw new Error(k.message || "chunk refused");
+              const part = Buffer.from(k.data, "base64");
+              if (!part.length) throw new Error("empty chunk");
+              fs.writeSync(out, part);
+              offset += part.length;
+            }
+          } finally { fs.closeSync(out); }
+          const input = fs.openSync(file, "r");
+          try { execFileSync("git", ["--git-dir", dir, "index-pack", "--stdin", "--fix-thin"], { stdio: [input, "ignore", "inherit"] }); }
+          finally { fs.closeSync(input); fs.rmSync(file, { force: true }); }
+        } else if (r.pack) execFileSync("git", ["--git-dir", dir, "index-pack", "--stdin", "--fix-thin"], { input: Buffer.from(r.pack, "base64"), stdio: ["pipe", "ignore", "inherit"] });
         const want = new Map(r.refs.map(([ref, sha]) => [ref, sha]));
         const cmds = [];
         for (const line of git(["for-each-ref", "--format=%(refname)"]).split("\n").filter(Boolean)) {

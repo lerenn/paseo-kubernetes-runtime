@@ -1,7 +1,7 @@
 import { type Socket, connect } from "node:net";
 import type { AcpStreamMessage } from "@getpaseo/plugin/server/acp";
 import { type GitRunner, scrub } from "./git.js";
-import type { FetchRequest } from "./mirrors.js";
+import type { FetchChunkRequest, FetchRequest } from "./mirrors.js";
 import type { Kube } from "./kube.js";
 
 export interface BridgeReply {
@@ -10,10 +10,14 @@ export interface BridgeReply {
   refs?: [string, string][];
   head?: string;
   pack?: string;
+  packId?: string;
+  packBytes?: number;
+  data?: string;
+  eof?: boolean;
 }
 
 export type PushRequest = { op: "push"; ref: string; old: string; new: string; base: string; pack: string; /** A submodule's mirror in the pod; absent for the project's own branches. */ mirror?: string };
-export type BridgeRequest = PushRequest | FetchRequest;
+export type BridgeRequest = PushRequest | FetchRequest | FetchChunkRequest;
 
 export interface BridgeHandlers {
   handle(request: BridgeRequest): Promise<BridgeReply>;

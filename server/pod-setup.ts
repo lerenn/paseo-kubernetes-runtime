@@ -175,3 +175,30 @@ chmod 755 "$t" && mv "$t" "$HOME/bin/jq"
 export async function ensureJq(kube: Kube, pod: string): Promise<void> {
   await kube.exec(pod, ["sh", "-c", JQ_SCRIPT]).catch(() => undefined);
 }
+
+/** Where a pod remembers that fetching its submodules failed: "<epoch ms> <failed attempts>". It lives on the volume, so a restart keeps it. */
+export const SUBMODULE_MARKER = "submodules-failed";
+
+/** 30 minutes after the first failure, doubling, at most 4 hours. */
+export const submoduleBackoffMs = (attempts: number): number => Math.min(4 * 3_600_000, 30 * 60_000 * 2 ** Math.max(0, attempts - 1));
+
+export function parseSubmoduleMarker(text: string): { at: number; attempts: number } | null {
+  const m = /^(\d+) (\d+)\s*$/.exec(text);
+  return m ? { at: Number(m[1]), attempts: Number(m[2]) } : null;
+}
+
+/** How long to leave a failing submodule fetch alone, or 0 when it may run. */
+export async function submoduleWait(kube: Kube, pod: string, now: number): Promise<{ ms: number; attempts: number }> {
+  const r = await kube.exec(pod, ["cat", `${HOME_DIR}/${SUBMODULE_MARKER}`]).catch(() => null);
+  const marker = r?.code === 0 ? parseSubmoduleMarker(r.stdout) : null;
+  if (!marker) return { ms: 0, attempts: 0 };
+  return { ms: Math.max(0, marker.at + submoduleBackoffMs(marker.attempts) - now), attempts: marker.attempts };
+}
+
+export async function recordSubmoduleFailure(kube: Kube, pod: string, now: number, attempts: number): Promise<void> {
+  await kube.exec(pod, ["sh", "-c", 'echo "$1 $2" > "$3"', "sh", String(now), String(attempts + 1), `${HOME_DIR}/${SUBMODULE_MARKER}`]).catch(() => undefined);
+}
+
+export async function clearSubmoduleFailure(kube: Kube, pod: string): Promise<void> {
+  await kube.exec(pod, ["rm", "-f", `${HOME_DIR}/${SUBMODULE_MARKER}`]).catch(() => undefined);
+}
