@@ -10,6 +10,7 @@ import { Kubectl } from "./server/kube.js";
 import { migrateLegacyData } from "./server/migrate.js";
 import { OrphanReaper } from "./server/orphans.js";
 import { podOnlyAgent, podOnlyWorkspace } from "./server/pod-only.js";
+import { workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
 import { PodRegistry } from "./server/registry.js";
 import { KubernetesRuntime } from "./server/runtime.js";
 import type { WorkspaceRuntimeRegistration } from "./server/runtime-types.js";
@@ -33,7 +34,12 @@ export default function contribute(server: PluginServerContext) {
   const registry = new PodRegistry();
   const daemonId = readDaemonId();
 
-  const runtime = new KubernetesRuntime({ getConfig, kubeFor, daemonId, registry });
+  // The Paseo API only reaches a plugin through hook, event and RPC contexts: keep the first one seen, for the idle check.
+  let paseoApi: AgentListApi | null = null;
+  const capture = (ctx: { paseo?: unknown } | undefined) => {
+    if (ctx?.paseo && !paseoApi) paseoApi = ctx.paseo as AgentListApi;
+  };
+  const runtime = new KubernetesRuntime({ getConfig, kubeFor, daemonId, registry, agentsBusy: (workspaceId) => workspaceAgentsBusy(paseoApi, workspaceId) });
   // The workspace runtime API is in Paseo's fork; on a Paseo without it the plugin still loads (settings, credentials) and says why it does nothing.
   const registerRuntime = (server as unknown as { registerWorkspaceRuntime?: (r: WorkspaceRuntimeRegistration) => void }).registerWorkspaceRuntime;
   if (typeof registerRuntime === "function") {
@@ -47,6 +53,7 @@ export default function contribute(server: PluginServerContext) {
   // launched, so the labels are recorded then; the published SDK's hook payload has none, so they are read from
   // the agent list (a fork that puts `labels` on the request is used directly).
   server.before("agent.session_open", async ({ request }, { paseo }) => {
+    capture({ paseo });
     try {
       if (!request.workspaceId) return;
       let labels = (request as { labels?: Record<string, string> }).labels;
@@ -59,6 +66,8 @@ export default function contribute(server: PluginServerContext) {
       // labels are an optimisation of access, never a reason to stop a session
     }
   });
+
+  for (const name of ["agent.created", "agent.turn_started", "agent.turn_ended"] as const) server.on(name, (_event, ctx) => capture(ctx));
 
   // Pod-only mode (off by default). A refusal is the hook's error, shown to whoever made the request.
   server.before("workspace.create", async ({ request }) => {
