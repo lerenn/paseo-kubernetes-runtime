@@ -500,6 +500,7 @@ describe("describeWorkspace for the sidebar badge", () => {
     const running = await describe();
     expect(t.kube.calls).toHaveLength(calls); // nothing read or started
     expect(running!.label).toBeUndefined(); // icon only in the sidebar
+    expect(running!.hostIcon).toBe("ship-wheel");
     expect(running!.tooltip).toContain("Image name: paseo-kubernetes-runtime-default");
     expect(running!.tooltip).toContain("State: running");
     expect(running!.tooltip).toMatch(/Pod pka-/);

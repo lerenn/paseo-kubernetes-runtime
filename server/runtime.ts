@@ -141,6 +141,9 @@ interface WorkspaceState {
 /** Stands in `commands` for the Daemon Ops shim having been installed in the current pod. */
 const OPS_SHIM = "paseo (daemon ops)";
 
+/** The single indicator of a pod row in the sidebar. */
+const HOST_ICON = "ship-wheel";
+
 export const RUNTIME_LABEL = "Kubernetes Runtime";
 
 /**
@@ -668,12 +671,13 @@ export class KubernetesRuntime {
    */
   describeWorkspace(request: WorkspaceRuntimeWorkspaceRequest): WorkspaceRuntimeDisplay | null {
     const ws = this.states.get(request.workspaceId);
-    if (!ws?.sandbox) return { tooltip: "Kubernetes pod\nNo pod yet", detail: "Kubernetes pod · not started yet" };
+    if (!ws?.sandbox) return { hostIcon: HOST_ICON, tooltip: "Kubernetes pod\nNo pod yet", detail: "Kubernetes pod · not started yet" };
     const short = shortImage(ws.image);
     const name = short?.split("@")[0]?.split(":")[0];
     const state = ws.phase === "resuming" ? "starting" : ws.phase === "none" ? "unknown" : ws.phase;
     // no `label`: the sidebar shows the runtime icon alone (a label beside it truncated the host name)
     return {
+      hostIcon: HOST_ICON,
       tooltip: [
         `Pod ${ws.sandbox}`,
         ...(name ? [`Image name: ${name}`] : []),
