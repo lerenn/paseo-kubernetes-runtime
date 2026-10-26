@@ -25,9 +25,11 @@ busy_count() {
 }
 
 deadline=$(( $(date +%s) + ${MAX_WAIT_MINUTES:-240} * 60 ))
+quiet=0
 while :; do
   n=$(busy_count)
-  [ "$n" = "0" ] && break
+  # two quiet reads in a row, 15 s apart: an agent between its message and its first process shows no activity for a moment
+  if [ "$n" = "0" ]; then quiet=$((quiet + 1)); [ "$quiet" -ge 2 ] && break; else quiet=0; fi
   [ "$(date +%s)" -gt "$deadline" ] && { log "gave up: $n agent(s) still running in runtime workspaces"; exit 2; }
   sleep 15
 done
