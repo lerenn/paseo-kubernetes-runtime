@@ -157,6 +157,19 @@ export const ConfigSchema = z.object({
    * background work Paseo cannot show as "running" (monitors, scheduled wakeups): suspending them ends an open turn and shows an error.
    */
   idleExemptLabels: z.array(z.string().regex(/^[^=\s]+(=[^=\s]*)?$/, "Use key=value")).default([]),
+  /**
+   * What happens to agents whose turn a node reclaim (Spot interruption, node loss) cut short. `interruptedExit` reports
+   * the stop to Paseo as the exit reason `interrupted` instead of `runtime-lost`: turn off until the Paseo in use has that
+   * reason, or the turn is failed like before. `autoResume` sends the agent one prompt to carry on once the pod is back.
+   * `checkpointNudge` tells an agent mid-turn to commit and push when its pod starts to be taken away.
+   */
+  recovery: z
+    .object({
+      interruptedExit: z.boolean().default(false),
+      autoResume: z.boolean().default(true),
+      checkpointNudge: z.boolean().default(true),
+    })
+    .default({ interruptedExit: false, autoResume: true, checkpointNudge: true }),
   /** A workspace whose agents have all been idle this long has its pod deleted (the volume stays); any input brings it back. 0 = never. */
   podIdleMinutes: z.number().int().min(0).default(30),
 });

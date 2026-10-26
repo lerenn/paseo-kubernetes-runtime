@@ -261,6 +261,93 @@ describe("idle suspension asks Paseo before ending a pod", () => {
   });
 });
 
+describe("recovery from a node reclaim", () => {
+  const messages: { agentId: string; text: string; behavior: string }[] = [];
+  const messenger = { send: async (agentId: string, text: string, behavior: "steer" | "skip") => void messages.push({ agentId, text, behavior }) };
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+  const lose = async (t: ReturnType<typeof setup>, n = 0) => {
+    t.kube.pods = [{ uid: "other", ready: false, terminating: true }];
+    t.kube.procs[n]!.end(137);
+    await flush();
+  };
+
+  it("reports the stop as interrupted (when asked to) and sends the agent mid-turn ONE prompt with skip", async () => {
+    messages.length = 0;
+    const t = setup({ recovery: { interruptedExit: true } }, { messenger });
+    await t.reg.create!(t.base, t.ctx);
+    t.activity("turn_started", "agent-1");
+    const p = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    const q = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    await lose(t, 0);
+    expect(await p.exit).toMatchObject({ reason: "interrupted", message: expect.stringContaining("Interrupted by a node reclaim") });
+    t.kube.procs[1]!.end(137);
+    expect(await q.exit).toMatchObject({ reason: "interrupted" });
+    await flush();
+    expect(messages).toHaveLength(1); // two processes of the pod, one resume
+    expect(messages[0]).toMatchObject({ agentId: "agent-1", behavior: "skip" });
+    expect(messages[0]!.text).toContain("interrupted by a node reclaim");
+  });
+
+  it("keeps runtime-lost while interruptedExit is off, and does not resume an agent that was idle", async () => {
+    messages.length = 0;
+    const t = setup({}, { messenger });
+    await t.reg.create!(t.base, t.ctx);
+    t.activity("turn_started", "busy");
+    t.activity("turn_ended", "busy");
+    const p = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    await lose(t);
+    expect(await p.exit).toMatchObject({ reason: "runtime-lost" });
+    expect(messages).toHaveLength(0);
+  });
+
+  it("does not call a healthy pod's failing process an interruption, and says when it ran out of memory", async () => {
+    messages.length = 0;
+    const t = setup({ recovery: { interruptedExit: true } }, { messenger });
+    await t.reg.create!(t.base, t.ctx);
+    t.activity("turn_started", "agent-1");
+    const p = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.kube.pods = [{ uid: "uid-1", ready: true, terminating: false, oomKilled: true }];
+    t.kube.procs[0]!.end(137);
+    expect(await p.exit).toMatchObject({ reason: "exited", message: expect.stringContaining("out of memory") });
+    await flush();
+    expect(messages).toHaveLength(0);
+  });
+
+  it("does not resume the same agent again within ten minutes (no loop)", async () => {
+    messages.length = 0;
+    const t = setup({}, { messenger });
+    await t.reg.create!(t.base, t.ctx);
+    t.activity("turn_started", "agent-1");
+    await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    await lose(t, 0);
+    expect(messages).toHaveLength(1);
+    // the pod comes back as a new one, the agent works a turn and is cut again 2 minutes later
+    t.kube.pods = [{ uid: "uid-2", ready: true, terminating: false }];
+    await t.reg.create!(t.base, t.ctx);
+    t.activity("turn_started", "agent-1");
+    await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.advance(2 * MIN);
+    t.kube.pods = [{ uid: "uid-3", ready: false, terminating: true }];
+    t.kube.procs[1]!.end(137);
+    await flush();
+    expect(messages).toHaveLength(1);
+  });
+
+  it("tells an agent mid-turn to commit and push when its pod starts to be taken away, once", async () => {
+    messages.length = 0;
+    const t = setup({}, { messenger });
+    await t.reg.create!(t.base, t.ctx);
+    t.activity("turn_started", "agent-1");
+    await t.prepare();
+    await t.runtime.checkInterruptions();
+    expect(messages).toHaveLength(0); // a healthy pod
+    t.kube.pods = [{ uid: "uid-1", ready: true, terminating: false, disrupted: "EvictionByEvictionAPI" }];
+    await t.runtime.checkInterruptions();
+    await t.runtime.checkInterruptions();
+    expect(messages).toEqual([{ agentId: "agent-1", text: expect.stringContaining("commit and push"), behavior: "steer" }]);
+  });
+});
+
 describe("idle suspension asks for the workspace's own agents by id", () => {
   it("does not suspend while one of its agents has a turn open that the directory check cannot see, nor when it cannot tell", async () => {
     let byId: boolean | null = true;
