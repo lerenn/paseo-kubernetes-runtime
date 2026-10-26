@@ -25,8 +25,12 @@ export const SeedDirSchema = z.object({
     .string()
     .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/, "A relative path under /workspace")
     .refine((t) => !t.split("/").includes("..") && !["checkout", ".home"].includes(t.split("/")[0]!), "Not the checkout or the home"),
-  /** `tar --exclude` patterns. */
+  /** `tar --exclude` patterns, relative to `from` as tar sees them (`./cache`, `*.log`). */
   exclude: z.array(z.string()).default([]),
+  /** Keep only some entries of a directory: everything in `dir` (relative to `from`) not named in `keep` is left out. */
+  prune: z
+    .array(z.object({ dir: z.string().regex(/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/), keep: z.array(z.string()).default([]) }))
+    .default([]),
 });
 
 export const ProfileSchema = z.object({

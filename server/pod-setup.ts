@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readdirSync } from "node:fs";
 import { Readable } from "node:stream";
 import { HOME_DIR } from "./sandbox.js";
 import { BRIDGE_SCRIPT, FS_SCRIPT, INSTALLABLE_CLIS, GIT_REMOTE_HELPER, MIRROR_PRE_RECEIVE, PRE_RECEIVE_HOOK, UPLOAD_PACK_WRAPPER, envFile } from "./pod-assets.js";
@@ -209,6 +210,22 @@ export interface SeedDir {
   from: string;
   to: string;
   exclude: readonly string[];
+  prune?: readonly { dir: string; keep: readonly string[] }[];
+}
+
+/** The `tar --exclude` list of a seed: its patterns, and every entry of a pruned directory that is not kept. */
+export function seedExcludes(seed: SeedDir): string[] {
+  const out = [...seed.exclude];
+  for (const { dir, keep } of seed.prune ?? []) {
+    let names: string[] = [];
+    try {
+      names = readdirSync(`${seed.from}/${dir}`);
+    } catch {
+      // no such directory: nothing to prune
+    }
+    for (const name of names) if (!keep.includes(name)) out.push(`./${dir}/${name}`);
+  }
+  return out;
 }
 
 const seedMarker = (seed: SeedDir) => `/workspace/.seeded/${createHash("sha1").update(`${seed.from}\n${seed.to}`).digest("hex").slice(0, 16)}`;
@@ -222,7 +239,7 @@ export async function seedDirectory(kube: Kube, pod: string, seed: SeedDir, onSt
   const marker = seedMarker(seed);
   if ((await kube.exec(pod, ["test", "-e", marker])).code === 0) return false;
   onStart();
-  const tar = spawnTar("tar", ["-C", seed.from, ...seed.exclude.map((e) => `--exclude=${e}`), "-cf", "-", "."], { stdio: ["ignore", "pipe", "pipe"] });
+  const tar = spawnTar("tar", ["-C", seed.from, ...seedExcludes(seed).map((e) => `--exclude=${e}`), "-cf", "-", "."], { stdio: ["ignore", "pipe", "pipe"] });
   let tarError = "";
   tar.stderr!.on("data", (d) => (tarError += d));
   const tarExit = new Promise<number>((resolve) => tar.on("close", (code) => resolve(code ?? 1)).on("error", () => resolve(1)));

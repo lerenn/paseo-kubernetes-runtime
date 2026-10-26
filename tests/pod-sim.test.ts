@@ -214,12 +214,20 @@ describe("pod profiles (real pod scripts)", () => {
     writeFileSync(join(data, "runs", "baseline.json"), "{}");
     mkdirSync(join(data, "cache"));
     writeFileSync(join(data, "cache", "junk"), "x");
-    const config = { profiles: { "prbr-picky": { seed: [{ from: data, to: "prbr-picky", exclude: ["./cache"] }] } } };
+    mkdirSync(join(data, "runs", "v1"));
+    writeFileSync(join(data, "runs", "v1", "keep.json"), "{}");
+    mkdirSync(join(data, "runs", "old"));
+    writeFileSync(join(data, "runs", "old", "big.json"), "{}");
+    writeFileSync(join(data, "run.log"), "log");
+    const config = { profiles: { "prbr-picky": { seed: [{ from: data, to: "prbr-picky", exclude: ["./cache", "*.log"], prune: [{ dir: "runs", keep: ["v1"] }] }] } } };
     const first = await openSession("sh", {}, undefined, {}, false, { config, options: { profile: "prbr-picky" } });
     const pod = join(first.kube.workspace, "prbr-picky");
     expect(readFileSync(join(pod, "corpus.json"), "utf8")).toBe('{"cases":3}');
     expect(existsSync(join(pod, "runs", "baseline.json"))).toBe(true);
     expect(existsSync(join(pod, "cache"))).toBe(false);
+    expect(existsSync(join(pod, "run.log"))).toBe(false);
+    expect(existsSync(join(pod, "runs", "v1", "keep.json"))).toBe(true);
+    expect(existsSync(join(pod, "runs", "old"))).toBe(false); // pruned: not in keep
     expect(first.notices.join("\n")).toMatch(/Copying .* as \/workspace\/prbr-picky \(once\)/);
     expect(first.notices.join("\n")).toContain("prbr-picky is in the pod.");
     // the same volume, started again: the marker keeps it from being copied again, and what the agent changed stays
