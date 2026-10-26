@@ -17,6 +17,10 @@ export interface PodInfo {
   /** Being deleted: not usable even if it still reports Ready. */
   terminating: boolean;
   phase?: string;
+  /** Set when the pod is being disrupted involuntarily (a node reclaim, an eviction): the `DisruptionTarget` condition's reason. */
+  disrupted?: string;
+  /** A container was killed for memory. */
+  oomKilled?: boolean;
   /** Why the pod is not running yet, in a form fit to show a user (scheduling, volume, image pull). */
   problem?: string;
 }
@@ -33,11 +37,15 @@ export function parsePodInfo(pod: any): PodInfo {
     : waiting
       ? `Container waiting: ${waiting.reason}${waiting.message ? ` (${waiting.message})` : ""}`
       : undefined;
+  const disruption = cond("DisruptionTarget")?.status === "True" ? cond("DisruptionTarget") : undefined;
+  const oom = (pod?.status?.containerStatuses ?? []).some((c: any) => c.state?.terminated?.reason === "OOMKilled" || c.lastState?.terminated?.reason === "OOMKilled");
   return {
     uid: pod?.metadata?.uid ?? "",
     ready: cond("Ready")?.status === "True",
     terminating: Boolean(pod?.metadata?.deletionTimestamp),
     phase: pod?.status?.phase,
+    ...(disruption ? { disrupted: disruption.reason ?? "Disrupted" } : {}),
+    ...(oom ? { oomKilled: true } : {}),
     ...(problem ? { problem } : {}),
   };
 }

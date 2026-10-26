@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import path from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { credentialsRemove, credentialsSet, credentialsStatus } from "./shared/credentials.js";
 import { ConfigSchema, kubeSettings } from "./shared/settings.js";
@@ -41,7 +43,16 @@ export default function contribute(server: PluginServerContext) {
   const capture = (ctx: { paseo?: unknown } | undefined) => {
     if (ctx?.paseo && !paseoApi) paseoApi = ctx.paseo as AgentListApi;
   };
-  const runtime = new KubernetesRuntime({ getConfig, kubeFor, daemonId, registry, agentsBusy: (workspaceId) => workspaceAgentsBusy(paseoApi, workspaceId) });
+  const runtime = new KubernetesRuntime({ getConfig, kubeFor, daemonId, registry, agentsBusy: (workspaceId) => workspaceAgentsBusy(paseoApi, workspaceId),
+    recoveryStateFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "interruptions.json"),
+    // the fork's `skip` (never steer a running turn) is not in the published SDK's types
+    messenger: {
+      async send(agentId, text, behavior) {
+        if (!paseoApi) throw new Error("Paseo's API has not reached the plugin yet");
+        await (paseoApi as unknown as { agents: { ref(id: string): { send(text: string, o: { activeTurnBehavior: string }): Promise<void> } } }).agents.ref(agentId).send(text, { activeTurnBehavior: behavior });
+      },
+    },
+  });
   // The workspace runtime API is in Paseo's fork; on a Paseo without it the plugin still loads (settings, credentials) and says why it does nothing.
   const registerRuntime = (server as unknown as { registerWorkspaceRuntime?: (r: WorkspaceRuntimeRegistration) => void }).registerWorkspaceRuntime;
   if (typeof registerRuntime === "function") {

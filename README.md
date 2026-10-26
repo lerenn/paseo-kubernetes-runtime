@@ -147,6 +147,23 @@ published to `ghcr.io/lerenn/paseo-kubernetes-runtime-default`; `DEFAULT_IMAGE` 
 (the workflow prints the new digest in its summary). A custom image needs node and git; claude, codex and a verified jq are
 installed on first use when missing.
 
+## Node reclaims (Spot)
+
+A pod taken away under a running agent (a Spot interruption, a node loss, an eviction) is told apart from an idle suspend and
+from a process that failed on its own: when a process ends and the plugin did not end it, the pod is looked at (gone,
+replaced, being deleted, `DisruptionTarget`, not ready: interrupted; healthy: the process failed, an OOM kill is named).
+Settings `recovery`:
+
+- `interruptedExit` (off): report the stop as the exit reason `interrupted` instead of `runtime-lost`. Turn it on once the Paseo in use
+  has that reason (a turn open at the cut then ends as interrupted, with no error and no red dot); until then Paseo fails the turn as before.
+- `autoResume` (on): each agent that had a turn open gets ONE prompt, "Your previous turn was interrupted by a node reclaim at HH:MMZ. Resume
+  from your saved state", sent with `activeTurnBehavior: "skip"` (a turn already running is never steered); Paseo brings the pod back first.
+  At least 10 minutes between two resumes of an agent, three an hour, and a stop (with a warning notice) after two interruptions that
+  came within 2 minutes of a resume; a turn that completes well after clears that. State in `plugin-data/kubernetes-runtime/interruptions.json`.
+- `checkpointNudge` (on): every 10 s, pods of agents mid-turn are looked at; when one starts to be taken away (Karpenter drains a Spot
+  node on the 2-minute notice, so the pod is deleted or disrupted before its processes end), the agents get one steered message to
+  commit and push. A hard loss gives no warning.
+
 ## Pod profiles (another image, a bigger volume, seeded data)
 
 A workspace that needs more than the default pod picks a named profile from the `profiles` setting, with the runtime option `profile`.

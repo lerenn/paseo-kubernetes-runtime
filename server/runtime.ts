@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import { applyProfile } from "../shared/settings.js";
+import { checkpointPrompt, classifyStop, ResumeGuard, resumePrompt } from "./interruption.js";
 import { parseRuntimeOptions, type RuntimeOptions } from "../shared/runtime-options.js";
 import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, serveFetchChunk, type FetchTarget } from "./mirrors.js";
 import { applyPush, loopbackPorts, startBridge, type RunningBridge } from "./bridge.js";
@@ -85,6 +86,10 @@ export interface RuntimeDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Whether Paseo has an agent running a turn in this workspace directory; null when it cannot tell (injected for tests). */
   workspaceBusy?: (cwd: string) => Promise<boolean | null>;
+  /** Sends a prompt to an agent (the Paseo API); `skip` never steers a turn that is already running. Absent: no recovery prompts. */
+  messenger?: { send(agentId: string, text: string, behavior: "steer" | "skip"): Promise<void> };
+  /** Where the automatic-resume guard keeps its state, so a restarted plugin does not start over. */
+  recoveryStateFile?: string;
   /** Whether an agent of this workspace (by id) has a turn open, from Paseo's agent list; null when it cannot say. */
   agentsBusy?: (workspaceId: string) => Promise<boolean | null>;
   /** Archives a workspace in Paseo (the delete action's option); injected for tests. */
@@ -124,6 +129,10 @@ interface WorkspaceState {
   repoUrl?: string;
   agent?: string;
   labelled?: string;
+  /** The pod uid the checkpoint nudge was sent for, and the pod uid whose loss was already handled. */
+  nudgedUid?: string;
+  interruptedUid?: string;
+  lastInterruptedAt?: number;
   /** When labelling the pod or claim last failed (missing `patch` in the Role); retried after a while. */
   labelFailedAt?: number;
   /** The image the pod was started with, for the sidebar badge; known once the Sandbox has been read or created. */
@@ -164,7 +173,11 @@ export class KubernetesRuntime {
   private readonly git: GitRunner;
   private readonly now: () => number;
 
+  private readonly guard: ResumeGuard;
+  private stopInterruptTicker: () => void = () => undefined;
+
   constructor(private readonly deps: RuntimeDeps) {
+    this.guard = new ResumeGuard(deps.recoveryStateFile ?? null);
     this.git = deps.git ?? runGit;
     this.now = deps.now ?? Date.now;
     this.lastDemand = this.now();
@@ -185,6 +198,11 @@ export class KubernetesRuntime {
       timer.unref?.();
       return () => clearInterval(timer);
     }))(tick, 30_000);
+    this.stopInterruptTicker = (this.deps.ticker ?? ((fn, ms) => {
+      const timer = setInterval(fn, ms) as unknown as NodeJS.Timeout;
+      timer.unref?.();
+      return () => clearInterval(timer);
+    }))(() => void this.checkInterruptions().catch(() => undefined), 10_000);
     await this.adopt().catch(() => undefined);
     void this.maintainPool().catch(() => undefined);
   }
@@ -197,6 +215,7 @@ export class KubernetesRuntime {
   async stop(): Promise<void> {
     this.stopped = true;
     this.stopTicker();
+    this.stopInterruptTicker();
     const running = [...this.execs];
     for (const e of running) e.proc.kill("SIGTERM");
     await Promise.race([Promise.allSettled(running.map((e) => e.exited)), new Promise((r) => setTimeout(r, 3_000).unref?.())]);
@@ -661,6 +680,54 @@ export class KubernetesRuntime {
   }
 
   /**
+   * A pod was taken away under running processes (a node reclaim): the agents that had a turn open are told to carry on,
+   * once, when the guard allows it. The prompt goes with `skip`, so a turn someone already started is never steered; Paseo
+   * brings the pod back before it delivers the prompt.
+   */
+  private async onInterrupted(ws: WorkspaceState, pod: string, at: Date, why: string): Promise<void> {
+    const uid = ws.readyUid ?? pod;
+    if (ws.interruptedUid === uid) return; // every process of the pod reports the loss: handle it once
+    ws.interruptedUid = uid;
+    ws.lastInterruptedAt = this.now();
+    const cut = [...ws.agents].filter(([, a]) => a.turn).map(([id]) => id);
+    for (const [, a] of ws.agents) a.turn = false; // its processes are gone: no turn is open any more
+    this.log(`[kubernetes-runtime] pod ${pod} was interrupted (${why}); agents mid-turn: ${cut.map((id) => id.slice(0, 8)).join(", ") || "none"}`);
+    const { recovery } = await this.deps.getConfig();
+    if (!recovery.autoResume || !this.deps.messenger) return;
+    for (const agentId of cut) {
+      const verdict = this.guard.allow(agentId, this.now());
+      if (!verdict.ok) {
+        this.log(`[kubernetes-runtime] not resuming agent ${agentId.slice(0, 8)}: ${verdict.reason}`);
+        ws.notice?.(`Not resuming the agent after the interruption: ${verdict.reason}`, "warning");
+        continue;
+      }
+      this.guard.sent(agentId, this.now());
+      await (this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(5_000); // let Paseo take in the exit first
+      await this.deps.messenger.send(agentId, resumePrompt(at), "skip").catch((e: Error) => this.log(`[kubernetes-runtime] could not resume agent ${agentId.slice(0, 8)}: ${e.message}`));
+    }
+  }
+
+  /**
+   * Watches pods that have a turn open: when one starts to be taken away (a Spot interruption notice makes Karpenter drain
+   * the node, so the pod is deleted or disrupted before its processes end), the agents mid-turn get one message to commit
+   * and push. Once per pod.
+   */
+  async checkInterruptions(): Promise<void> {
+    const config = await this.deps.getConfig();
+    if (!config.recovery.checkpointNudge || !this.deps.messenger) return;
+    const kube = this.deps.kubeFor(config);
+    for (const ws of this.states.values()) {
+      const open = [...ws.agents].filter(([, a]) => a.turn).map(([id]) => id);
+      if (ws.phase !== "running" || !ws.sandbox || !open.length) continue;
+      const info = await kube.podInfo(ws.sandbox).catch(() => null);
+      if (!info || !(info.terminating || info.disrupted) || ws.nudgedUid === info.uid) continue;
+      ws.nudgedUid = info.uid;
+      this.log(`[kubernetes-runtime] pod ${ws.sandbox} is being taken away (${info.disrupted ?? "deleted"}): telling ${open.length} agent(s) to checkpoint`);
+      for (const agentId of open) await this.deps.messenger.send(agentId, checkpointPrompt, "steer").catch(() => undefined);
+    }
+  }
+
+  /**
    * Whether an agent is working in the workspace. Two questions: the directory-based one (`paseo agent ls`: any agent
    * `running` under the project directory, which also matches other workspaces on it, so it can only err toward busy)
    * and, when Paseo's API is at hand, the workspace's own agents by id with their open turn. Either says busy: busy. Both
@@ -921,7 +988,11 @@ export class KubernetesRuntime {
     if (!ws) return;
     const agent = ws.agents.get(event.agentId) ?? { turn: false, pendingPermissions: 0 };
     if (event.activity === "turn_started") agent.turn = true;
-    if (event.activity === "turn_ended") agent.turn = false;
+    if (event.activity === "turn_ended") {
+      agent.turn = false;
+      // a turn that completes well after an interruption shows the agent can work: forget earlier failed resumes
+      if (ws.lastInterruptedAt === undefined || this.now() - ws.lastInterruptedAt > 2 * 60_000) this.guard.healthy(event.agentId);
+    }
     if (event.activity === "permission_requested") agent.pendingPermissions++;
     if (event.activity === "permission_resolved") agent.pendingPermissions = Math.max(0, agent.pendingPermissions - 1);
     ws.agents.set(event.agentId, agent);
@@ -1103,14 +1174,21 @@ export class KubernetesRuntime {
         if ((this.stopped || tracked.planned) && code !== 0) return { code, signal, reason: "suspended" as const, message: this.stopped ? "The Kubernetes Runtime plugin restarted; the next message brings the agent back" : "The idle pod was suspended; the next message brings it back" };
         // An exec that ends because the pod went away is the runtime's doing, not the process finishing.
         const info = await kube.podInfo(pod).catch(() => null);
-        const lost = ws.phase === "suspended" || !info || !info.ready || info.terminating;
+        const stop = classifyStop(info, ws.readyUid);
+        const lost = ws.phase === "suspended" || stop.kind === "interrupted";
         if (code !== 0) {
-          this.log(`[kubernetes-runtime] ${request.argv[0]} in ${pod} exited with ${code ?? signal}${lost ? " (pod lost or suspended)" : ""}${stderrTail.trim() ? `: ${scrub(stderrTail.trim())}` : ""}`);
+          this.log(`[kubernetes-runtime] ${request.argv[0]} in ${pod} exited with ${code ?? signal}${lost ? " (pod lost or suspended)" : ""} (${stop.why})${stderrTail.trim() ? `: ${scrub(stderrTail.trim())}` : ""}`);
         }
         if (lost && code !== 0) {
           if (ws.phase === "suspended") return { code, signal, reason: "suspended" as const, message: "The idle pod was suspended; the next message brings it back" };
+          const at = new Date(this.now());
+          void this.onInterrupted(ws, pod, at, stop.why).catch(() => undefined);
+          if ((await this.deps.getConfig()).recovery.interruptedExit) {
+            return { code, signal, reason: "interrupted" as const, message: `Interrupted by a node reclaim at ${at.toISOString().slice(11, 16)}Z (${stop.why}); the agent carries on once its pod is back` };
+          }
           return { code, signal, reason: "runtime-lost" as const, message: "The pod was lost; the next message brings it back" };
         }
+        if (code !== 0 && info?.oomKilled) return { code, signal, reason: "exited" as const, message: "The process ran out of memory (the pod's memory limit)" };
         return { code, signal, reason: "exited" as const };
     });
     tracked.exited = exit;
