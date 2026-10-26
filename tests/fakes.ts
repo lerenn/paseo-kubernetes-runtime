@@ -85,9 +85,9 @@ export class FakeKube implements Kube {
   removed: string[] = [];
   patches2: { name: string; patch: any }[] = [];
   sandboxes: SandboxInfo[] = [];
-  labelled: { kind: string; name: string; labels: Record<string, string> }[] = [];
-  async label(kind: string, name: string, labels: Record<string, string>) {
-    this.labelled.push({ kind, name, labels });
+  labelled: { kind: string; name: string; labels: Record<string, string>; annotations?: Record<string, string> }[] = [];
+  async label(kind: string, name: string, labels: Record<string, string>, annotations: Record<string, string> = {}) {
+    this.labelled.push({ kind, name, labels, annotations });
   }
   async patchSandbox(name: string, patch: Record<string, unknown>) {
     this.calls.push(`patch:${name}`);

@@ -97,6 +97,18 @@ export const ConfigSchema = z.object({
       idleMinutes: z.number().int().min(0).default(0),
     })
     .default({ enabled: false, size: 1, idleMinutes: 0 }),
+  /**
+   * Pod-only mode. Off by default. When on, a request for a Local or Worktree workspace is moved to a pod (or refused),
+   * and an agent is refused in a local workspace, unless its labels match `exemptLabels` (`key=value`).
+   */
+  podOnly: z
+    .object({
+      enabled: z.boolean().default(false),
+      exemptLabels: z.array(z.string().regex(/^[^=\s]+(=[^=\s]*)?$/, "Use key=value")).default(["paseo.assistant=1"]),
+      /** `rewrite` moves a Local or Worktree workspace request to a pod; `refuse` rejects it. */
+      localWorkspaces: z.enum(["rewrite", "refuse"]).default("rewrite"),
+    })
+    .default({ enabled: false, exemptLabels: ["paseo.assistant=1"], localWorkspaces: "rewrite" }),
   /** A workspace whose agents have all been idle this long has its pod deleted (the volume stays); any input brings it back. 0 = never. */
   podIdleMinutes: z.number().int().min(0).default(30),
 });

@@ -579,7 +579,9 @@ export class KubernetesRuntime {
   private async syncLabels(kube: Kube, ws: WorkspaceState, state: MetaState): Promise<void> {
     if (!ws.sandbox) return;
     const meta = this.meta(ws, state);
-    const key = this.metaKey(meta);
+    // a running pod that predates the setting gets the autoscaler's hint too (annotations on a live pod are allowed)
+    const podAnnotations = state === "running" ? (await this.deps.getConfig()).podAnnotations : {};
+    const key = this.metaKey(meta) + JSON.stringify(podAnnotations);
     const retry = ws.labelFailedAt !== undefined && this.now() - ws.labelFailedAt > 5 * 60_000;
     if (ws.labelled === key && !retry) return;
     ws.labelled = key;
@@ -587,7 +589,7 @@ export class KubernetesRuntime {
     await kube.patchSandbox(ws.sandbox, metaPatch(meta)).catch(() => undefined);
     const { labels, annotations } = (metaPatch(meta) as { metadata: unknown }).metadata as { labels: Record<string, string>; annotations: Record<string, string> };
     const failed: unknown[] = [];
-    if (state === "running") await kube.label("pod", ws.sandbox, labels, annotations).catch((e) => failed.push(e));
+    if (state === "running") await kube.label("pod", ws.sandbox, labels, { ...annotations, ...podAnnotations }).catch((e) => failed.push(e));
     await kube.label("pvc", workspaceClaimName(ws.sandbox), labels, annotations).catch((e) => failed.push(e));
     if (failed.length) ws.labelFailedAt = this.now();
   }
