@@ -117,6 +117,13 @@ describe("prepare: the pod is created when the first process is about to start",
     expect(asked).toHaveLength(1);
   });
 
+  it("puts the autoscaler's annotations on a running pod that predates the setting", async () => {
+    const t = setup({ podAnnotations: { "karpenter.sh/do-not-disrupt": "true" } });
+    await t.prepare();
+    expect(t.kube.labelled.find((l) => l.kind === "pod")?.annotations).toMatchObject({ "karpenter.sh/do-not-disrupt": "true" });
+    expect(t.kube.labelled.find((l) => l.kind === "pvc")?.annotations?.["karpenter.sh/do-not-disrupt"]).toBeUndefined();
+  });
+
   it("installs claude or codex on first use when the image lacks them; any other missing command is a clear error", async () => {
     const t = setup();
     let missing = true;
