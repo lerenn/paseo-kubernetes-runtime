@@ -269,6 +269,97 @@ describe("idle suspension and background work inside an agent's process", () => 
   });
 });
 
+describe("the warm pool", () => {
+  const IMAGE = "ghcr.io/x/img@sha256:aaa";
+  const settings = (over: object = {}) => ({ image: IMAGE, warmPool: { enabled: true, size: 1 }, ...over });
+
+  it("keeps the configured number of warm pods running, with neutral names and no workspace", async () => {
+    const t = setup(settings({ warmPool: { enabled: true, size: 2 } }));
+    await t.runtime.maintainPool();
+    const warm = t.kube.sandboxes.filter((s) => s.labels["paseo.sh/state"] === "warm");
+    expect(warm).toHaveLength(2);
+    for (const w of warm) {
+      expect(w.name).toMatch(/^pka-[0-9a-f]{6}$/); // no "warm" in the name: pods cannot be renamed
+      expect(w.labels).not.toHaveProperty("paseo.sh/workspace-id");
+      expect(w.labels["paseo.sh/daemon"]).toBe("srv_ME");
+      expect(w.annotations["paseo.sh/layout"]).toBe("mapped");
+    }
+    await t.runtime.maintainPool(); // enough already: nothing more
+    expect(t.kube.sandboxes).toHaveLength(2);
+    const manifest = t.kube.applied[0] as any;
+    const mounts = manifest.spec.podTemplate.spec.containers[0].volumeMounts;
+    expect(mounts).toEqual([{ name: "workspace", mountPath: "/workspace" }]); // the checkout is inside the volume, no mount at a daemon path
+  });
+
+  it("removes warm pods when the pool is turned off, and replaces ones with another image", async () => {
+    const t = setup(settings());
+    await t.runtime.maintainPool();
+    const first = t.kube.sandboxes[0]!.name;
+    let config: object = settings({ image: "ghcr.io/x/img@sha256:bbb" });
+    const t2 = setup(config, {}, t.kube);
+    await t2.runtime.maintainPool();
+    expect(t.kube.sandboxes.map((s) => s.name)).not.toContain(first); // stale image: removed and replaced
+    expect(t.kube.sandboxes).toHaveLength(1);
+    const t3 = setup({ image: "ghcr.io/x/img@sha256:bbb", warmPool: { enabled: false, size: 1 } }, {}, t.kube);
+    await t3.runtime.maintainPool();
+    expect(t.kube.sandboxes).toHaveLength(0);
+    expect(t.kube.calls.filter((c) => c.startsWith("delete:pvc/"))).toHaveLength(2);
+  });
+
+  it("gives a new workspace a ready warm pod, relabelled for it, then starts the next warm pod", async () => {
+    const t = setup(settings());
+    await t.runtime.maintainPool();
+    const warm = t.kube.sandboxes[0]!.name;
+    await t.prepare();
+    expect(t.kube.applied.every((m: any) => m.metadata.labels["paseo.sh/state"] === "warm")).toBe(true); // nothing was created for the workspace itself: no cold start
+    const claimed = t.kube.sandboxes.find((s) => s.name === warm)!;
+    expect(claimed.labels).toMatchObject({ "paseo.sh/workspace-id": "wks_1", "paseo.sh/state": "running", "paseo.sh/workspace": "brave-otter-12" });
+    expect(claimed.annotations["paseo.sh/cwd"]).toBe(CWD);
+    expect(t.kube.labelled.some((l) => l.kind === "pvc" && l.name === `workspace-${warm}` && l.labels["paseo.sh/workspace-id"] === "wks_1")).toBe(true);
+    expect(t.notices.map((n) => n[0])).toContain("Using a pod that was already running...");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(t.kube.sandboxes.filter((s) => s.labels["paseo.sh/state"] === "warm")).toHaveLength(1); // the pool refilled
+    // the checkout is seeded at the fixed path inside the pod, not at the daemon's
+    const seed = t.kube.execs.find((e) => e.argv[2]?.includes('git init -q "$dir"'))!;
+    expect(seed.argv[4]).toBe("/workspace/checkout");
+  });
+
+  it("starts a mapped pod of its own when no warm pod is ready, and maps the workspace directory to the fixed path", async () => {
+    const t = setup(settings());
+    expect(await t.reg.mapCwd!({ ...t.base, cwd: CWD } as never)).toBe("/workspace/checkout");
+    await t.prepare();
+    const sb = t.kube.applied[0] as any;
+    expect(sb.metadata.labels["paseo.sh/workspace-id"]).toBe("wks_1");
+    expect(sb.metadata.annotations["paseo.sh/layout"]).toBe("mapped");
+    expect(sb.spec.podTemplate.spec.containers[0].volumeMounts).toHaveLength(1);
+  });
+
+  it("leaves everything as it was with the pool off: the checkout is at the daemon's path and no mapping", async () => {
+    const t = setup({ image: IMAGE });
+    expect(await t.reg.mapCwd!({ ...t.base, cwd: CWD } as never)).toBe(CWD);
+    await t.prepare();
+    const sb = t.kube.applied[0] as any;
+    expect(sb.metadata.annotations["paseo.sh/layout"]).toBeUndefined();
+    expect(sb.spec.podTemplate.spec.containers[0].volumeMounts).toContainEqual({ name: "workspace", mountPath: CWD, subPath: "checkout" });
+  });
+
+  it("keeps an existing legacy pod legacy after the pool is turned on", async () => {
+    const t = setup(settings());
+    t.kube.sandboxes = [{ name: "pka-old", labels: { "paseo.sh/daemon": "srv_ME", "paseo.sh/workspace-id": "wks_1" }, annotations: { "paseo.sh/cwd": CWD }, operatingMode: "Running", image: IMAGE, createdAt: new Date(0).toISOString() }];
+    await t.runtime.start();
+    expect(await t.reg.mapCwd!({ ...t.base, cwd: CWD } as never)).toBe(CWD);
+  });
+
+  it("deletes a warm pod from the screen's action", async () => {
+    const t = setup(settings());
+    await t.runtime.maintainPool();
+    const name = t.kube.sandboxes[0]!.name;
+    expect(await t.runtime.podAction(`warm:${name}`, "delete")).toEqual({ ok: true });
+    expect(await t.runtime.podAction(`warm:${name}`, "suspend")).toMatchObject({ ok: false });
+    expect(t.kube.calls).toContain(`delete:sandbox/${name}`);
+  });
+});
+
 describe("submodules do not hold the agent back", () => {
   it("returns from prepare while the submodule checkout is still running, then reports it", async () => {
     const t = setup();

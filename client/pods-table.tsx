@@ -179,7 +179,7 @@ export function PodsTable({ theme, layout, navigation }: Pick<PluginScreenProps,
                 </View>
               ) : (
                 <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
-                  {actionsFor(row.state).map((a) => (
+                  {actionsFor(row.state, row.workspaceId).map((a) => (
                     <Button key={a} label={LABELS[a]} danger={a === "delete"} colors={colors} disabled={working === row.workspaceId} onPress={() => onAction(row, a)} />
                   ))}
                 </View>

@@ -55,6 +55,17 @@ export const ConfigSchema = z.object({
       allow: z.array(z.string()).default([]),
     })
     .default({ enabled: true, hosts: ["github.com"], allow: [] }),
+  /**
+   * Pods kept running ahead of workspaces, so a new workspace starts in seconds instead of waiting for scheduling and a
+   * volume (about 15 s of a 33 s start). Each costs its CPU/memory request and a volume while it waits. New workspaces
+   * use the mapped layout (the checkout at a fixed path, Paseo rewriting paths with `mapCwd`) while this is on.
+   */
+  warmPool: z
+    .object({
+      enabled: z.boolean().default(false),
+      size: z.number().int().min(1).max(5).default(1),
+    })
+    .default({ enabled: false, size: 1 }),
   /** A workspace whose agents have all been idle this long has its pod deleted (the volume stays); any input brings it back. 0 = never. */
   podIdleMinutes: z.number().int().min(0).default(30),
 });

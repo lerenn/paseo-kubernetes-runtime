@@ -17,6 +17,15 @@ export const REPO_URL_ANNOTATION = "paseo.sh/repo-url";
 export const SPEC_HASH_ANNOTATION = "paseo.sh/spec-hash";
 /** The project directory on the daemon, so a restarted plugin can resume a workspace it has not been told about yet. */
 export const CWD_ANNOTATION = "paseo.sh/cwd";
+/**
+ * `mapped`: the checkout is at the fixed `MAPPED_CHECKOUT` in every pod and Paseo rewrites the daemon's path to it (the
+ * runtime's `mapCwd`), so a pod does not depend on its workspace and can be started ahead of it (the warm pool).
+ * Without the annotation a pod is `legacy`: the checkout is mounted at the daemon's own path.
+ */
+export const LAYOUT_ANNOTATION = "paseo.sh/layout";
+export const MAPPED_CHECKOUT = "/workspace/checkout";
+/** The `paseo.sh/state` of a pod that is started ahead of its workspace. */
+export const WARM_STATE = "warm";
 
 export const WORKSPACE_ROOT = "/workspace";
 /** Agent session state (claude's transcripts, caches, installed CLIs) lives under HOME, on the workspace volume. */
@@ -99,23 +108,42 @@ export function specHash(config: KubernetesRuntimeConfig, cwd: string): string {
 
 export interface SandboxSpecInput {
   name: string;
-  workspaceId: string;
-  /** The project directory on the daemon; the pod shows the workspace's checkout at this same path. */
-  cwd: string;
+  /** Absent for a warm pod, which belongs to no workspace yet. */
+  workspaceId?: string;
+  /** The project directory on the daemon. A legacy pod shows the checkout at this same path; a mapped one does not need it. */
+  cwd?: string;
   config: KubernetesRuntimeConfig;
   daemonId?: string;
   meta?: PodMeta;
+  /** Where the checkout is in the pod (default legacy). */
+  layout?: "legacy" | "mapped";
+  /** A pod started ahead of any workspace; claimed later with `claimPatch`. */
+  warm?: boolean;
+}
+
+/** `pka-<random>`: a neutral name for a pod that is started before its workspace is known (names cannot change). */
+export function warmSandboxName(): string {
+  return `pka-${randomBytes(3).toString("hex")}`;
+}
+
+/** Turns a warm pod into a workspace's pod: ownership and display labels on the Sandbox, its pod template (the controller copies them onto the running pod) and the directory annotation. */
+export function claimPatch(workspaceId: string, cwd: string, meta: PodMeta): Record<string, unknown> {
+  const labels = { [WORKSPACE_ID_LABEL]: workspaceId, ...metaLabels(meta) };
+  const annotations = { [CWD_ANNOTATION]: cwd, ...metaAnnotations(meta) };
+  return { metadata: { labels, annotations }, spec: { podTemplate: { metadata: { labels, annotations } } } };
 }
 
 /** A `Sandbox` (agents.x-k8s.io) whose single container idles; provider processes are started in it by `kubectl exec`. */
 export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
-  const { name, workspaceId, cwd, config, daemonId, meta } = input;
+  const { name, workspaceId, config, daemonId, meta, warm } = input;
+  const layout = input.layout ?? (warm ? "mapped" : "legacy");
+  const cwd = layout === "mapped" ? undefined : (input.cwd ?? "");
   const shown = meta ? metaLabels(meta) : {};
-  const podLabels = { [MANAGED_BY_LABEL]: MANAGED_BY, ...shown };
+  const podLabels = { [MANAGED_BY_LABEL]: MANAGED_BY, ...(warm ? { [STATE_LABEL]: WARM_STATE } : shown) };
   const owner = {
     ...(daemonId ? { [DAEMON_LABEL]: daemonId } : {}),
-    [WORKSPACE_ID_LABEL]: workspaceId,
-    ...shown,
+    ...(workspaceId ? { [WORKSPACE_ID_LABEL]: workspaceId } : {}),
+    ...(warm ? { [STATE_LABEL]: WARM_STATE } : shown),
   };
   return {
     apiVersion: config.sandboxApiVersion,
@@ -124,7 +152,12 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
       name,
       namespace: config.namespace,
       labels: { ...podLabels, ...owner },
-      annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd), [CWD_ANNOTATION]: cwd, ...(meta ? metaAnnotations(meta) : {}) },
+      annotations: {
+        [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT),
+        ...(cwd ? { [CWD_ANNOTATION]: cwd } : { [LAYOUT_ANNOTATION]: "mapped" }),
+        ...(input.cwd && layout === "mapped" ? { [CWD_ANNOTATION]: input.cwd } : {}),
+        ...(meta ? metaAnnotations(meta) : {}),
+      },
     },
     // No shutdownTime: a workspace's storage goes only when the workspace is archived (or the reaper finds
     // it gone). Only `operatingMode` changes over its life.
@@ -171,7 +204,7 @@ function volumeInit(config: KubernetesRuntimeConfig) {
 }
 
 /** The pod's single container: idles; provider processes are started in it by `kubectl exec`. */
-export function workspaceContainer(config: KubernetesRuntimeConfig, cwd: string) {
+export function workspaceContainer(config: KubernetesRuntimeConfig, cwd?: string) {
   return {
     name: "agent",
     image: config.image,
@@ -188,9 +221,9 @@ export function workspaceContainer(config: KubernetesRuntimeConfig, cwd: string)
     ...(config.resources ? { resources: config.resources } : {}),
     volumeMounts: [
       { name: WORKSPACE_VOLUME, mountPath: WORKSPACE_ROOT },
-      // Paths inside provider protocols (claude's session files, codex's thread cwd) are the daemon's, so the
-      // checkout must appear at the daemon's own absolute path.
-      { name: WORKSPACE_VOLUME, mountPath: cwd, subPath: CHECKOUT_SUBPATH },
+      // A legacy pod shows the checkout at the daemon's own absolute path (paths inside provider protocols, like
+      // claude's session files, are the daemon's). A mapped pod has it at MAPPED_CHECKOUT, inside the volume.
+      ...(cwd ? [{ name: WORKSPACE_VOLUME, mountPath: cwd, subPath: CHECKOUT_SUBPATH }] : []),
     ],
   };
 }
@@ -201,9 +234,9 @@ export function suspendPatch() {
 }
 
 /** Recreates the pod on the same volume, with the current image and settings. */
-export function resumePatch(config: KubernetesRuntimeConfig, cwd: string) {
+export function resumePatch(config: KubernetesRuntimeConfig, cwd?: string) {
   return {
-    metadata: { annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd) } },
+    metadata: { annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT) } },
     spec: {
       operatingMode: "Running",
       podTemplate: { spec: { initContainers: [volumeInit(config)], containers: [workspaceContainer(config, cwd)] } },
