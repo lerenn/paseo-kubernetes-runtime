@@ -10,7 +10,7 @@ import { Kubectl } from "./server/kube.js";
 import { migrateLegacyData } from "./server/migrate.js";
 import { OrphanReaper } from "./server/orphans.js";
 import { podOnlyAgent, podOnlyWorkspace } from "./server/pod-only.js";
-import { workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
+import { labelsOfAgent, workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
 import { PodRegistry } from "./server/registry.js";
 import { KubernetesRuntime } from "./server/runtime.js";
 import type { WorkspaceRuntimeRegistration } from "./server/runtime-types.js";
@@ -57,10 +57,7 @@ export default function contribute(server: PluginServerContext) {
     try {
       if (!request.workspaceId) return;
       let labels = (request as { labels?: Record<string, string> }).labels;
-      if (!labels) {
-        const list = (await paseo.agents.list()) as unknown as { agents?: { id: string; labels?: Record<string, string> }[] };
-        labels = list.agents?.find((a) => a.id === request.agentId)?.labels;
-      }
+      labels ??= await labelsOfAgent(paseo as AgentListApi, request.agentId);
       runtime.noteAgent(request.workspaceId, labels);
     } catch {
       // labels are an optimisation of access, never a reason to stop a session

@@ -30,3 +30,19 @@ export async function workspaceAgentsBusy(paseo: AgentListApi | null, workspaceI
     return null;
   }
 }
+
+/**
+ * The labels of one agent from the agent list (`{ entries: [{ agent }] }`, or a plain array). Undefined when the agent is
+ * not in the list or the list is not readable.
+ */
+export async function labelsOfAgent(paseo: AgentListApi | null, agentId: string): Promise<Record<string, string> | undefined> {
+  if (!paseo) return undefined;
+  try {
+    const result = (await paseo.agents.list({})) as { entries?: { agent?: AgentLike & { labels?: Record<string, string> } }[] } | (AgentLike & { labels?: Record<string, string> })[];
+    const entries = Array.isArray(result) ? result : (result.entries ?? []);
+    const agents = entries.map((e) => ((e as { agent?: AgentLike }).agent ?? e) as AgentLike & { labels?: Record<string, string> });
+    return agents.find((a) => a.id === agentId)?.labels;
+  } catch {
+    return undefined;
+  }
+}
