@@ -9,6 +9,8 @@ export class FakeKube implements Kube {
   execResult: ExecResult = { code: 0, stdout: "", stderr: "" };
   waitError?: Error;
   streams: { pod: string; argv: string[] }[] = [];
+  /** A killed process ends (as a real one does); turn off to test a process that will not die. */
+  killEnds = true;
 
   async apply(manifest: Record<string, unknown>) {
     this.calls.push("apply");
@@ -60,7 +62,16 @@ export class FakeKube implements Kube {
     let finish!: (v: { code: number | null; signal: string | null }) => void;
     const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => (finish = resolve));
     this.procs.push({ pod, argv, stdin, stdout, stderr, killed, end: (code, signal = null) => finish({ code, signal }) });
-    return { stdin, stdout, stderr, exit, kill: (sig) => void killed.push(sig ?? "SIGTERM") };
+    return {
+      stdin,
+      stdout,
+      stderr,
+      exit,
+      kill: (sig) => {
+        killed.push(sig ?? "SIGTERM");
+        if (this.killEnds) queueMicrotask(() => finish({ code: null, signal: sig ?? "SIGTERM" }));
+      },
+    };
   }
   execStream(pod: string, argv: string[]) {
     this.streams.push({ pod, argv });

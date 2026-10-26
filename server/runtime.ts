@@ -145,7 +145,7 @@ export const RUNTIME_LABEL = "Kubernetes Runtime";
 export class KubernetesRuntime {
   private stopped = false;
   /** Provider processes started in pods and not yet finished. */
-  private readonly execs = new Set<{ proc: PodProcess; exited: Promise<unknown> }>();
+  private readonly execs = new Set<{ ws: WorkspaceState; proc: PodProcess; exited: Promise<unknown>; /** Ended on purpose by a suspend: reported as the planned `suspended` exit, whatever happens to the workspace afterwards. */ planned: boolean }>();
   private readonly states = new Map<string, WorkspaceState>();
   private stopTicker: () => void = () => undefined;
   private readonly git: GitRunner;
@@ -596,7 +596,16 @@ export class KubernetesRuntime {
     ws.bridge = undefined;
     ws.readyUid = undefined;
     ws.commands.clear();
-    this.setPhase(ws, "suspended"); // before the pod goes: processes that end with it are reported as runtime-lost
+    this.setPhase(ws, "suspended");
+    // End the provider processes ourselves first and wait for their exits to be reported as the planned stop. Left
+    // to the pod's deletion they die 30 s later, and by then a Git poll may already have resumed the workspace, so
+    // the exit would read as a lost pod and the agent would show an error.
+    const mine = [...this.execs].filter((e) => e.ws === ws);
+    for (const e of mine) {
+      e.planned = true;
+      e.proc.kill("SIGTERM");
+    }
+    await Promise.race([Promise.allSettled(mine.map((e) => e.exited)), new Promise((r) => setTimeout(r, 5_000).unref?.())]);
     await this.syncLabels(kube, ws, "suspended");
     await kube.patchSandbox(ws.sandbox, suspendPatch());
   }
@@ -974,10 +983,11 @@ export class KubernetesRuntime {
     proc.stderr.on("data", (chunk: Buffer | string) => {
       stderrTail = (stderrTail + chunk.toString()).slice(-1500);
     });
+    const tracked = { ws, proc, exited: undefined as unknown as Promise<unknown>, planned: false };
     const exit = proc.exit.then(async ({ code, signal }) => {
         ctx.signal.removeEventListener("abort", abort);
-        // The plugin is stopping and ended its processes itself: a planned stop, answered at once (no cluster calls)
-        if (this.stopped && code !== 0) return { code, signal, reason: "suspended" as const, message: "The Kubernetes Runtime plugin restarted; the next message brings the agent back" };
+        // Ended by us on purpose (the plugin stopping, or an idle suspend): a planned stop, answered at once, no cluster calls
+        if ((this.stopped || tracked.planned) && code !== 0) return { code, signal, reason: "suspended" as const, message: this.stopped ? "The Kubernetes Runtime plugin restarted; the next message brings the agent back" : "The idle pod was suspended; the next message brings it back" };
         // An exec that ends because the pod went away is the runtime's doing, not the process finishing.
         const info = await kube.podInfo(pod).catch(() => null);
         const lost = ws.phase === "suspended" || !info || !info.ready || info.terminating;
@@ -985,13 +995,12 @@ export class KubernetesRuntime {
           this.log(`[kubernetes-runtime] ${request.argv[0]} in ${pod} exited with ${code ?? signal}${lost ? " (pod lost or suspended)" : ""}${stderrTail.trim() ? `: ${scrub(stderrTail.trim())}` : ""}`);
         }
         if (lost && code !== 0) {
-          // Our own idle suspension is a planned, clean stop (agents drop it quietly); a pod that vanished is not.
           if (ws.phase === "suspended") return { code, signal, reason: "suspended" as const, message: "The idle pod was suspended; the next message brings it back" };
           return { code, signal, reason: "runtime-lost" as const, message: "The pod was lost; the next message brings it back" };
         }
         return { code, signal, reason: "exited" as const };
     });
-    const tracked = { proc, exited: exit };
+    tracked.exited = exit;
     this.execs.add(tracked);
     void exit.finally(() => this.execs.delete(tracked));
     return {
