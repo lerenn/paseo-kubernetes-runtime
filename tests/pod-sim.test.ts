@@ -223,7 +223,7 @@ describe("pod profiles (real pod scripts)", () => {
     const first = await openSession("sh", {}, undefined, {}, false, { config, options: { profile: "prbr-picky" } });
     const pod = join(first.kube.workspace, "prbr-picky");
     expect(readFileSync(join(pod, "corpus.json"), "utf8")).toBe('{"cases":3}');
-    expect(existsSync(join(pod, "runs", "baseline.json"))).toBe(true);
+    expect(existsSync(join(pod, "runs", "baseline.json"))).toBe(false); // a file of the pruned directory that is not kept
     expect(existsSync(join(pod, "cache"))).toBe(false);
     expect(existsSync(join(pod, "run.log"))).toBe(false);
     expect(existsSync(join(pod, "runs", "v1", "keep.json"))).toBe(true);
