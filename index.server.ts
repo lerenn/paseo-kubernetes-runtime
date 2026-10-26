@@ -10,9 +10,11 @@ import { Kubectl } from "./server/kube.js";
 import { migrateLegacyData } from "./server/migrate.js";
 import { OrphanReaper } from "./server/orphans.js";
 import { podOnlyAgent, podOnlyWorkspace } from "./server/pod-only.js";
+import { LABELS_REF_ENV, LabelHandoff, withAgentLabels } from "./server/label-handoff.js";
 import { labelsOfAgent, workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
 import { PodRegistry } from "./server/registry.js";
 import { KubernetesRuntime } from "./server/runtime.js";
+import { RUNTIME_ID } from "./shared/runtime-options.js";
 import type { WorkspaceRuntimeRegistration } from "./server/runtime-types.js";
 
 export default function contribute(server: PluginServerContext) {
@@ -52,11 +54,12 @@ export default function contribute(server: PluginServerContext) {
   // The first agent of a workspace picks its pod's ServiceAccount by label. Its session opens before the pod is
   // launched, so the labels are recorded then; the published SDK's hook payload has none, so they are read from
   // the agent list (a fork that puts `labels` on the request is used directly).
+  const handoff = new LabelHandoff();
   server.before("agent.session_open", async ({ request }, { paseo }) => {
     capture({ paseo });
     try {
       if (!request.workspaceId) return;
-      let labels = (request as { labels?: Record<string, string> }).labels;
+      let labels = handoff.find(request.env?.[LABELS_REF_ENV]) ?? (request as { labels?: Record<string, string> }).labels;
       labels ??= await labelsOfAgent(paseo as AgentListApi, request.agentId);
       runtime.noteAgent(request.workspaceId, labels);
     } catch {
@@ -69,11 +72,15 @@ export default function contribute(server: PluginServerContext) {
   // Pod-only mode (off by default). A refusal is the hook's error, shown to whoever made the request.
   server.before("workspace.create", async ({ request }) => {
     const { podOnly } = await getConfig();
-    return podOnlyWorkspace(request as never, podOnly) as never;
+    return withAgentLabels(podOnlyWorkspace(request as never, podOnly), RUNTIME_ID) as never;
   });
   server.before("agent.create", async ({ request }) => {
     const { podOnly } = await getConfig();
     podOnlyAgent(request as never, podOnly);
+    // leave the agent's labels for its session hook (see LabelHandoff); only when the daemon gives them
+    const labels = (request as { labels?: Record<string, string> }).labels;
+    if (!labels || Object.keys(labels).length === 0) return;
+    return { ...request, env: { ...(request.env ?? {}), [LABELS_REF_ENV]: handoff.issue(labels) } } as never;
   });
 
   const reaper = new OrphanReaper({
