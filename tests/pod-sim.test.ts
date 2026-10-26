@@ -106,6 +106,23 @@ describe("seeded pod workspace and push-back (real git, real pod scripts)", () =
     expect(sh(origin, "log", "-1", "--format=%s", "refs/heads/throwaway")).toBe("pod work");
   });
 
+  it("pushes a branch whose history does not contain the seed commit (the seed is not in the outbox, so it cannot be excluded there)", async () => {
+    const { origin, kube, podDir } = await openSession();
+    // a line of history that does not include the seed commit, like a branch cut from a newer origin/main than the seed was
+    for (const argv of [
+      ["git", "switch", "-q", "--orphan", "other-line"],
+      ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "a line without the seed"],
+    ]) {
+      const r = await kube.as(argv, { cwd: podDir });
+      expect(r.code, r.stderr).toBe(0);
+    }
+    const seed = (await kube.as(["cat", `${kube.home}/seed.sha`])).stdout.trim();
+    expect((await kube.as(["git", "merge-base", "--is-ancestor", seed, "HEAD"], { cwd: podDir })).code).not.toBe(0);
+    const pushed = await kube.as(["git", "push", "origin", "other-line"], { cwd: podDir });
+    expect(pushed.code, pushed.stderr).toBe(0);
+    expect(sh(origin, "log", "--format=%s", "-1", "refs/heads/other-line")).toBe("a line without the seed");
+  });
+
   it("a second push on the same branch sends only the new commits", async () => {
     const { origin, kube, podDir } = await openSession();
     for (const n of [1, 2]) {
