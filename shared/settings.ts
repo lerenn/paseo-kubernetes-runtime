@@ -52,6 +52,19 @@ export const ConfigSchema = z.object({
    * so the autoscaler leaves a node alone while an agent works on it. A suspended workspace has no pod, so they go with it.
    */
   podAnnotations: z.record(z.string(), z.string()).default({}),
+  /**
+   * ServiceAccount by agent label. The first rule whose `label` (`key=value`) is among the labels of the first agent
+   * of a workspace names the pod's ServiceAccount, and its token is mounted. No match: the pod has no token.
+   * Chosen when the pod is created, so a warm pod (which waits for any workspace) is never used for one.
+   */
+  serviceAccounts: z
+    .array(
+      z.object({
+        label: z.string().regex(/^[^=\s]+=[^=\s]*$/, "Use key=value, e.g. paseo.ops=1"),
+        serviceAccount: z.string().min(1),
+      }),
+    )
+    .default([]),
   storage: StorageSchema.default({ mode: "persistent", size: "10Gi" }),
   /**
    * Also delete this plugin's sandboxes that carry no daemon label (made before labelling existed) and match no

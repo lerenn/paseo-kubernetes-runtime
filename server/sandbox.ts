@@ -11,6 +11,8 @@ export const WORKSPACE_ID_LABEL = "paseo.sh/workspace-id";
 export const WORKSPACE_LABEL = "paseo.sh/workspace";
 export const AGENT_LABEL = "paseo.sh/agent";
 export const REPO_LABEL = "paseo.sh/repo";
+/** On pods that run as a ServiceAccount, so a NetworkPolicy can select them. */
+export const SERVICE_ACCOUNT_LABEL = "paseo.sh/service-account";
 export const STATE_LABEL = "paseo.sh/state";
 export const WORKSPACE_NAME_ANNOTATION = "paseo.sh/workspace-name";
 export const REPO_URL_ANNOTATION = "paseo.sh/repo-url";
@@ -92,7 +94,15 @@ export function sandboxName(workspaceId: string, repo?: string, slug?: string): 
 }
 
 /** Changes whenever a setting that shapes the pod does, so a resumed pod picks up the current ones. */
-export function specHash(config: KubernetesRuntimeConfig, cwd: string): string {
+/** The ServiceAccount a workspace's pod runs as: the first configured rule matched by the agent's labels. */
+export function serviceAccountFor(config: KubernetesRuntimeConfig, labels: Record<string, string> = {}): string | undefined {
+  return config.serviceAccounts.find((r) => {
+    const [key, value] = r.label.split("=");
+    return labels[key!] === value;
+  })?.serviceAccount;
+}
+
+export function specHash(config: KubernetesRuntimeConfig, cwd: string, serviceAccount?: string | null): string {
   const shape = {
     image: config.image,
     resources: config.resources ?? null,
@@ -121,6 +131,8 @@ export interface SandboxSpecInput {
   layout?: "legacy" | "mapped";
   /** A pod started ahead of any workspace; claimed later with `claimPatch`. */
   warm?: boolean;
+  /** The pod runs as this ServiceAccount (see `serviceAccounts`); none for a warm pod. */
+  serviceAccount?: string;
 }
 
 /** `pka-<random>`: a neutral name for a pod that is started before its workspace is known (names cannot change). */
@@ -139,10 +151,15 @@ export function claimPatch(workspaceId: string, cwd: string, meta: PodMeta, conf
 /** A `Sandbox` (agents.x-k8s.io) whose single container idles; provider processes are started in it by `kubectl exec`. */
 export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
   const { name, workspaceId, config, daemonId, meta, warm } = input;
+  const serviceAccount = warm ? undefined : input.serviceAccount;
   const layout = input.layout ?? (warm ? "mapped" : "legacy");
   const cwd = layout === "mapped" ? undefined : (input.cwd ?? "");
   const shown = meta ? metaLabels(meta) : {};
-  const podLabels = { [MANAGED_BY_LABEL]: MANAGED_BY, ...(warm ? { [STATE_LABEL]: WARM_STATE } : shown) };
+  const podLabels = {
+    [MANAGED_BY_LABEL]: MANAGED_BY,
+    ...(serviceAccount ? { [SERVICE_ACCOUNT_LABEL]: serviceAccount } : {}),
+    ...(warm ? { [STATE_LABEL]: WARM_STATE } : shown),
+  };
   const owner = {
     ...(daemonId ? { [DAEMON_LABEL]: daemonId } : {}),
     ...(workspaceId ? { [WORKSPACE_ID_LABEL]: workspaceId } : {}),
@@ -156,7 +173,7 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
       namespace: config.namespace,
       labels: { ...podLabels, ...owner },
       annotations: {
-        [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT),
+        [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT, serviceAccount),
         ...(cwd ? { [CWD_ANNOTATION]: cwd } : { [LAYOUT_ANNOTATION]: "mapped" }),
         ...(input.cwd && layout === "mapped" ? { [CWD_ANNOTATION]: input.cwd } : {}),
         ...(meta ? metaAnnotations(meta) : {}),
@@ -175,7 +192,7 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
         },
         spec: {
           restartPolicy: "Never",
-          automountServiceAccountToken: false,
+          ...(serviceAccount ? { serviceAccountName: serviceAccount, automountServiceAccountToken: true } : { automountServiceAccountToken: false }),
           securityContext: { runAsNonRoot: true, runAsUser: 1000, fsGroup: 1000 },
           ...placement(config),
           // The checkout is a subPath of the volume, and kubelet creates a subPath directory owned by root,
@@ -243,15 +260,23 @@ export function suspendPatch() {
 }
 
 /** Recreates the pod on the same volume, with the current image and settings. */
-export function resumePatch(config: KubernetesRuntimeConfig, cwd?: string) {
+export function resumePatch(config: KubernetesRuntimeConfig, cwd?: string, serviceAccount?: string) {
   return {
-    metadata: { annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT) } },
+    metadata: { annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT, serviceAccount) } },
     spec: {
       operatingMode: "Running",
       // placement and annotations too: a resumed pod follows the settings of today (a node pool that changed, the autoscaler's hint)
       podTemplate: {
-        ...(Object.keys(config.podAnnotations).length ? { metadata: { annotations: config.podAnnotations } } : {}),
-        spec: { ...placement(config), initContainers: [volumeInit(config)], containers: [workspaceContainer(config, cwd)] },
+        metadata: {
+          // null removes the label from a template that had it
+          labels: { [SERVICE_ACCOUNT_LABEL]: serviceAccount ?? null },
+          ...(Object.keys(config.podAnnotations).length ? { annotations: config.podAnnotations } : {}),
+        },
+        spec: {
+          ...(serviceAccount ? { serviceAccountName: serviceAccount, automountServiceAccountToken: true } : { serviceAccountName: null, automountServiceAccountToken: false }),
+          ...placement(config), initContainers: [volumeInit(config)],
+          containers: [workspaceContainer(config, cwd)],
+        },
       },
     },
   };

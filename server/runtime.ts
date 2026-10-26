@@ -48,6 +48,8 @@ import {
   type PodMeta,
   type PodState as MetaState,
   resumePatch,
+  serviceAccountFor,
+  SERVICE_ACCOUNT_LABEL,
   sandboxName,
   suspendPatch,
   workspaceClaimName,
@@ -441,7 +443,9 @@ export class KubernetesRuntime {
       const repo = await (this.deps.detectRepo ?? detectRepo)(cwd);
       ws.repo = repoName(repo.url);
       ws.repoUrl = repo.url;
-      const warm = layout === "mapped" ? await this.claimWarm(kube, config, ws) : undefined;
+      const serviceAccount = serviceAccountFor(config, this.agentLabels(ws));
+      // a running pod cannot change ServiceAccount, so only a pod without one is taken from the warm pool
+      const warm = layout === "mapped" && !serviceAccount ? await this.claimWarm(kube, config, ws) : undefined;
       if (warm) {
         ctx.notice("Using a pod that was already running...");
         ws.sandbox = warm.name;
@@ -451,7 +455,7 @@ export class KubernetesRuntime {
       } else {
         ctx.notice("Starting the pod...");
         const name = sandboxName(ws.id, repoName(repo.url), ws.options.slug);
-        await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, layout, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running") }));
+        await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, layout, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running"), serviceAccount }));
         ws.labelled = this.metaKey(this.meta(ws, "running"));
         ws.sandbox = name;
         ws.image = config.image;
@@ -464,7 +468,7 @@ export class KubernetesRuntime {
       if (sandbox.operatingMode === "Suspended") {
         ctx.notice("Resuming the pod...");
         this.setPhase(ws, "resuming");
-        await kube.patchSandbox(sandbox.name, resumePatch(config, ws.layout === "mapped" ? undefined : cwd));
+        await kube.patchSandbox(sandbox.name, resumePatch(config, ws.layout === "mapped" ? undefined : cwd, this.resumeServiceAccount(config, ws, sandbox)));
         ws.image = config.image; // a resumed pod starts with the current image
       }
     }
@@ -702,6 +706,24 @@ export class KubernetesRuntime {
     return run.catch(() => undefined);
   }
 
+  /** Labels of the first agent seen in each workspace, recorded before its session opens (see `noteAgent`). */
+  private readonly firstAgentLabels = new Map<string, Record<string, string>>();
+
+  /** Called before an agent's session opens: the first agent of a workspace decides its pod's ServiceAccount. */
+  noteAgent(workspaceId: string, labels: Record<string, string> | undefined): void {
+    if (labels && !this.firstAgentLabels.has(workspaceId)) this.firstAgentLabels.set(workspaceId, labels);
+  }
+
+  private agentLabels(ws: WorkspaceState): Record<string, string> | undefined {
+    return ws.options.labels ?? this.firstAgentLabels.get(ws.id);
+  }
+
+  /** On resume the pod keeps its ServiceAccount unless the labels are known and say otherwise (after a daemon restart they are not). */
+  private resumeServiceAccount(config: KubernetesRuntimeConfig, ws: WorkspaceState, sandbox: SandboxInfo): string | undefined {
+    const labels = this.agentLabels(ws);
+    return labels ? serviceAccountFor(config, labels) : sandbox.labels[SERVICE_ACCOUNT_LABEL];
+  }
+
   private claims: Promise<unknown> = Promise.resolve();
   /** When a workspace or an agent last needed a pod (ms): the warm pool's idle timeout counts from here. */
   private lastDemand = 0;
@@ -912,6 +934,7 @@ export class KubernetesRuntime {
   }
 
   private async destroyWorkspace(ws: WorkspaceState): Promise<void> {
+    this.firstAgentLabels.delete(ws.id);
     await this.serial(ws, async () => {
       const config = await this.deps.getConfig();
       const kube = this.deps.kubeFor(config);
