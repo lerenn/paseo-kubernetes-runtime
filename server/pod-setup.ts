@@ -24,6 +24,24 @@ export async function installAssets(kube: Kube, pod: string): Promise<void> {
   await write(kube, pod, "mirror-pre-receive", MIRROR_PRE_RECEIVE, "755");
 }
 
+/** The Daemon Ops variables of an agent launch: its endpoint on the daemon's loopback and its capability token. */
+export function opsEnv(env: Readonly<Record<string, string>> | undefined): { url: string; capability: string } | undefined {
+  const url = env?.PASEO_DAEMON_OPS_URL;
+  const capability = env?.PASEO_DAEMON_OPS_CAPABILITY;
+  return url && capability ? { url, capability } : undefined;
+}
+
+/**
+ * Puts the scoped `paseo` of Daemon Ops on the pod's PATH. The daemon plugin serves it to the agent's own capability
+ * (so it is always the current version, and only agents that have the tools get it); the pod reaches the endpoint
+ * itself through the tunnel with the same token.
+ */
+export async function installOpsShim(kube: Kube, pod: string, ops: { url: string; capability: string }, fetcher: typeof fetch = fetch): Promise<void> {
+  const res = await fetcher(`${ops.url}/shim`, { headers: { authorization: `Bearer ${ops.capability}` } });
+  if (!res.ok) throw new Error(`Daemon Ops did not serve the paseo shim (${res.status})`);
+  await write(kube, pod, "bin/paseo", await res.text(), "755");
+}
+
 /** Points git in the pod at local mirrors of the project's remote and its submodules, refreshed through the bridge. */
 export async function setupMirrors(kube: Kube, pod: string, cwd: string, identity: { name: string; email: string }, targets: readonly FetchTarget[], hosts: readonly string[] = []): Promise<void> {
   const r = await kube.exec(pod, ["sh", "-c", MIRROR_SETUP_SCRIPT, "sh", ...mirrorSetupArgs(cwd, identity, targets, hosts)]);
