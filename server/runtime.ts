@@ -402,7 +402,7 @@ export class KubernetesRuntime {
     const config = await this.deps.getConfig();
     const kube = this.deps.kubeFor(config);
     const { cwd } = ws.options;
-    for (const port of loopbackPorts((need.mcpServers ?? {}) as Record<string, { type: string; url?: string }>, [need.env?.PASEO_GITHUB_PROXY_URL])) ws.wantPorts.add(port);
+    for (const port of loopbackPorts((need.mcpServers ?? {}) as Record<string, { type: string; url?: string }>)) ws.wantPorts.add(port);
     const wanted = new Set([...ws.ports, ...ws.wantPorts]);
     const grows = [...wanted].some((p) => !ws.ports.has(p));
 

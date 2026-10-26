@@ -56,9 +56,9 @@ Paseo daemon                                   cluster (paseo-agents)
   pushes. The "Other repositories" setting turns it off or restricts it to `owner/*` or `owner/repo` patterns.
 - **Push-back.** `git push` goes to a local "outbox" repository whose `pre-receive` hook asks the plugin, over the
   same bridge, to push the new commits from the daemon with the daemon's git credentials (branches only, no
-  deletions). `gh` and GitHub tools go through the GitHub Proxy plugin if it is installed and the agent is opted in
-  (`PASEO_GITHUB_PROXY=on`, or its scope set to all).
-- **Loopback MCP servers** (`http://127.0.0.1:<port>`: GitHub Proxy, MCP Proxy, Inbox, Leases, ...) found in the
+  deletions). The pod has no `gh`: GitHub is reached through GitHub's MCP server behind MCP Proxy (a loopback MCP
+  server, tunnelled below) and the Events plugin, never with a token in the pod.
+- **Loopback MCP servers** (`http://127.0.0.1:<port>`: MCP Proxy, Inbox, Leases, ...) found in the
   agent's MCP config at `prepare` are tunnelled by port, byte for byte, to the daemon's loopback over the same
   channel: URLs and headers stay unchanged, streams work, and only the named ports are reachable.
 - **Credentials.** Only `CLAUDE_CODE_OAUTH_TOKEN`, from the Secret `paseo-agent-credentials`, by reference. Written from
