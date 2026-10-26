@@ -8,6 +8,8 @@ export const RuntimeOptionsSchema = z.object({
   slug: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/).optional(),
   /** The workspace's name in Paseo; labels the pod. Kept current by the reconciler when the workspace is renamed. */
   title: z.string().max(200).optional(),
+  /** Labels of the agent the workspace is for (e.g. `paseo.ops: "1"`); they pick the pod's ServiceAccount at creation. */
+  labels: z.record(z.string(), z.string()).optional(),
   /** The branch picker's choice. */
   ref: z
     .object({

@@ -76,8 +76,16 @@ export function sandboxName(workspaceId: string, repo?: string, slug?: string): 
   return `pka-${named || slugify(workspaceId, 24) || "workspace"}-${randomBytes(3).toString("hex")}`;
 }
 
+/** The ServiceAccount a workspace's pod runs as: the first configured rule matched by the workspace's agent labels. */
+export function serviceAccountFor(config: KubernetesRuntimeConfig, labels: Record<string, string> = {}): string | undefined {
+  return config.serviceAccounts.find((r) => {
+    const [key, value] = r.label.split("=");
+    return labels[key] === value;
+  })?.serviceAccount;
+}
+
 /** Changes whenever a setting that shapes the pod does, so a resumed pod picks up the current ones. */
-export function specHash(config: KubernetesRuntimeConfig, cwd: string): string {
+export function specHash(config: KubernetesRuntimeConfig, cwd: string, serviceAccount?: string): string {
   const shape = {
     image: config.image,
     resources: config.resources ?? null,
@@ -87,6 +95,7 @@ export function specHash(config: KubernetesRuntimeConfig, cwd: string): string {
     credentialsSecret: config.credentialsSecret,
     apiVersion: config.sandboxApiVersion,
     cwd,
+    ...(serviceAccount ? { serviceAccount } : {}),
   };
   return createHash("sha1").update(JSON.stringify(shape)).digest("hex").slice(0, 12);
 }
@@ -99,11 +108,14 @@ export interface SandboxSpecInput {
   config: KubernetesRuntimeConfig;
   daemonId?: string;
   meta?: PodMeta;
+  /** Labels of the agent the workspace is for; see `serviceAccounts`. */
+  agentLabels?: Record<string, string>;
 }
 
 /** A `Sandbox` (agents.x-k8s.io) whose single container idles; provider processes are started in it by `kubectl exec`. */
 export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
   const { name, workspaceId, cwd, config, daemonId, meta } = input;
+  const serviceAccount = serviceAccountFor(config, input.agentLabels);
   const shown = meta ? metaLabels(meta) : {};
   const podLabels = { [MANAGED_BY_LABEL]: MANAGED_BY, ...shown };
   const owner = {
@@ -118,7 +130,7 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
       name,
       namespace: config.namespace,
       labels: { ...podLabels, ...owner },
-      annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd), [CWD_ANNOTATION]: cwd, ...(meta ? metaAnnotations(meta) : {}) },
+      annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd, serviceAccount), [CWD_ANNOTATION]: cwd, ...(meta ? metaAnnotations(meta) : {}) },
     },
     // No shutdownTime: a workspace's storage goes only when the workspace is archived (or the reaper finds
     // it gone). Only `operatingMode` changes over its life.
@@ -130,7 +142,7 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
         metadata: { labels: podLabels, ...(meta ? { annotations: metaAnnotations(meta) } : {}) },
         spec: {
           restartPolicy: "Never",
-          automountServiceAccountToken: false,
+          ...(serviceAccount ? { serviceAccountName: serviceAccount, automountServiceAccountToken: true } : { automountServiceAccountToken: false }),
           securityContext: { runAsNonRoot: true, runAsUser: 1000, fsGroup: 1000 },
           ...placement(config),
           // The checkout is a subPath of the volume, and kubelet creates a subPath directory owned by root,
@@ -195,12 +207,13 @@ export function suspendPatch() {
 }
 
 /** Recreates the pod on the same volume, with the current image and settings. */
-export function resumePatch(config: KubernetesRuntimeConfig, cwd: string) {
+export function resumePatch(config: KubernetesRuntimeConfig, cwd: string, agentLabels?: Record<string, string>) {
+  const serviceAccount = serviceAccountFor(config, agentLabels);
   return {
-    metadata: { annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd) } },
+    metadata: { annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd, serviceAccount) } },
     spec: {
       operatingMode: "Running",
-      podTemplate: { spec: { initContainers: [volumeInit(config)], containers: [workspaceContainer(config, cwd)] } },
+      podTemplate: { spec: { ...(serviceAccount ? { serviceAccountName: serviceAccount, automountServiceAccountToken: true } : { serviceAccountName: null, automountServiceAccountToken: false }), initContainers: [volumeInit(config)], containers: [workspaceContainer(config, cwd)] } },
     },
   };
 }

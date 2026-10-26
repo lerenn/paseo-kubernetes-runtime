@@ -35,6 +35,19 @@ export const ConfigSchema = z.object({
   nodeSelector: z.record(z.string(), z.string()).default({}),
   /** Taint keys every pod tolerates (operator Exists). */
   tolerationKeys: z.array(z.string()).default([]),
+  /**
+   * ServiceAccount by agent label. The first rule whose `label` (`key=value`) is among the labels the workspace's
+   * creator handed over (runtime option `labels`) names the pod's ServiceAccount, and its token is mounted.
+   * No match: the pod has no ServiceAccount token.
+   */
+  serviceAccounts: z
+    .array(
+      z.object({
+        label: z.string().regex(/^[^=\s]+=[^=\s]*$/, "Use key=value, e.g. paseo.ops=1"),
+        serviceAccount: z.string().min(1),
+      }),
+    )
+    .default([]),
   storage: StorageSchema.default({ mode: "persistent", size: "10Gi" }),
   /**
    * Also delete this plugin's sandboxes that carry no daemon label (made before labelling existed) and match no

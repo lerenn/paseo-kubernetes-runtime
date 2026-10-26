@@ -30,6 +30,17 @@ describe("sandbox manifest", () => {
     expect(JSON.stringify(sb)).not.toMatch(/GH_TOKEN|GITHUB_TOKEN/);
   });
 
+  it("runs the pod as the ServiceAccount picked by the agent's labels, and as none otherwise", () => {
+    const c = ConfigSchema.parse({ serviceAccounts: [{ label: "paseo.ops=1", serviceAccount: "paseo-ops" }] });
+    const spec = (labels?: Record<string, string>) =>
+      (buildSandbox({ name: "n", workspaceId: "wks_1", cwd: "/home/me/repo", config: c, agentLabels: labels }) as any).spec.podTemplate.spec;
+    expect(spec({ "paseo.ops": "1" })).toMatchObject({ serviceAccountName: "paseo-ops", automountServiceAccountToken: true });
+    for (const labels of [undefined, {} as Record<string, string>, { "paseo.ops": "0" }]) {
+      expect(spec(labels).serviceAccountName).toBeUndefined();
+      expect(spec(labels).automountServiceAccountToken).toBe(false);
+    }
+  });
+
   it("applies the node selector and tolerations", () => {
     const c = ConfigSchema.parse({
       nodeSelector: { "lab.anyshift.io/pool": "burst" },

@@ -292,7 +292,7 @@ export class KubernetesRuntime {
       const name = sandboxName(ws.id, repoName(repo.url), ws.options.slug);
       ws.repo = repoName(repo.url);
       ws.repoUrl = repo.url;
-      await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running") }));
+      await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running"), agentLabels: ws.options.labels }));
       ws.labelled = this.metaKey(this.meta(ws, "running"));
       ws.sandbox = name;
     } else {
@@ -301,7 +301,7 @@ export class KubernetesRuntime {
       if (sandbox.operatingMode === "Suspended") {
         ctx.notice("Resuming the pod...");
         this.setPhase(ws, "resuming");
-        await kube.patchSandbox(sandbox.name, resumePatch(config, cwd));
+        await kube.patchSandbox(sandbox.name, resumePatch(config, cwd, ws.options.labels));
       }
     }
     this.setPhase(ws, "resuming");
