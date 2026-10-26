@@ -11,6 +11,8 @@ export const WORKSPACE_ID_LABEL = "paseo.sh/workspace-id";
 export const WORKSPACE_LABEL = "paseo.sh/workspace";
 export const AGENT_LABEL = "paseo.sh/agent";
 export const REPO_LABEL = "paseo.sh/repo";
+/** On pods that run as a ServiceAccount, so a NetworkPolicy can select them. */
+export const SERVICE_ACCOUNT_LABEL = "paseo.sh/service-account";
 export const STATE_LABEL = "paseo.sh/state";
 export const WORKSPACE_NAME_ANNOTATION = "paseo.sh/workspace-name";
 export const REPO_URL_ANNOTATION = "paseo.sh/repo-url";
@@ -117,7 +119,7 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
   const { name, workspaceId, cwd, config, daemonId, meta } = input;
   const serviceAccount = serviceAccountFor(config, input.agentLabels);
   const shown = meta ? metaLabels(meta) : {};
-  const podLabels = { [MANAGED_BY_LABEL]: MANAGED_BY, ...shown };
+  const podLabels = { [MANAGED_BY_LABEL]: MANAGED_BY, ...(serviceAccount ? { [SERVICE_ACCOUNT_LABEL]: serviceAccount } : {}), ...shown };
   const owner = {
     ...(daemonId ? { [DAEMON_LABEL]: daemonId } : {}),
     [WORKSPACE_ID_LABEL]: workspaceId,
@@ -213,7 +215,7 @@ export function resumePatch(config: KubernetesRuntimeConfig, cwd: string, agentL
     metadata: { annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd, serviceAccount) } },
     spec: {
       operatingMode: "Running",
-      podTemplate: { spec: { ...(serviceAccount ? { serviceAccountName: serviceAccount, automountServiceAccountToken: true } : { serviceAccountName: null, automountServiceAccountToken: false }), initContainers: [volumeInit(config)], containers: [workspaceContainer(config, cwd)] } },
+      podTemplate: { metadata: { labels: { [SERVICE_ACCOUNT_LABEL]: serviceAccount ?? null } }, spec: { ...(serviceAccount ? { serviceAccountName: serviceAccount, automountServiceAccountToken: true } : { serviceAccountName: null, automountServiceAccountToken: false }), initContainers: [volumeInit(config)], containers: [workspaceContainer(config, cwd)] } },
     },
   };
 }

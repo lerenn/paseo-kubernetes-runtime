@@ -34,6 +34,8 @@ describe("sandbox manifest", () => {
     const c = ConfigSchema.parse({ serviceAccounts: [{ label: "paseo.ops=1", serviceAccount: "paseo-ops" }] });
     const spec = (labels?: Record<string, string>) =>
       (buildSandbox({ name: "n", workspaceId: "wks_1", cwd: "/home/me/repo", config: c, agentLabels: labels }) as any).spec.podTemplate.spec;
+    const labelled = buildSandbox({ name: "n", workspaceId: "wks_1", cwd: "/x/y", config: c, agentLabels: { "paseo.ops": "1" } }) as any;
+    expect(labelled.spec.podTemplate.metadata.labels["paseo.sh/service-account"]).toBe("paseo-ops");
     expect(spec({ "paseo.ops": "1" })).toMatchObject({ serviceAccountName: "paseo-ops", automountServiceAccountToken: true });
     for (const labels of [undefined, {} as Record<string, string>, { "paseo.ops": "0" }]) {
       expect(spec(labels).serviceAccountName).toBeUndefined();
