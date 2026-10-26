@@ -185,7 +185,13 @@ while read old new ref; do
   esac
   base="$old"
   [ "$old" = "$ZERO" ] && base=$(cat "$HOME/seed.sha")
-  { echo "$new"; echo "^$base"; } | git pack-objects --revs --stdout --thin 2>/dev/null \
+  # Pack from the checkout, not from this outbox: the outbox only holds what was pushed to it, and the base (the commit
+  # the daemon has) is not among that when the branch was rebased past the seed, so excluding it failed here and the
+  # daemon received an empty pack. The checkout has the whole history.
+  gd=$(git config paseo.checkout 2>/dev/null)
+  if [ -n "$gd" ] && [ -d "$gd/.git" ]; then gd="$gd/.git"; else gd=.; fi
+  # receive-pack points the object directories at its quarantine of the pushed objects: drop that to read the checkout's
+  { echo "$new"; echo "^$base"; } | env -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_QUARANTINE_PATH git --git-dir "$gd" pack-objects --revs --stdout --thin 2>/dev/null \
     | node "$HOME/bridge.mjs" call push "$ref" "$old" "$new" "$base" || exit 1
 done
 exit 0

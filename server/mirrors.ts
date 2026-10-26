@@ -130,6 +130,8 @@ git config --global protocol.file.allow always
 git config --global push.autoSetupRemote true
 git config --global remote.origin.uploadpack "$HOME/bin/paseo-upload-pack"
 cwd="$1"; name="$2"; email="$3"; hosts="$4"; shift 4
+# pods made before the outbox hook packed from the checkout learn where it is
+[ -d "$HOME/outbox.git" ] && git config --file "$HOME/outbox.git/config" paseo.checkout "$cwd"
 # every URL of an allowed host goes through git-remote-paseo, which serves a mirror of that repository; the longer
 # rules for the project's own remotes below win over these
 for h in $hosts; do
