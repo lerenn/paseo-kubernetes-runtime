@@ -26,7 +26,7 @@ jobs:
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
       - name: Check the tools the runtime needs
         run: |
-          docker run --rm ${{ env.IMAGE }}:test sh -c 'id -u && node --version && git --version && gh --version | head -1 && jq --version && rg --version | head -1 && claude --version && codex --version'
+          docker run --rm ${{ env.IMAGE }}:test sh -c 'id -u && node --version && git --version && gh --version | head -1 && jq --version && rg --version | head -1 && kubectl version --client && claude --version && codex --version'
       - uses: docker/login-action@v3
         if: github.event_name != 'pull_request'
         with:
