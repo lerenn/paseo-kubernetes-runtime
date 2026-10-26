@@ -112,6 +112,16 @@ The runtime's badge shows the pod's image name beside the ship wheel, with the p
 repository on hover, and a one-line detail in the workspace header (`image · pod · running`). It is answered from what
 the plugin already knows, so showing a workspace never starts or reads a pod; the state follows suspend and resume.
 
+## Placement and the autoscaler
+
+`nodeSelector`, `tolerationKeys` (operator Exists) and `tolerations` (key, operator, value, effect: e.g. key
+`lab.anyshift.io/agents`, Equal, `true`, NoSchedule) place every pod, warm ones too. `resources` sets the container's
+requests and limits (leave the CPU limit out for none). `podAnnotations` go on the pods of workspaces but not on warm
+pods, for instance `{"karpenter.sh/do-not-disrupt": "true"}` so the autoscaler keeps a node while an agent works on it; a
+suspended workspace has no pod, so the hint goes with it, and a claimed warm pod gets it at the claim. A resumed pod
+follows today's placement and annotations. `warmPool.idleMinutes` removes the warm pods that long after the last workspace
+or agent start (0 = never) and brings them back with the next one.
+
 ## The Pods table
 
 The Kubernetes Runtime screen lists the pods, one row per workspace: its title (opens the workspace), the pod name, the

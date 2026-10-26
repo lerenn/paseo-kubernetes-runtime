@@ -154,6 +154,7 @@ export class KubernetesRuntime {
   constructor(private readonly deps: RuntimeDeps) {
     this.git = deps.git ?? runGit;
     this.now = deps.now ?? Date.now;
+    this.lastDemand = this.now();
   }
 
   private log(line: string): void {
@@ -420,6 +421,8 @@ export class KubernetesRuntime {
     const wanted = new Set([...ws.ports, ...ws.wantPorts]);
     const grows = [...wanted].some((p) => !ws.ports.has(p));
 
+    this.lastDemand = this.now();
+    if (config.warmPool.enabled && config.warmPool.idleMinutes > 0) void this.maintainPool().catch(() => undefined); // somebody needs a pod: bring the pool back if it had idled out
     // Fast path: the same pod is up and everything this launch needs is already in place.
     if (ws.sandbox && ws.phase === "running" && ws.readyUid && !grows && (!need.command || ws.commands.has(need.command))) {
       const info = await kube.podInfo(ws.sandbox).catch(() => null);
@@ -688,8 +691,8 @@ export class KubernetesRuntime {
         const info = await kube.podInfo(warm.name).catch(() => null);
         if (!info?.ready || info.terminating) continue;
         const meta = this.meta(ws, "running");
-        await kube.patchSandbox(warm.name, claimPatch(ws.id, ws.options.cwd, meta));
-        const { labels, annotations } = claimPatch(ws.id, ws.options.cwd, meta).metadata as { labels: Record<string, string>; annotations: Record<string, string> };
+        await kube.patchSandbox(warm.name, claimPatch(ws.id, ws.options.cwd, meta, config));
+        const { labels, annotations } = claimPatch(ws.id, ws.options.cwd, meta, config).metadata as { labels: Record<string, string>; annotations: Record<string, string> };
         await kube.label("pvc", workspaceClaimName(warm.name), labels, annotations).catch(() => undefined);
         return warm;
       }
@@ -700,6 +703,8 @@ export class KubernetesRuntime {
   }
 
   private claims: Promise<unknown> = Promise.resolve();
+  /** When a workspace or an agent last needed a pod (ms): the warm pool's idle timeout counts from here. */
+  private lastDemand = 0;
 
   /** Keeps `warmPool.size` pods running ahead of workspaces (and removes them all, or stale ones, when the pool is off or the image changed). */
   async maintainPool(): Promise<void> {
@@ -717,6 +722,16 @@ export class KubernetesRuntime {
       } else keep.push(pod);
     }
     if (!config.warmPool.enabled) return;
+    // Nobody started a workspace or an agent for a while: let the warm pod go and do not replace it until someone does
+    const { idleMinutes } = config.warmPool;
+    if (idleMinutes > 0 && this.now() - this.lastDemand > idleMinutes * 60_000) {
+      for (const pod of keep) {
+        this.log(`[kubernetes-runtime] removing warm pod ${pod.name} (idle for ${idleMinutes} min)`);
+        await kube.delete("sandbox", pod.name).catch(() => undefined);
+        await kube.delete("pvc", workspaceClaimName(pod.name)).catch(() => undefined);
+      }
+      return;
+    }
     for (let i = keep.length; i < config.warmPool.size; i++) {
       const name = warmSandboxName();
       this.log(`[kubernetes-runtime] starting warm pod ${name}`);

@@ -383,6 +383,17 @@ export function KubernetesRuntimeScreen({ theme, layout, navigation }: PluginScr
                   }}
                 />
               ) : null}
+              {draft.warmPool.enabled ? (
+                <SettingsInput
+                  label="Warm pods idle timeout (minutes)"
+                  hint="Remove the warm pods this long after the last workspace or agent start, and bring them back with the next one. 0 = never."
+                  initialValue={String(draft.warmPool.idleMinutes)}
+                  onChangeText={(t) => {
+                    const n = Number.parseInt(t, 10);
+                    if (Number.isInteger(n) && n >= 0) setDraft({ ...draft, warmPool: { ...draft.warmPool, idleMinutes: n } });
+                  }}
+                />
+              ) : null}
               <SettingsSwitch
                 label="Other repositories"
                 hint="Lets pods clone, fetch and push branches to other repositories through the daemon, with its git credentials."

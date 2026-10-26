@@ -36,6 +36,22 @@ export const ConfigSchema = z.object({
   nodeSelector: z.record(z.string(), z.string()).default({}),
   /** Taint keys every pod tolerates (operator Exists). */
   tolerationKeys: z.array(z.string()).default([]),
+  /** Tolerations with a value and effect (e.g. key lab.anyshift.io/agents, Equal, "true", NoSchedule); added to `tolerationKeys`. */
+  tolerations: z
+    .array(
+      z.object({
+        key: z.string().min(1),
+        operator: z.enum(["Exists", "Equal"]).default("Exists"),
+        value: z.string().optional(),
+        effect: z.enum(["NoSchedule", "PreferNoSchedule", "NoExecute"]).optional(),
+      }),
+    )
+    .default([]),
+  /**
+   * Annotations on the pods of workspaces (not on warm pods, which wait for one), e.g. {"karpenter.sh/do-not-disrupt": "true"}
+   * so the autoscaler leaves a node alone while an agent works on it. A suspended workspace has no pod, so they go with it.
+   */
+  podAnnotations: z.record(z.string(), z.string()).default({}),
   storage: StorageSchema.default({ mode: "persistent", size: "10Gi" }),
   /**
    * Also delete this plugin's sandboxes that carry no daemon label (made before labelling existed) and match no
@@ -64,8 +80,10 @@ export const ConfigSchema = z.object({
     .object({
       enabled: z.boolean().default(false),
       size: z.number().int().min(1).max(5).default(1),
+      /** Warm pods are removed this long after the last workspace or agent start, and not replaced until the next one. 0 = never. */
+      idleMinutes: z.number().int().min(0).default(0),
     })
-    .default({ enabled: false, size: 1 }),
+    .default({ enabled: false, size: 1, idleMinutes: 0 }),
   /** A workspace whose agents have all been idle this long has its pod deleted (the volume stays); any input brings it back. 0 = never. */
   podIdleMinutes: z.number().int().min(0).default(30),
 });

@@ -269,6 +269,61 @@ describe("idle suspension and background work inside an agent's process", () => 
   });
 });
 
+describe("node pool options", () => {
+  const nodePool = {
+    nodeSelector: { "lab.anyshift.io/pool": "agents" },
+    tolerations: [{ key: "lab.anyshift.io/agents", operator: "Equal", value: "true", effect: "NoSchedule" }],
+    resources: { requests: { cpu: "750m", memory: "2Gi" }, limits: { memory: "6Gi" } },
+    podAnnotations: { "karpenter.sh/do-not-disrupt": "true" },
+  };
+
+  it("places a workspace pod on the pool with its tolerations, resources and the autoscaler's do-not-disrupt hint", async () => {
+    const t = setup(nodePool);
+    await t.prepare();
+    const sb = t.kube.applied[0] as any;
+    const spec = sb.spec.podTemplate.spec;
+    expect(spec.nodeSelector).toEqual({ "lab.anyshift.io/pool": "agents" });
+    expect(spec.tolerations).toEqual([{ key: "lab.anyshift.io/agents", operator: "Equal", value: "true", effect: "NoSchedule" }]);
+    expect(spec.containers[0].resources).toEqual({ requests: { cpu: "750m", memory: "2Gi" }, limits: { memory: "6Gi" } }); // no cpu limit
+    expect(sb.spec.podTemplate.metadata.annotations["karpenter.sh/do-not-disrupt"]).toBe("true");
+  });
+
+  it("keeps warm pods without the hint (a waiting pod may be moved) and adds it when a workspace claims one", async () => {
+    const t = setup({ ...nodePool, warmPool: { enabled: true, size: 1 } });
+    await t.runtime.maintainPool();
+    const warm = t.kube.applied[0] as any;
+    expect(warm.spec.podTemplate.spec.nodeSelector).toEqual({ "lab.anyshift.io/pool": "agents" }); // same placement
+    expect(warm.spec.podTemplate.metadata.annotations?.["karpenter.sh/do-not-disrupt"]).toBeUndefined();
+    await t.prepare();
+    const claim = t.kube.patches2.find((p) => p.patch.spec?.podTemplate?.metadata?.annotations?.["paseo.sh/cwd"])!;
+    expect(claim.patch.spec.podTemplate.metadata.annotations["karpenter.sh/do-not-disrupt"]).toBe("true");
+  });
+
+  it("a resumed pod follows today's placement and annotations", async () => {
+    const t = setup(nodePool);
+    await t.prepare();
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json", stderr: "" }; // nothing running in the pod
+    expect(await t.runtime.podAction("wks_1", "restart", { force: true })).toEqual({ ok: true });
+    const resume = t.kube.patches2.map((p) => p.patch).find((p) => p.spec?.operatingMode === "Running")!;
+    expect(resume.spec.podTemplate.spec.nodeSelector).toEqual({ "lab.anyshift.io/pool": "agents" });
+    expect(resume.spec.podTemplate.metadata.annotations).toEqual({ "karpenter.sh/do-not-disrupt": "true" });
+  });
+
+  it("lets the warm pod go after the idle timeout and brings it back when somebody needs a pod", async () => {
+    const t = setup({ warmPool: { enabled: true, size: 1, idleMinutes: 20 } });
+    await t.runtime.maintainPool();
+    expect(t.kube.sandboxes).toHaveLength(1);
+    t.advance(21 * MIN);
+    await t.runtime.maintainPool();
+    expect(t.kube.sandboxes).toHaveLength(0); // idle: removed, not replaced
+    await t.runtime.maintainPool();
+    expect(t.kube.sandboxes).toHaveLength(0);
+    await t.prepare(); // a workspace appears: its own pod now, and the pool refills for the next one
+    await new Promise((r) => setTimeout(r, 10));
+    expect(t.kube.sandboxes.filter((s) => s.labels["paseo.sh/state"] === "warm")).toHaveLength(1);
+  });
+});
+
 describe("the warm pool", () => {
   const IMAGE = "ghcr.io/x/img@sha256:aaa";
   const settings = (over: object = {}) => ({ image: IMAGE, warmPool: { enabled: true, size: 1 }, ...over });
