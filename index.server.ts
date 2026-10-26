@@ -13,7 +13,7 @@ import { migrateLegacyData } from "./server/migrate.js";
 import { OrphanReaper } from "./server/orphans.js";
 import { podOnlyAgent, podOnlyWorkspace } from "./server/pod-only.js";
 import { LABELS_REF_ENV, LabelHandoff, withAgentLabels } from "./server/label-handoff.js";
-import { labelsOfAgent, workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
+import { labelsOfAgent, sendUnlessBusy, workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
 import { PodRegistry } from "./server/registry.js";
 import { KubernetesRuntime } from "./server/runtime.js";
 import { RUNTIME_ID } from "./shared/runtime-options.js";
@@ -45,11 +45,16 @@ export default function contribute(server: PluginServerContext) {
   };
   const runtime = new KubernetesRuntime({ getConfig, kubeFor, daemonId, registry, agentsBusy: (workspaceId) => workspaceAgentsBusy(paseoApi, workspaceId),
     recoveryStateFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "interruptions.json"),
-    // the fork's `skip` (never steer a running turn) is not in the published SDK's types
+    // `skip` is the fork's (not in the published SDK's types); a host without it is handled in sendUnlessBusy
     messenger: {
       async send(agentId, text, behavior) {
-        if (!paseoApi) throw new Error("Paseo's API has not reached the plugin yet");
-        await (paseoApi as unknown as { agents: { ref(id: string): { send(text: string, o: { activeTurnBehavior: string }): Promise<void> } } }).agents.ref(agentId).send(text, { activeTurnBehavior: behavior });
+        const api = paseoApi as unknown as Parameters<typeof sendUnlessBusy>[0];
+        if (behavior === "skip") {
+          await sendUnlessBusy(api, agentId, text);
+          return;
+        }
+        if (!api) throw new Error("Paseo's API has not reached the plugin yet");
+        await api.agents.ref(agentId).send(text, { activeTurnBehavior: behavior });
       },
     },
   });

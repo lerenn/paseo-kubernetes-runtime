@@ -46,3 +46,39 @@ export async function labelsOfAgent(paseo: AgentListApi | null, agentId: string)
     return undefined;
   }
 }
+
+/** Whether one agent has a turn open (or waits on a permission), from the agent list; null when it cannot be read. */
+export async function agentHasOpenTurn(paseo: AgentListApi | null, agentId: string): Promise<boolean | null> {
+  if (!paseo) return null;
+  try {
+    const result = (await paseo.agents.list({})) as { entries?: { agent?: AgentLike }[] } | AgentLike[];
+    const entries = Array.isArray(result) ? result : (result.entries ?? []);
+    const a = entries.map((e) => ((e as { agent?: AgentLike }).agent ?? e) as AgentLike).find((x) => x.id === agentId);
+    if (!a) return null;
+    return a.activeTurn != null || a.status === "running" || (a.pendingPermissions?.length ?? 0) > 0;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Sends a prompt that must not steer a running turn. Uses the host's `activeTurnBehavior: "skip"`; a host without it
+ * ("Update the Paseo host") gets the same effect by looking first: an agent with no open turn is sent the prompt
+ * (steer and skip are the same for it), one with an open turn or an unknown state is left alone.
+ */
+export async function sendUnlessBusy(
+  paseo: (AgentListApi & { agents: { ref(id: string): { send(text: string, o: { activeTurnBehavior: string }): Promise<unknown> } } }) | null,
+  agentId: string,
+  text: string,
+): Promise<"sent" | "skipped"> {
+  if (!paseo) throw new Error("Paseo's API has not reached the plugin yet");
+  try {
+    const result = (await paseo.agents.ref(agentId).send(text, { activeTurnBehavior: "skip" })) as { skipped?: boolean } | undefined;
+    return result?.skipped ? "skipped" : "sent";
+  } catch (error) {
+    if (!/Update the Paseo host/i.test((error as Error).message)) throw error;
+    if ((await agentHasOpenTurn(paseo, agentId)) !== false) return "skipped";
+    await paseo.agents.ref(agentId).send(text, { activeTurnBehavior: "steer" });
+    return "sent";
+  }
+}
