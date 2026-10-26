@@ -152,6 +152,11 @@ export const ConfigSchema = z.object({
       localWorkspaces: z.enum(["rewrite", "refuse"]).default("rewrite"),
     })
     .default({ enabled: false, exemptLabels: ["paseo.assistant=1"], localWorkspaces: "rewrite" }),
+  /**
+   * Workspaces whose first agent has one of these labels (`key=value`) are never suspended when idle. For agents that wait on
+   * background work Paseo cannot show as "running" (monitors, scheduled wakeups): suspending them ends an open turn and shows an error.
+   */
+  idleExemptLabels: z.array(z.string().regex(/^[^=\s]+(=[^=\s]*)?$/, "Use key=value")).default([]),
   /** A workspace whose agents have all been idle this long has its pod deleted (the volume stays); any input brings it back. 0 = never. */
   podIdleMinutes: z.number().int().min(0).default(30),
 });

@@ -261,6 +261,25 @@ describe("idle suspension asks Paseo before ending a pod", () => {
   });
 });
 
+describe("idle suspension asks for the workspace's own agents by id", () => {
+  it("does not suspend while one of its agents has a turn open that the directory check cannot see, nor when it cannot tell", async () => {
+    let byId: boolean | null = true;
+    const t = setup({ podIdleMinutes: 30 }, { workspaceBusy: async () => false, agentsBusy: async () => byId });
+    await t.prepare();
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running"); // an open turn
+    byId = null;
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running"); // unknown counts as busy
+    byId = false;
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+});
+
 describe("idle suspension and a prompt that arrives while the checks run", () => {
   it("does not suspend a workspace that got input after the idle decision was taken", async () => {
     let release!: () => void;
@@ -278,6 +297,23 @@ describe("idle suspension and a prompt that arrives while the checks run", () =>
     t.advance(31 * MIN);
     await t.tick();
     expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+});
+
+describe("idle suspension exemptions", () => {
+  it("never suspends a workspace whose first agent has an exempt label", async () => {
+    const t = setup({ podIdleMinutes: 30, idleExemptLabels: ["paseo.keepalive=1"] });
+    t.runtime.noteAgent("wks_1", { "paseo.keepalive": "1" });
+    await t.prepare();
+    t.advance(120 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running");
+    const other = setup({ podIdleMinutes: 30, idleExemptLabels: ["paseo.keepalive=1"] });
+    other.runtime.noteAgent("wks_1", { "paseo.keepalive": "0" });
+    await other.prepare();
+    other.advance(31 * MIN);
+    await other.tick();
+    expect(other.registry.list()[0]!.state).toBe("suspended");
   });
 });
 

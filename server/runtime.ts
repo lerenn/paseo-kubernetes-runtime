@@ -85,6 +85,8 @@ export interface RuntimeDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Whether Paseo has an agent running a turn in this workspace directory; null when it cannot tell (injected for tests). */
   workspaceBusy?: (cwd: string) => Promise<boolean | null>;
+  /** Whether an agent of this workspace (by id) has a turn open, from Paseo's agent list; null when it cannot say. */
+  agentsBusy?: (workspaceId: string) => Promise<boolean | null>;
   /** Archives a workspace in Paseo (the delete action's option); injected for tests. */
   archiveWorkspace?: (workspaceId: string) => Promise<void>;
   /** How long `prepare` and `beforeInput` wait for the pod before returning and letting `exec` wait (Paseo gives them 15 minutes). */
@@ -658,12 +660,35 @@ export class KubernetesRuntime {
     await kube.patchSandbox(ws.sandbox, suspendPatch());
   }
 
+  /**
+   * Whether an agent is working in the workspace. Two questions: the directory-based one (`paseo agent ls`: any agent
+   * `running` under the project directory, which also matches other workspaces on it, so it can only err toward busy)
+   * and, when Paseo's API is at hand, the workspace's own agents by id with their open turn. Either says busy: busy. Both
+   * say idle: idle. Anything unreadable: null, which callers treat as busy.
+   */
+  private async workspaceRunning(ws: WorkspaceState): Promise<boolean | null> {
+    const byDirectory = await (this.deps.workspaceBusy ?? paseoWorkspaceBusy)(ws.options.cwd).catch(() => null);
+    const byId = this.deps.agentsBusy ? await this.deps.agentsBusy(ws.id).catch(() => null) : false;
+    if (byDirectory === true || byId === true) return true;
+    return byDirectory === false && byId === false ? false : null;
+  }
+
+  /** Whether the workspace's first agent carries one of the `idleExemptLabels`. Unknown labels (after a plugin restart) do not exempt. */
+  private exemptFromIdle(config: KubernetesRuntimeConfig, ws: WorkspaceState): boolean {
+    const labels = this.agentLabels(ws);
+    return !!labels && config.idleExemptLabels.some((rule) => {
+      const i = rule.indexOf("=");
+      return i < 0 ? rule in labels : labels[rule.slice(0, i)] === rule.slice(i + 1);
+    });
+  }
+
   /** Suspends every workspace whose agents have all been idle for `podIdleMinutes`. */
   async checkIdle(): Promise<void> {
     const config = await this.deps.getConfig();
     const limit = config.podIdleMinutes * 60_000;
     if (limit <= 0 || config.storage.mode !== "persistent") return;
     for (const ws of this.states.values()) {
+      if (config.idleExemptLabels.length && this.exemptFromIdle(config, ws)) continue;
       const busy = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
       if (ws.phase === "running" && !busy && this.now() - ws.lastActivity >= limit) {
         // What this decision is based on. The checks below take a while (Paseo's answer, a look inside the pod), and a
@@ -671,7 +696,7 @@ export class KubernetesRuntime {
         const decidedAt = ws.lastActivity;
         // The activity events this plugin saw are not the whole story: after a plugin reload it has seen none, and a
         // turn that started before it keeps running. Ask Paseo; if an agent is running (or it cannot say), wait.
-        const running = await (this.deps.workspaceBusy ?? paseoWorkspaceBusy)(ws.options.cwd).catch(() => null);
+        const running = await this.workspaceRunning(ws);
         // An agent between turns can still be waiting on a background shell, a timer or a watch inside its process
         // (it shows as idle); suspending would kill that work. Live children of a claude/codex process mean busy.
         const background = running === false ? await this.hasBackgroundWork(ws).catch(() => true) : false;
@@ -922,7 +947,7 @@ export class KubernetesRuntime {
 
   /** Why this workspace's pod must not be taken down right now, or null: an agent is running, or one waits on background work. */
   async busyReason(ws: WorkspaceState): Promise<string | null> {
-    const running = await (this.deps.workspaceBusy ?? paseoWorkspaceBusy)(ws.options.cwd).catch(() => null);
+    const running = await this.workspaceRunning(ws);
     if (running === true) return "an agent is running in this workspace";
     if (running === null) return "Paseo could not say whether an agent is running in this workspace";
     if (ws.phase === "running" && (await this.hasBackgroundWork(ws).catch(() => true))) return "an agent has a background command running in the pod";
