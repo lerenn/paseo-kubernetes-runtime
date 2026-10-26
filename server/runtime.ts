@@ -7,7 +7,7 @@ import type { KubernetesRuntimeConfig } from "./config.js";
 import { type GitRunner, runGit, scrub } from "./git.js";
 import type { Kube, PodProcess, SandboxInfo } from "./kube.js";
 import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
-import { ensureCommand, ensureJq, initSubmodules, installAssets, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
+import { ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
 import { paseoWorkspaceBusy } from "./orphans.js";
 import { WARM_PREFIX, shortImage } from "./status.js";
@@ -87,6 +87,8 @@ export interface RuntimeDeps {
   /** How long `prepare` and `beforeInput` wait for the pod before returning and letting `exec` wait (Paseo gives them 15 minutes). */
   startWindowMs?: number;
   now?: () => number;
+  /** Fetches the Daemon Ops shim (injected for tests). */
+  fetch?: typeof fetch;
   log?: (line: string) => void;
 }
 
@@ -133,6 +135,9 @@ interface WorkspaceState {
   /** Everything that changes the pod (create, resume, suspend, destroy, prepare) runs one at a time. */
   chain: Promise<unknown>;
 }
+
+/** Stands in `commands` for the Daemon Ops shim having been installed in the current pod. */
+const OPS_SHIM = "paseo (daemon ops)";
 
 export const RUNTIME_LABEL = "Kubernetes Runtime";
 
@@ -417,14 +422,15 @@ export class KubernetesRuntime {
     const config = await this.deps.getConfig();
     const kube = this.deps.kubeFor(config);
     const { cwd } = ws.options;
-    for (const port of loopbackPorts((need.mcpServers ?? {}) as Record<string, { type: string; url?: string }>)) ws.wantPorts.add(port);
+    const ops = opsEnv(need.env);
+    for (const port of loopbackPorts((need.mcpServers ?? {}) as Record<string, { type: string; url?: string }>, [ops?.url])) ws.wantPorts.add(port);
     const wanted = new Set([...ws.ports, ...ws.wantPorts]);
     const grows = [...wanted].some((p) => !ws.ports.has(p));
 
     this.lastDemand = this.now();
     if (config.warmPool.enabled && config.warmPool.idleMinutes > 0) void this.maintainPool().catch(() => undefined); // somebody needs a pod: bring the pool back if it had idled out
     // Fast path: the same pod is up and everything this launch needs is already in place.
-    if (ws.sandbox && ws.phase === "running" && ws.readyUid && !grows && (!need.command || ws.commands.has(need.command))) {
+    if (ws.sandbox && ws.phase === "running" && ws.readyUid && !grows && (!need.command || ws.commands.has(need.command)) && (!ops || ws.commands.has(OPS_SHIM))) {
       const info = await kube.podInfo(ws.sandbox).catch(() => null);
       if (info?.ready && !info.terminating && info.uid === ws.readyUid) {
         await this.syncLabels(kube, ws, "running"); // another agent may have started in this workspace
@@ -479,6 +485,10 @@ export class KubernetesRuntime {
         onProblem: (problem) => ctx.notice(problem, "warning"),
       });
       await installAssets(kube, pod);
+      if (ops && !ws.commands.has(OPS_SHIM)) {
+        await installOpsShim(kube, pod, ops, this.deps.fetch);
+        ws.commands.add(OPS_SHIM);
+      }
       await ensureJq(kube, pod);
       if (!ws.bridge || grows || ws.readyUid !== info.uid) this.startBridge(kube, ws, wanted); // before seeding: submodules are fetched through it
       await this.seedIfEmpty(kube, ws, pod, ctx);
