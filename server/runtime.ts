@@ -5,7 +5,7 @@ import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, type FetchTarg
 import { applyPush, loopbackPorts, startBridge, type RunningBridge } from "./bridge.js";
 import type { KubernetesRuntimeConfig } from "./config.js";
 import { type GitRunner, runGit, scrub } from "./git.js";
-import type { Kube, SandboxInfo } from "./kube.js";
+import type { Kube, PodProcess, SandboxInfo } from "./kube.js";
 import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
 import { ensureCommand, ensureJq, initSubmodules, installAssets, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
@@ -136,6 +136,8 @@ export const RUNTIME_LABEL = "Kubernetes Runtime";
  */
 export class KubernetesRuntime {
   private stopped = false;
+  /** Provider processes started in pods and not yet finished. */
+  private readonly execs = new Set<{ proc: PodProcess; exited: Promise<unknown> }>();
   private readonly states = new Map<string, WorkspaceState>();
   private stopTicker: () => void = () => undefined;
   private readonly git: GitRunner;
@@ -161,9 +163,17 @@ export class KubernetesRuntime {
     await this.adopt().catch(() => undefined);
   }
 
-  stop(): void {
+  /**
+   * The plugin is stopping (an update, a reload, the daemon going down). The provider processes die with it; end them
+   * here so each reports the planned `suspended` exit before the channel to Paseo closes, which lets an idle agent drop
+   * the process quietly instead of showing "Claude stopped unexpectedly". A turn running at that moment still fails.
+   */
+  async stop(): Promise<void> {
     this.stopped = true;
     this.stopTicker();
+    const running = [...this.execs];
+    for (const e of running) e.proc.kill("SIGTERM");
+    await Promise.race([Promise.allSettled(running.map((e) => e.exited)), new Promise((r) => setTimeout(r, 3_000).unref?.())]);
     for (const ws of this.states.values()) ws.bridge?.close();
   }
 
@@ -859,13 +869,10 @@ export class KubernetesRuntime {
     proc.stderr.on("data", (chunk: Buffer | string) => {
       stderrTail = (stderrTail + chunk.toString()).slice(-1500);
     });
-    return {
-      stdin: proc.stdin,
-      stdout: proc.stdout,
-      stderr: proc.stderr,
-      signal: (signal) => proc.kill(signal),
-      exit: proc.exit.then(async ({ code, signal }) => {
+    const exit = proc.exit.then(async ({ code, signal }) => {
         ctx.signal.removeEventListener("abort", abort);
+        // The plugin is stopping and ended its processes itself: a planned stop, answered at once (no cluster calls)
+        if (this.stopped && code !== 0) return { code, signal, reason: "suspended" as const, message: "The Kubernetes Runtime plugin restarted; the next message brings the agent back" };
         // An exec that ends because the pod went away is the runtime's doing, not the process finishing.
         const info = await kube.podInfo(pod).catch(() => null);
         const lost = ws.phase === "suspended" || !info || !info.ready || info.terminating;
@@ -878,7 +885,16 @@ export class KubernetesRuntime {
           return { code, signal, reason: "runtime-lost" as const, message: "The pod was lost; the next message brings it back" };
         }
         return { code, signal, reason: "exited" as const };
-      }),
+    });
+    const tracked = { proc, exited: exit };
+    this.execs.add(tracked);
+    void exit.finally(() => this.execs.delete(tracked));
+    return {
+      stdin: proc.stdin,
+      stdout: proc.stdout,
+      stderr: proc.stderr,
+      signal: (signal) => proc.kill(signal),
+      exit,
     };
   }
 }

@@ -289,6 +289,29 @@ describe("submodules do not hold the agent back", () => {
   });
 });
 
+describe("stopping the plugin", () => {
+  it("ends the provider processes itself and reports each as a planned stop, so idle agents drop them quietly", async () => {
+    const t = setup();
+    const a = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    const b = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    const stopping = t.runtime.stop();
+    expect(t.kube.procs.map((p) => p.killed)).toEqual([["SIGTERM"], ["SIGTERM"]]);
+    t.kube.procs[0]!.end(null, "SIGTERM");
+    t.kube.procs[1]!.end(null, "SIGTERM");
+    await stopping;
+    expect(await a.exit).toMatchObject({ reason: "suspended", message: expect.stringContaining("plugin restarted") });
+    expect(await b.exit).toMatchObject({ reason: "suspended" });
+  });
+
+  it("does not hang the shutdown on a process that will not die", async () => {
+    const t = setup();
+    await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    const started = Date.now();
+    await t.runtime.stop(); // the fake process never ends: the wait is bounded
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+});
+
 describe("describeWorkspace for the sidebar badge", () => {
   it("answers without touching the cluster: no pod yet, then image/pod/state, following suspension", async () => {
     const t = setup({ image: "ghcr.io/lerenn/paseo-kubernetes-runtime-default@sha256:f4aedb1145658527f3e43dd1ae6d95a917b39e94799491eae6f9c400ccd8e3b5", podIdleMinutes: 30 });

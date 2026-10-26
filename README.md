@@ -149,6 +149,14 @@ storage and the default-deny NetworkPolicy.
 - Uncommitted local changes are not copied (the seed is a commit).
 - Files of a suspended pod are not available until it wakes.
 
+## Updating the plugin
+
+An update stops the plugin process, and the provider processes it started in the pods die with it. `stop()` ends them
+itself and reports each as the planned `suspended` exit, so idle agents drop them quietly; a turn running at that moment
+still fails. To keep that to idle moments use `scripts/update-when-idle.sh <plugin-id>[=<revision>] ...`: it waits until no
+agent is running in a workspace that has a runtime (a first launch has no Sandbox yet, so it asks Paseo, not the
+cluster), then runs `paseo plugin update` for each plugin, reloading and retrying once if the first update fails.
+
 ## Development
 
 ```bash

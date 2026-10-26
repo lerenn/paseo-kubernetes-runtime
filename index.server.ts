@@ -70,8 +70,8 @@ export default function contribute(server: PluginServerContext) {
   server.handle(kubeReconcile, async () => ({ reaper: await reaper.run() }));
 
 
-  return () => {
-    runtime.stop();
+  return async () => {
+    await runtime.stop();
     reaper.stop();
   };
 }
