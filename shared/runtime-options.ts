@@ -10,6 +10,8 @@ export const RuntimeOptionsSchema = z.object({
   title: z.string().max(200).optional(),
   /** Override of the agent labels that pick the pod's ServiceAccount; normally taken from the workspace's first agent. */
   labels: z.record(z.string(), z.string()).optional(),
+  /** A named pod profile of the settings (another image, a bigger volume), for workspaces that need one. */
+  profile: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/).optional(),
   /** The branch picker's choice. */
   ref: z
     .object({
