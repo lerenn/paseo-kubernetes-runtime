@@ -261,6 +261,26 @@ describe("idle suspension asks Paseo before ending a pod", () => {
   });
 });
 
+describe("idle suspension and a prompt that arrives while the checks run", () => {
+  it("does not suspend a workspace that got input after the idle decision was taken", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const t = setup({ podIdleMinutes: 30 }, { workspaceBusy: async () => (await gate, false) });
+    await t.prepare();
+    t.advance(31 * MIN);
+    const ticking = t.tick(); // idle: Paseo is being asked
+    await Promise.resolve();
+    t.activity("input"); // a prompt arrives during the question
+    release();
+    await ticking;
+    expect(t.registry.list()[0]!.state).toBe("running");
+    // idle again for real: now it is suspended
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+});
+
 describe("idle suspension and background work inside an agent's process", () => {
   const idleTree = [
     "    1     0 Ss   sleep infinity",
