@@ -367,6 +367,23 @@ export function KubernetesRuntimeScreen({ theme, layout, navigation }: PluginScr
                 }}
               />
               <SettingsSwitch
+                label="Warm pool"
+                hint="Keeps pods running ahead of workspaces so a new one starts in seconds. Each idle pod costs its CPU/memory request and a volume."
+                value={draft.warmPool.enabled}
+                onValueChange={(enabled) => setDraft({ ...draft, warmPool: { ...draft.warmPool, enabled } })}
+              />
+              {draft.warmPool.enabled ? (
+                <SettingsInput
+                  label="Warm pods"
+                  hint="How many pods to keep ready (1-5)."
+                  initialValue={String(draft.warmPool.size)}
+                  onChangeText={(t) => {
+                    const n = Number.parseInt(t, 10);
+                    if (Number.isInteger(n) && n >= 1 && n <= 5) setDraft({ ...draft, warmPool: { ...draft.warmPool, size: n } });
+                  }}
+                />
+              ) : null}
+              <SettingsSwitch
                 label="Other repositories"
                 hint="Lets pods clone, fetch and push branches to other repositories through the daemon, with its git credentials."
                 value={draft.otherRepos.enabled}

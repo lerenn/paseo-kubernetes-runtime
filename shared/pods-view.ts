@@ -16,7 +16,8 @@ export function reaperLine(r: { lastRunAt?: string; removed: number; error?: str
 }
 
 /** Which actions a pod in this state offers. */
-export function actionsFor(state: PodRow["state"]): ("suspend" | "resume" | "restart" | "delete")[] {
+export function actionsFor(state: PodRow["state"], workspaceId = ""): ("suspend" | "resume" | "restart" | "delete")[] {
+  if (workspaceId.startsWith("warm:")) return ["delete"]; // a warm pod has no workspace: remove it, the pool starts another
   if (state === "running") return ["suspend", "restart", "delete"];
   if (state === "suspended") return ["resume", "delete"];
   return ["delete"]; // creating or error: the only way out is to remove it (a restart needs a running pod)

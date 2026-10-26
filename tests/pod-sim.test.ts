@@ -252,6 +252,35 @@ describe("fetching through the daemon (real git, real pod scripts)", () => {
   });
 });
 
+describe("the mapped layout (warm pool on): the checkout is at a fixed path in the pod", () => {
+  it("seeds, fetches and pushes with the checkout at /workspace/checkout instead of the daemon's path", async () => {
+    const { origin, kube } = await openSession("sh", {}, undefined, {}, false, { config: { warmPool: { enabled: true, size: 1 } } });
+    const podDir = join(kube.workspace, "checkout"); // /workspace/checkout in the pod
+    expect(existsSync(join(podDir, ".git"))).toBe(true);
+    expect(sh(podDir, "log", "-1", "--format=%s")).toBe("one");
+    expect(sh(podDir, "config", "remote.origin.pushurl")).toContain("outbox.git");
+    expect(sh(podDir, "config", "branch.main.merge")).toBe("refs/heads/main");
+
+    writeFileSync(join(podDir, "mapped.txt"), "m\n");
+    for (const argv of [["git", "add", "."], ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "from the mapped pod"], ["git", "push", "origin", "HEAD:refs/heads/mapped"]]) {
+      const r = await kube.as(argv, { cwd: podDir });
+      expect(r.code, `${argv.join(" ")}: ${r.stderr}`).toBe(0);
+    }
+    expect(sh(origin, "log", "-1", "--format=%s", "refs/heads/mapped")).toBe("from the mapped pod");
+
+    // the origin mirror borrows objects from the checkout at its fixed path
+    const other = join(mkdtempSync(join(tmpdir(), "kube-other-")), "o");
+    sh(tmpdir(), "clone", "-q", origin, other);
+    writeFileSync(join(other, "up.txt"), "u\n");
+    sh(other, "add", ".");
+    sh(other, "commit", "-qm", "upstream");
+    sh(other, "push", "-q", "origin", "main");
+    const fetched = await kube.as(["git", "fetch", "origin"], { cwd: podDir });
+    expect(fetched.code, fetched.stderr).toBe(0);
+    expect(sh(podDir, "log", "-1", "--format=%s", "origin/main")).toBe("upstream");
+  });
+});
+
 describe("other repositories through the daemon (real git, real pod scripts)", () => {
   /** A bare repo standing in for git@example.test:o/r.git, reached by the daemon through an insteadOf rule. */
   function otherRepo() {

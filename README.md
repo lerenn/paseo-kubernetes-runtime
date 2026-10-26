@@ -91,6 +91,21 @@ kubectl -n paseo-agents get pods -L paseo.sh/workspace,paseo.sh/agent,paseo.sh/s
 `paseo.sh/workspace-id` and `paseo.sh/daemon` are what the orphan reconciler goes by. Updating the labels of an
 existing pod and claim needs `patch` on them in the daemon's Role; without it only the Sandbox's labels stay current.
 
+## Warm pool (off by default)
+
+With "Warm pool" on, the plugin keeps `size` pods (1 to 5) running ahead of any workspace, with the image, placement and a
+volume of their own. A new Pod workspace is given one at once (relabelled for the workspace: Sandbox, pod template and
+volume claim) instead of waiting for scheduling and the volume (about 15 s of a 33 s cold start), is seeded, and the pool
+starts the next. If none is ready, the workspace gets a pod of its own as usual. A warm pod costs its CPU and memory
+request (250m / 512Mi by default, usage is a few dozen MiB) and a volume (10Gi by default) while it waits; the pool
+removes warm pods when it is turned off or the image changes. Warm pods show in the Pods table and can be deleted there.
+
+The pods of a pool are not tied to a workspace, so they cannot mount the checkout at the daemon's path. With the pool on,
+new workspaces use the **mapped layout**: the checkout is at `/workspace/checkout` in every pod and Paseo rewrites the
+daemon's workspace path to it in what it sends the pod and back in what the pod prints (the runtime's `mapCwd`). Workspaces
+created before, or with the pool off, keep the **legacy layout** (the checkout at the daemon's own path) for their whole
+life; `paseo.sh/layout: mapped` on the Sandbox marks the new one.
+
 ## In the sidebar and the workspace header
 
 The runtime's badge shows the pod's image name beside the ship wheel, with the pod name, state, full image reference and

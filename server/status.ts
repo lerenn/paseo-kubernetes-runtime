@@ -2,10 +2,13 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { PodRow } from "../shared/status.js";
 import type { ClaimInfo, Kube, PodInfo, SandboxInfo } from "./kube.js";
-import { CWD_ANNOTATION, DAEMON_LABEL, WORKSPACE_ID_LABEL, WORKSPACE_LABEL, workspaceClaimName } from "./sandbox.js";
+import { CWD_ANNOTATION, DAEMON_LABEL, STATE_LABEL, WARM_STATE, WORKSPACE_ID_LABEL, WORKSPACE_LABEL, workspaceClaimName } from "./sandbox.js";
 import type { PodEntry } from "./registry.js";
 
 const execFileAsync = promisify(execFile);
+
+/** Rows of warm pods carry this prefix in place of a workspace id. */
+export const WARM_PREFIX = "warm:";
 
 export interface AgentSummary {
   id: string;
@@ -63,7 +66,8 @@ export function buildPodRows(input: StatusInputs): PodRow[] {
   const entries = new Map(input.entries.map((e) => [e.workspaceId, e]));
   const rows: PodRow[] = [];
   for (const sandbox of input.sandboxes) {
-    const workspaceId = sandbox.labels[WORKSPACE_ID_LABEL] ?? sandbox.labels[WORKSPACE_LABEL];
+    const warm = !sandbox.labels[WORKSPACE_ID_LABEL] && sandbox.labels[STATE_LABEL] === WARM_STATE;
+    const workspaceId = warm ? `${WARM_PREFIX}${sandbox.name}` : (sandbox.labels[WORKSPACE_ID_LABEL] ?? sandbox.labels[WORKSPACE_LABEL]);
     if (!workspaceId) continue;
     const pod = input.pods.get(sandbox.name) ?? null;
     let state: PodRow["state"];
@@ -75,7 +79,7 @@ export function buildPodRows(input: StatusInputs): PodRow[] {
     const entry = entries.get(workspaceId);
     rows.push({
       workspaceId,
-      title: input.titles?.get(workspaceId) || sandbox.annotations["paseo.sh/workspace-name"] || sandbox.labels[WORKSPACE_LABEL] || workspaceId,
+      title: warm ? "Warm pod (waiting for a workspace)" : input.titles?.get(workspaceId) || sandbox.annotations["paseo.sh/workspace-name"] || sandbox.labels[WORKSPACE_LABEL] || workspaceId,
       sandbox: sandbox.name,
       state,
       ...(problem ? { problem } : {}),

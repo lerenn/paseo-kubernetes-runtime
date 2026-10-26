@@ -20,6 +20,8 @@ export class FakeKube implements Kube {
         labels: meta.labels ?? {},
         annotations: meta.annotations ?? {},
         operatingMode: "Running",
+        image: (manifest as any).spec?.podTemplate?.spec?.containers?.[0]?.image,
+        createdAt: new Date(this.sandboxes.length).toISOString(),
       });
     }
   }
@@ -93,8 +95,8 @@ export class FakeKube implements Kube {
     return this.claims.filter((c) => (v === undefined ? k! in c.labels : c.labels[k!] === v));
   }
   async listSandboxes(selector: string) {
-    const [k, v] = selector.split("=");
-    return this.sandboxes.filter((s) => (v === undefined ? k! in s.labels : s.labels[k!] === v));
+    const terms = selector.split(",").map((t) => t.split("="));
+    return this.sandboxes.filter((s) => terms.every(([k, v]) => (v === undefined ? k! in s.labels : s.labels[k!] === v)));
   }
   removeError?: Error;
   async removeSecretKey(_secret: string, key: string) {

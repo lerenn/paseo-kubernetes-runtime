@@ -10,7 +10,7 @@ import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
 import { ensureCommand, ensureJq, initSubmodules, installAssets, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
 import { paseoWorkspaceBusy } from "./orphans.js";
-import { shortImage } from "./status.js";
+import { WARM_PREFIX, shortImage } from "./status.js";
 import { PodRegistry, type PodState } from "./registry.js";
 import type {
   WorkspaceRuntimeActivityEvent,
@@ -33,6 +33,12 @@ import type {
 import {
   CWD_ANNOTATION,
   DAEMON_LABEL,
+  LAYOUT_ANNOTATION,
+  MAPPED_CHECKOUT,
+  STATE_LABEL,
+  WARM_STATE,
+  claimPatch,
+  warmSandboxName,
   HOME_DIR,
   REPO_LABEL,
   WORKSPACE_ID_LABEL,
@@ -102,6 +108,8 @@ interface WorkspaceState {
   notice?: WorkspaceRuntimeContext["notice"];
   /** Remotes the pod may fetch from (the project's origin and its submodules), served through the bridge. */
   targets: FetchTarget[];
+  /** Where the checkout is in the pod: at the daemon's own path (legacy) or at MAPPED_CHECKOUT, with Paseo rewriting paths (mapCwd). Fixed when the pod is created. */
+  layout?: "legacy" | "mapped";
   /** The directory came from the workspace itself (`create`'s cwd or the Sandbox), not from options an inherited runtime copied. */
   cwdFixed?: boolean;
   /** What the Sandbox, pod and claim were last labelled with, so they are only patched when it changes. */
@@ -154,13 +162,17 @@ export class KubernetesRuntime {
 
   /** Starts the idle timer and picks up the pods a previous plugin run left running. */
   async start(): Promise<void> {
-    const tick = () => void this.checkIdle().catch(() => undefined);
+    const tick = () => {
+      void this.checkIdle().catch(() => undefined);
+      void this.maintainPool().catch(() => undefined);
+    };
     this.stopTicker = (this.deps.ticker ?? ((fn, ms) => {
       const timer = setInterval(fn, ms) as unknown as NodeJS.Timeout;
       timer.unref?.();
       return () => clearInterval(timer);
     }))(tick, 30_000);
     await this.adopt().catch(() => undefined);
+    void this.maintainPool().catch(() => undefined);
   }
 
   /**
@@ -189,6 +201,7 @@ export class KubernetesRuntime {
       const ws = this.newState(id, { cwd });
       ws.sandbox = sandbox.name;
       ws.image = sandbox.image;
+      ws.layout = sandbox.annotations[LAYOUT_ANNOTATION] === "mapped" ? "mapped" : "legacy";
       ws.cwdFixed = true;
       this.setPhase(ws, sandbox.operatingMode === "Suspended" ? "suspended" : "running");
       // A pod that runs when the plugin starts had its bridge (and with it the loopback tunnels its agents' MCP
@@ -285,8 +298,9 @@ export class KubernetesRuntime {
   };
 
   private async seedIfEmpty(kube: Kube, ws: WorkspaceState, pod: string, ctx: WorkspaceRuntimeContext): Promise<void> {
-    const { cwd } = ws.options;
-    const present = await kube.exec(pod, ["test", "-d", `${cwd}/.git`]);
+    const { cwd } = ws.options; // on the daemon
+    const root = this.podRoot(ws); // in the pod
+    const present = await kube.exec(pod, ["test", "-d", `${root}/.git`]);
     if (present.code === 0) return;
     ctx.notice("Copying the project into the pod...");
     const repo = await (this.deps.detectRepo ?? detectRepo)(cwd);
@@ -295,14 +309,14 @@ export class KubernetesRuntime {
     try {
       await this.refreshTargets(kube, ws, pod, [made.seed.sha]);
       await seedWorkspace(kube, pod, made.seed, made.bundle, {
-        dir: cwd,
+        dir: root,
         originUrl: repo.url,
         identity: await this.identity(cwd),
         newBranch: plan?.action === "branch-off" && plan.slug ? plan.slug : undefined,
       });
       await made.done;
       // origin/<branch> exists from the start (no "gone" upstream in git status); best effort
-      await kube.exec(pod, ["git", "-C", cwd, "fetch", "-q", "origin"]).catch(() => undefined);
+      await kube.exec(pod, ["git", "-C", root, "fetch", "-q", "origin"]).catch(() => undefined);
     } finally {
       await made.release().catch(() => undefined);
     }
@@ -314,7 +328,7 @@ export class KubernetesRuntime {
    */
   private startSubmodules(kube: Kube, ws: WorkspaceState, pod: string): void {
     if (ws.submodulesJob) return;
-    const { cwd } = ws.options;
+    const cwd = this.podRoot(ws);
     const notice = (message: string, level?: "info" | "warning" | "error") => ws.notice?.(message, level);
     ws.submodulesJob = (async () => {
       if (!(await submodulesPending(kube, pod, cwd))) return;
@@ -342,7 +356,7 @@ export class KubernetesRuntime {
     const originUrl = raw?.code === 0 && raw.stdout.trim() ? raw.stdout.trim() : (await (this.deps.detectRepo ?? detectRepo)(cwd)).url;
     ws.targets = await fetchTargets(this.git, cwd, originUrl, all);
     const access = (await this.deps.getConfig()).otherRepos;
-    await setupMirrors(kube, pod, cwd, await this.identity(cwd), ws.targets, access.enabled ? access.hosts : []);
+    await setupMirrors(kube, pod, this.podRoot(ws), await this.identity(cwd), ws.targets, access.enabled ? access.hosts : []);
   }
 
   private defaultSeeder = async (cwd: string, plan: ClonePlan | null, currentBranch: string): Promise<SeedBundle> => {
@@ -420,23 +434,34 @@ export class KubernetesRuntime {
     sandbox ??= (await kube.listSandboxes(`${WORKSPACE_ID_LABEL}=${ws.id}`))[0];
 
     if (!sandbox) {
-      ctx.notice("Starting the pod...");
+      const layout = await this.layoutFor(ws);
       const repo = await (this.deps.detectRepo ?? detectRepo)(cwd);
-      const name = sandboxName(ws.id, repoName(repo.url), ws.options.slug);
       ws.repo = repoName(repo.url);
       ws.repoUrl = repo.url;
-      await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running") }));
-      ws.labelled = this.metaKey(this.meta(ws, "running"));
-      ws.sandbox = name;
-      ws.image = config.image;
+      const warm = layout === "mapped" ? await this.claimWarm(kube, config, ws) : undefined;
+      if (warm) {
+        ctx.notice("Using a pod that was already running...");
+        ws.sandbox = warm.name;
+        ws.image = warm.image ?? config.image;
+        ws.labelled = this.metaKey(this.meta(ws, "running"));
+        void this.maintainPool().catch(() => undefined); // start the next one
+      } else {
+        ctx.notice("Starting the pod...");
+        const name = sandboxName(ws.id, repoName(repo.url), ws.options.slug);
+        await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, layout, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running") }));
+        ws.labelled = this.metaKey(this.meta(ws, "running"));
+        ws.sandbox = name;
+        ws.image = config.image;
+      }
     } else {
       ws.sandbox = sandbox.name;
       ws.image = sandbox.image ?? ws.image;
+      ws.layout = sandbox.annotations[LAYOUT_ANNOTATION] === "mapped" ? "mapped" : "legacy";
       ws.repo ??= sandbox.labels[REPO_LABEL];
       if (sandbox.operatingMode === "Suspended") {
         ctx.notice("Resuming the pod...");
         this.setPhase(ws, "resuming");
-        await kube.patchSandbox(sandbox.name, resumePatch(config, cwd));
+        await kube.patchSandbox(sandbox.name, resumePatch(config, ws.layout === "mapped" ? undefined : cwd));
         ws.image = config.image; // a resumed pod starts with the current image
       }
     }
@@ -489,7 +514,7 @@ export class KubernetesRuntime {
       if (!ws.sandbox || !info?.ready || info.terminating) {
         throw new Error("EAGAIN: the pod is not running (suspended or not started yet); it starts with the next message to an agent");
       }
-      const payload = Buffer.from(JSON.stringify({ op, root: ws.options.cwd, path: request.path, ...extra }));
+      const payload = Buffer.from(JSON.stringify({ op, root: this.podRoot(ws), path: request.path, ...extra }));
       const run = () => kube.execInput(ws.sandbox!, ["sh", "-c", 'exec node "$HOME/fs.mjs"'], Readable.from([payload]));
       let r = await run();
       if (r.code !== 0 && /Cannot find module/.test(r.stderr)) {
@@ -635,6 +660,72 @@ export class KubernetesRuntime {
     return liveProviderChildren(r.stdout);
   }
 
+  /** Pods that run ahead of any workspace, oldest first. */
+  private async warmPods(kube: Kube, config: KubernetesRuntimeConfig): Promise<SandboxInfo[]> {
+    if (!this.deps.daemonId) return [];
+    const all = await kube.listSandboxes(`${DAEMON_LABEL}=${this.deps.daemonId},${STATE_LABEL}=${WARM_STATE}`);
+    return all.sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? ""));
+  }
+
+  /**
+   * Gives a new workspace a pod that is already running: relabels the Sandbox (and its volume claim) for the
+   * workspace. Only one claim at a time; a warm pod with another image than today's is not used.
+   */
+  private async claimWarm(kube: Kube, config: KubernetesRuntimeConfig, ws: WorkspaceState): Promise<SandboxInfo | undefined> {
+    if (!config.warmPool.enabled) return undefined;
+    const run = this.claims.then(async () => {
+      for (const warm of await this.warmPods(kube, config)) {
+        if (warm.image !== config.image || warm.operatingMode !== "Running") continue;
+        const info = await kube.podInfo(warm.name).catch(() => null);
+        if (!info?.ready || info.terminating) continue;
+        const meta = this.meta(ws, "running");
+        await kube.patchSandbox(warm.name, claimPatch(ws.id, ws.options.cwd, meta));
+        const { labels, annotations } = claimPatch(ws.id, ws.options.cwd, meta).metadata as { labels: Record<string, string>; annotations: Record<string, string> };
+        await kube.label("pvc", workspaceClaimName(warm.name), labels, annotations).catch(() => undefined);
+        return warm;
+      }
+      return undefined;
+    });
+    this.claims = run.catch(() => undefined);
+    return run.catch(() => undefined);
+  }
+
+  private claims: Promise<unknown> = Promise.resolve();
+
+  /** Keeps `warmPool.size` pods running ahead of workspaces (and removes them all, or stale ones, when the pool is off or the image changed). */
+  async maintainPool(): Promise<void> {
+    if (!this.deps.daemonId || this.stopped) return;
+    const config = await this.deps.getConfig();
+    const kube = this.deps.kubeFor(config);
+    const warm = await this.warmPods(kube, config);
+    const keep: SandboxInfo[] = [];
+    for (const pod of warm) {
+      const stale = !config.warmPool.enabled || pod.image !== config.image || keep.length >= config.warmPool.size;
+      if (stale) {
+        this.log(`[kubernetes-runtime] removing warm pod ${pod.name} (${config.warmPool.enabled ? "stale or surplus" : "pool is off"})`);
+        await kube.delete("sandbox", pod.name).catch(() => undefined);
+        await kube.delete("pvc", workspaceClaimName(pod.name)).catch(() => undefined);
+      } else keep.push(pod);
+    }
+    if (!config.warmPool.enabled) return;
+    for (let i = keep.length; i < config.warmPool.size; i++) {
+      const name = warmSandboxName();
+      this.log(`[kubernetes-runtime] starting warm pod ${name}`);
+      await kube.apply(buildSandbox({ name, config, daemonId: this.deps.daemonId, warm: true }));
+    }
+  }
+
+  /** The workspace's directory as the pod sees it. */
+  private podRoot(ws: WorkspaceState): string {
+    return ws.layout === "mapped" ? MAPPED_CHECKOUT : ws.options.cwd;
+  }
+
+  /** New pods are mapped when the warm pool is on (so they can be started ahead of their workspace), legacy otherwise. */
+  private async layoutFor(ws: WorkspaceState): Promise<"legacy" | "mapped"> {
+    ws.layout ??= (await this.deps.getConfig()).warmPool.enabled ? "mapped" : "legacy";
+    return ws.layout;
+  }
+
   /** The registration Paseo's fork takes. */
   registration(): WorkspaceRuntimeRegistration {
     return {
@@ -647,6 +738,10 @@ export class KubernetesRuntime {
       },
       inspect: (request) => this.inspect(request),
       describeWorkspace: (request) => this.describeWorkspace(request),
+      mapCwd: async (request) => {
+        const ws = this.workspace(request);
+        return (await this.layoutFor(ws)) === "mapped" ? MAPPED_CHECKOUT : ws.options.cwd;
+      },
       destroy: (request) => this.destroy(request),
       reconcile: (request) => this.reconcile(request),
       checkCommand: (request) => this.checkCommand(request),
@@ -747,6 +842,16 @@ export class KubernetesRuntime {
     action: "suspend" | "resume" | "restart" | "delete",
     options: { force?: boolean; archive?: boolean } = {},
   ): Promise<{ ok: boolean; busy?: string; message?: string }> {
+    if (workspaceId.startsWith(WARM_PREFIX)) {
+      // a warm pod belongs to no workspace: the only action is to remove it (the pool starts another if it is still on)
+      if (action !== "delete") return { ok: false, message: "A warm pod can only be deleted." };
+      const name = workspaceId.slice(WARM_PREFIX.length);
+      const config = await this.deps.getConfig();
+      const kube = this.deps.kubeFor(config);
+      await kube.delete("sandbox", name);
+      await kube.delete("pvc", workspaceClaimName(name)).catch(() => undefined);
+      return { ok: true };
+    }
     if (!this.states.has(workspaceId)) await this.adopt().catch(() => undefined);
     const ws = this.states.get(workspaceId);
     if (!ws?.sandbox) return { ok: false, message: "This workspace has no pod." };
@@ -861,7 +966,7 @@ export class KubernetesRuntime {
     const kube = this.deps.kubeFor(config);
     const pod = ws.sandbox!;
     const envPath = await writeEnvFile(kube, pod, randomBytes(6).toString("hex"), request.env);
-    const cwd = request.cwd ?? ws.options.cwd;
+    const cwd = request.cwd ?? this.podRoot(ws); // already the pod's path: Paseo maps it with mapCwd
     const proc = kube.spawnExec(pod, ["sh", "-c", LAUNCH_SCRIPT, "sh", envPath, cwd, ...request.argv]);
     const abort = () => proc.kill();
     ctx.signal.addEventListener("abort", abort, { once: true });
