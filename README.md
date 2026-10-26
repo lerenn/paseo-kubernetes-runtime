@@ -30,19 +30,30 @@ Paseo daemon                                   cluster (paseo-agents)
   subPath again at that path (a root init container makes it writable for the agent user).
 - **Provider processes** run as `kubectl exec -i` with the exact command Paseo asks for. Their environment is the env
   delta Paseo passes (written to a short-lived env file in the pod, never on a command line), nothing from the daemon.
-  `claude` and `codex` are installed on first use under `$HOME/.npm-global` (on the volume) if the image lacks them.
+  `claude` and `codex` are installed on first use under `$HOME/.npm-global` (on the volume) if the image lacks them, and so is a
+  checksum-verified `jq` (under `$HOME/bin`) for `gh --jq` and for agents; the default image already has it.
 - **Seeding.** The daemon first fetches the chosen ref fresh from origin (the branch picker's branch, the base of a
   branch-off, a pull request head, or the checkout's own branch: the remote tip when the daemon's copy is behind, the
   local tip when it has unpushed commits), then bundles it from the project's own checkout (`git bundle`) and streams
   it into the pod over `pods/exec` stdin. Nothing is cloned from GitHub in the pod. The submodules recorded in the
-  seeded commit are checked out too, through the fetch bridge below.
+  seeded commit are fetched through the bridge below in the background (several at a time) while the agent starts, with
+  a notice when they are ready; an interrupted checkout resumes the next time the pod wakes.
 - **Fetch bridge (`git fetch`, `git pull`, `git submodule update`).** The pod has no GitHub credential. Git there is
   pointed at local mirror repositories (a global `url.<mirror>.insteadOf`) for the project's origin and each
   submodule, with `remote.origin.uploadpack` set to a wrapper that, before serving a fetch, asks the plugin over the
   bridge to refresh the mirror: the daemon fetches the real remote with its own credentials and sends a thin pack of
   only what the pod lacks. Branches, tags and the default branch come across; `origin/HEAD` resolves. Only the origin
-  and the submodules recorded in the project are fetchable (nothing else is reachable), and pushing to a submodule's
-  mirror is refused. Limits: 64MB per fetch, no nested submodules, pull request refs (`refs/pull/*`) are not mirrored.
+  and the submodules recorded in the project are fetchable (nothing else is reachable), and branches can be pushed to a submodule's remote the same way as to the project's
+  (applied and pushed by the daemon with its credentials; no deletions, and the remote still refuses non-fast-forward
+  pushes). Git in the pod uses the daemon's `user.name`/`user.email`. A submodule is checked out detached, as git does:
+  `git switch -c <branch>` in it before committing (or check out the branch `.gitmodules` tracks). Seeded branches track
+  their remote branch, so a plain `git pull` works, and the first push of a new branch sets its upstream. Limits: 64MB per fetch, no nested submodules, pull request refs (`refs/pull/*`) are not mirrored.
+- **Other repositories** (a plugin change plus a lab config PR): any URL of an allowed host (default `github.com`: https,
+  `git@` and `ssh://`) is turned by a global `insteadOf` rule into `paseo://host/owner/repo`, which the pod's
+  `git-remote-paseo` helper serves from a bare mirror made on demand. `git clone`, `fetch`, `pull`, `ls-remote` and a branch
+  `push` work for any repository the daemon's git credentials reach (it tries its ssh key, then https), through the same
+  bridge and with the same protections: branches and new tags only, no deletions, and the remote still refuses non-fast-forward
+  pushes. The "Other repositories" setting turns it off or restricts it to `owner/*` or `owner/repo` patterns.
 - **Push-back.** `git push` goes to a local "outbox" repository whose `pre-receive` hook asks the plugin, over the
   same bridge, to push the new commits from the daemon with the daemon's git credentials (branches only, no
   deletions). The pod has no `gh`: GitHub is reached through GitHub's MCP server behind MCP Proxy (a loopback MCP
@@ -56,7 +67,8 @@ Paseo daemon                                   cluster (paseo-agents)
   `podIdleMinutes` (default 30, 0 = never) the pod is deleted (`operatingMode: Suspended`); the volume, with the
   checkout and the agents' session state, stays. The next input (`beforeInput`) recreates the pod on the same volume with
   the current image, and the provider resumes its own session. A process that ends because the pod went away is
-  reported as `runtime-lost`, so the agent run fails like any process exit and the next message relaunches it.
+  reported as `runtime-lost`, so the agent run fails like any process exit and the next message relaunches it. Our own idle
+  suspension is reported as the planned `suspended` exit, which idle agents drop quietly instead of showing an error.
 - **Archive.** Archiving the workspace (`destroy`) deletes the Sandbox and its volume claim. There is no expiry on a
   workspace's storage.
 - **Orphans.** A reconciler (at start, then every 10 minutes) deletes the Sandbox and claim of any workspace Paseo no
@@ -79,6 +91,20 @@ kubectl -n paseo-agents get pods -L paseo.sh/workspace,paseo.sh/agent,paseo.sh/s
 `paseo.sh/workspace-id` and `paseo.sh/daemon` are what the orphan reconciler goes by. Updating the labels of an
 existing pod and claim needs `patch` on them in the daemon's Role; without it only the Sandbox's labels stay current.
 
+## In the sidebar and the workspace header
+
+The runtime's badge shows the pod's image name beside the ship wheel, with the pod name, state, full image reference and
+repository on hover, and a one-line detail in the workspace header (`image · pod · running`). It is answered from what
+the plugin already knows, so showing a workspace never starts or reads a pod; the state follows suspend and resume.
+
+## The Pods table
+
+The Kubernetes Runtime screen lists the pods, one row per workspace: its title (opens the workspace), the pod name, the
+agents running in it, a state badge (running, suspended, creating, error), since when, the image (short name and digest)
+and the volume size. Per row: Suspend and Restart (running), Resume (suspended), and Delete, which asks first and offers to
+archive the workspace too. A pod with a running agent or a background command is only touched after a second
+confirmation that names what is running. Above the table, "Last reconcile" and a "Reconcile now" button.
+
 ## Settings
 
 A sidebar item "Kubernetes Runtime" opens a screen: namespace and image; an Advanced section (kubectl context, node
@@ -89,20 +115,39 @@ for `CLAUDE_CODE_OAUTH_TOKEN`. New workspace gets a **Pod** location (with the b
 Settings and the credential flags that were kept under the plugin's old id `kube-agents` are copied over on first
 start (originals backed up under `~/.paseo/backups/`, never overwritten, never deleted).
 
+## Pod image
+
+The default image is built from `image/Dockerfile` (node 22, git, gh, jq, ripgrep, claude, codex) by the `image` workflow and
+published to `ghcr.io/lerenn/paseo-kubernetes-runtime-default`; `DEFAULT_IMAGE` in `shared/settings.ts` pins it by digest
+(the workflow prints the new digest in its summary). A custom image needs node and git; claude, codex and a verified jq are
+installed on first use when missing.
+
 ## Cluster requirements
 
 See [docs/rbac-and-network.md](docs/rbac-and-network.md): Role for the daemon ServiceAccount, the credentials Secret,
 storage and the default-deny NetworkPolicy.
 
-## Limits (phase 1 of the workspace runtime)
+## What Paseo does with the pod
 
-- Files, Git and terminals in the Paseo UI still read the **daemon's** checkout, not the pod's. Claude's own history
-  lives in the pod.
+- **Files panel** (Paseo with runtime files, fork #28): served from the pod through `fs` (stat, list, read, write,
+  create, rename, copy, delete), confined to the workspace directory; a symlink that leaves it is refused. Only while
+  the pod runs: a suspended or not-yet-started pod answers `EAGAIN`, and polling never wakes it or keeps it awake.
+- **Git panel** (`exec` with purpose `command`): Git for a runtime workspace runs in the pod. A refresh in the
+  background (`interactive: false`) is refused when the pod is not running; one the user waits for starts the pod.
+- **Reconcile and checks**: Paseo lists the live workspaces on every registration (daemon start, plugin reload) and after
+  a lost pod; a Sandbox for any other workspace (older than 5 minutes) is deleted with its volume. Before a session
+  Paseo asks whether the provider binary exists (`claude` and `codex` are installed on first use, so they do) and
+  warns about stdio MCP servers whose binary is missing from the image.
+- **Workspaces created by agents** inherit the caller's runtime (fork #22): the runtime is told the new workspace's
+  directory, which replaces the caller's directory in the copied options, and seeds from that directory's HEAD.
+
+## Limits
+
 - Model and version discovery runs on the daemon, so claude and codex must exist there too.
 - A provider that starts its processes inside the plugin process (opencode, pi, omp, plugin providers) is refused in a
   runtime workspace.
-- No warm pool: the pod must mount the checkout at a path that is only known when the workspace is created.
 - Uncommitted local changes are not copied (the seed is a commit).
+- Files of a suspended pod are not available until it wakes.
 
 ## Development
 

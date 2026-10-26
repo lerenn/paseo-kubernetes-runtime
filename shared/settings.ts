@@ -2,7 +2,8 @@ import { defineSettings } from "@getpaseo/plugin";
 import { z } from "zod";
 
 export const DEFAULT_NAMESPACE = "paseo-agents";
-export const DEFAULT_IMAGE = "ghcr.io/lerenn/paseo-kubernetes-runtime-default:latest";
+/** Pinned by digest, built by the image workflow from image/Dockerfile (bump it with each image release). */
+export const DEFAULT_IMAGE = "ghcr.io/lerenn/paseo-kubernetes-runtime-default@sha256:f4aedb1145658527f3e43dd1ae6d95a917b39e94799491eae6f9c400ccd8e3b5";
 
 /** Where a workspace pod's `/workspace` (the checkout, HOME and the agents' session state) lives. */
 export const StorageSchema = z.object({
@@ -41,6 +42,19 @@ export const ConfigSchema = z.object({
    * agent of this daemon, after 15 minutes. Turn off where several daemons share one namespace.
    */
   sweepUnlabelled: z.boolean().default(true),
+  /**
+   * Repositories other than the workspace's own (and its submodules) that a pod may `git clone`, fetch and push
+   * branches to, through the daemon and with its git credentials.
+   */
+  otherRepos: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** Git hosts the pods may reach this way. */
+      hosts: z.array(z.string()).default(["github.com"]),
+      /** `owner/*` or `owner/repo` patterns; empty allows every repository the daemon can reach. */
+      allow: z.array(z.string()).default([]),
+    })
+    .default({ enabled: true, hosts: ["github.com"], allow: [] }),
   /** A workspace whose agents have all been idle this long has its pod deleted (the volume stays); any input brings it back. 0 = never. */
   podIdleMinutes: z.number().int().min(0).default(30),
 });

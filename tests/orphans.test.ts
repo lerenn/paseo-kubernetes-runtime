@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { OrphanReaper, paseoAgentState, paseoWorkspaceIds, type AgentState } from "../server/orphans.js";
+import { OrphanReaper, paseoAgentState, paseoWorkspaceBusy, paseoWorkspaceIds, type AgentState } from "../server/orphans.js";
 import { buildSandbox, labelValue } from "../server/sandbox.js";
 import { readDaemonId } from "../server/daemon.js";
 import { ConfigSchema } from "../shared/settings.js";
@@ -227,5 +227,17 @@ describe("asking Paseo about an agent", () => {
     expect(await paseoAgentState("a", fail({ stderr: "boom" }))).toBe("unknown");
     expect(await paseoAgentState("a", async () => ({ stdout: "not json" }))).toBe("unknown");
     expect(await paseoAgentState("a", async () => { throw new Error("spawn paseo ENOENT"); })).toBe("unknown");
+  });
+});
+
+describe("asking Paseo whether a workspace has a running agent", () => {
+  const list = (agents: object[]) => async () => ({ stdout: JSON.stringify(agents) });
+  it("is true for a running agent in the directory or below it, false otherwise, null when unknown", async () => {
+    const agents = [{ status: "running", cwd: "/w/a/sub" }, { status: "idle", cwd: "/w/b" }, { status: "running", cwd: "/w/ab" }];
+    expect(await paseoWorkspaceBusy("/w/a", list(agents))).toBe(true);
+    expect(await paseoWorkspaceBusy("/w/b", list(agents))).toBe(false);
+    expect(await paseoWorkspaceBusy("/w/a/", list([{ status: "running", cwd: "/w/a" }]))).toBe(true);
+    expect(await paseoWorkspaceBusy("/w/a", async () => { throw new Error("daemon down"); })).toBeNull();
+    expect(await paseoWorkspaceBusy("/w/a", async () => ({ stdout: "nope" }))).toBeNull();
   });
 });

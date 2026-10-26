@@ -1,19 +1,28 @@
 import { randomBytes } from "node:crypto";
-import type { Readable } from "node:stream";
+import { Readable } from "node:stream";
 import { parseRuntimeOptions, type RuntimeOptions } from "../shared/runtime-options.js";
-import { applyFetch, fetchTargets, type FetchTarget } from "./mirrors.js";
+import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, type FetchTarget } from "./mirrors.js";
 import { applyPush, loopbackPorts, startBridge, type RunningBridge } from "./bridge.js";
 import type { KubernetesRuntimeConfig } from "./config.js";
 import { type GitRunner, runGit, scrub } from "./git.js";
 import type { Kube, SandboxInfo } from "./kube.js";
-import { LAUNCH_SCRIPT } from "./pod-assets.js";
-import { ensureCommand, initSubmodules, installAssets, seedWorkspace, setupMirrors, writeEnvFile } from "./pod-setup.js";
+import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
+import { ensureCommand, ensureJq, initSubmodules, installAssets, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
+import { paseoWorkspaceBusy } from "./orphans.js";
+import { shortImage } from "./status.js";
 import { PodRegistry, type PodState } from "./registry.js";
 import type {
   WorkspaceRuntimeActivityEvent,
+  WorkspaceRuntimeCommandRequest,
+  WorkspaceRuntimeDisplay,
+  WorkspaceRuntimeReconcileRequest,
   WorkspaceRuntimeContext,
   WorkspaceRuntimeExecRequest,
+  WorkspaceRuntimeFileSystem,
+  WorkspaceRuntimeFsEntry,
+  WorkspaceRuntimeFsRequest,
+  WorkspaceRuntimeFsStat,
   WorkspaceRuntimeInputRequest,
   WorkspaceRuntimePrepareRequest,
   WorkspaceRuntimeProcess,
@@ -65,7 +74,11 @@ export interface RuntimeDeps {
   /** Calls `fn` every `ms` until the returned stop function runs (injected for tests). */
   ticker?: (fn: () => void, ms: number) => () => void;
   sleep?: (ms: number) => Promise<void>;
-  /** How long `prepare` and `beforeInput` wait for the pod before returning and letting `exec` wait (Paseo gives them 30s). */
+  /** Whether Paseo has an agent running a turn in this workspace directory; null when it cannot tell (injected for tests). */
+  workspaceBusy?: (cwd: string) => Promise<boolean | null>;
+  /** Archives a workspace in Paseo (the delete action's option); injected for tests. */
+  archiveWorkspace?: (workspaceId: string) => Promise<void>;
+  /** How long `prepare` and `beforeInput` wait for the pod before returning and letting `exec` wait (Paseo gives them 15 minutes). */
   startWindowMs?: number;
   now?: () => number;
   log?: (line: string) => void;
@@ -89,11 +102,21 @@ interface WorkspaceState {
   notice?: WorkspaceRuntimeContext["notice"];
   /** Remotes the pod may fetch from (the project's origin and its submodules), served through the bridge. */
   targets: FetchTarget[];
+  /** The directory came from the workspace itself (`create`'s cwd or the Sandbox), not from options an inherited runtime copied. */
+  cwdFixed?: boolean;
   /** What the Sandbox, pod and claim were last labelled with, so they are only patched when it changes. */
   repo?: string;
   repoUrl?: string;
   agent?: string;
   labelled?: string;
+  /** When labelling the pod or claim last failed (missing `patch` in the Role); retried after a while. */
+  labelFailedAt?: number;
+  /** The image the pod was started with, for the sidebar badge; known once the Sandbox has been read or created. */
+  image?: string;
+  /** The submodule checkout running in the background, if any. */
+  submodulesJob?: Promise<void>;
+  /** Consecutive reconnects of the bridge channel, for backoff. */
+  bridgeRetries: number;
   /** The pod the pod-side setup was last verified for; a replacement pod has another uid and is set up again. */
   readyUid?: string;
   commands: Set<string>;
@@ -112,6 +135,7 @@ export const RUNTIME_LABEL = "Kubernetes Runtime";
  * idle for a while, resumed by the next input, and deleted when the workspace is archived.
  */
 export class KubernetesRuntime {
+  private stopped = false;
   private readonly states = new Map<string, WorkspaceState>();
   private stopTicker: () => void = () => undefined;
   private readonly git: GitRunner;
@@ -138,6 +162,7 @@ export class KubernetesRuntime {
   }
 
   stop(): void {
+    this.stopped = true;
     this.stopTicker();
     for (const ws of this.states.values()) ws.bridge?.close();
   }
@@ -153,8 +178,37 @@ export class KubernetesRuntime {
       if (!id || !cwd || this.states.has(id)) continue;
       const ws = this.newState(id, { cwd });
       ws.sandbox = sandbox.name;
+      ws.image = sandbox.image;
+      ws.cwdFixed = true;
       this.setPhase(ws, sandbox.operatingMode === "Suspended" ? "suspended" : "running");
+      // A pod that runs when the plugin starts had its bridge (and with it the loopback tunnels its agents' MCP
+      // servers use) die with the previous plugin process: bring it back without waiting for the next launch.
+      if (sandbox.operatingMode !== "Suspended") void this.restoreBridge(kube, ws).catch(() => undefined);
     }
+  }
+
+  /** Ports the pod's processes still point at (`http://127.0.0.1:<port>` in their arguments or environment). */
+  private async tunnelPortsInUse(kube: Kube, pod: string): Promise<number[]> {
+    const r = await kube.exec(pod, [
+      "sh",
+      "-c",
+      `for f in /proc/[0-9]*/cmdline /proc/[0-9]*/environ; do tr '\\0' '\\n' < "$f" 2>/dev/null; done | grep -o 'http://127\\.0\\.0\\.1:[0-9]*' | sed 's/.*://' | sort -u`,
+    ]);
+    return r.code === 0 ? r.stdout.split("\n").map((l) => Number(l.trim())).filter((n) => Number.isInteger(n) && n > 0 && n < 65536) : [];
+  }
+
+  private async restoreBridge(kube: Kube, ws: WorkspaceState): Promise<void> {
+    const pod = ws.sandbox;
+    if (!pod || ws.bridge) return;
+    const info = await kube.podInfo(pod).catch(() => null);
+    if (!info?.ready || info.terminating) return;
+    await this.serial(ws, async () => {
+      if (ws.bridge || ws.phase !== "running") return;
+      for (const port of await this.tunnelPortsInUse(kube, pod)) ws.wantPorts.add(port);
+      ws.readyUid = info.uid;
+      this.startBridge(kube, ws, new Set([...ws.ports, ...ws.wantPorts]));
+      await this.refreshTargets(kube, ws, pod).catch(() => undefined);
+    });
   }
 
   private newState(id: string, options: RuntimeOptions): WorkspaceState {
@@ -164,6 +218,7 @@ export class KubernetesRuntime {
       phase: "none",
       ports: new Set(),
       wantPorts: new Set(),
+      bridgeRetries: 0,
       targets: [],
       commands: new Set(),
       agents: new Map(),
@@ -175,14 +230,33 @@ export class KubernetesRuntime {
   }
 
   private workspace(request: WorkspaceRuntimeWorkspaceRequest): WorkspaceState {
-    const options = parseRuntimeOptions(request.options);
-    const ws = this.states.get(request.workspaceId) ?? this.newState(request.workspaceId, options);
-    ws.options = options;
+    let ws = this.states.get(request.workspaceId);
+    // A workspace created with just `--runtime kubernetes` has no options: its directory is all there is.
+    const dir = request.workspaceCwd ?? request.cwd;
+    const given: RuntimeOptions = request.options
+      ? parseRuntimeOptions(request.options)
+      : parseRuntimeOptions({ cwd: ws?.options.cwd ?? dir, slug: ws?.options.slug ?? (dir ? slugFor(dir) : undefined), ref: null });
+    // A workspace that inherited its runtime from the caller comes with the caller's options; its own directory is
+    // what `create` was told, so that wins, and the caller's branch choice and name do not apply to it.
+    const cwd = request.workspaceCwd ?? request.cwd;
+    if (cwd && cwd !== given.cwd && !ws?.cwdFixed) {
+      const options: RuntimeOptions = { cwd, slug: slugFor(cwd), ref: null };
+      ws ??= this.newState(request.workspaceId, options);
+      ws.options = options;
+      ws.cwdFixed = true;
+      return ws;
+    }
+    ws ??= this.newState(request.workspaceId, given);
+    if (cwd) ws.cwdFixed = true;
+    ws.options = ws.cwdFixed ? { ...given, cwd: ws.options.cwd, slug: ws.options.slug, ref: ws.options.ref, title: ws.options.title ?? given.title } : given;
     return ws;
   }
 
   private setPhase(ws: WorkspaceState, phase: PodState): void {
+    const before = ws.phase;
     ws.phase = phase;
+    // Paseo asks `describeWorkspace` again after a notice for the workspace: this keeps the badge's state current
+    if (before !== "none" && before !== phase && (phase === "running" || phase === "suspended")) this.stateChanged(ws, `The pod is ${phase}.`);
     if (ws.sandbox) this.deps.registry?.set(ws.id, ws.sandbox, phase, this.now());
   }
 
@@ -217,11 +291,32 @@ export class KubernetesRuntime {
         newBranch: plan?.action === "branch-off" && plan.slug ? plan.slug : undefined,
       });
       await made.done;
-      const subs = await initSubmodules(kube, pod, cwd, ws.targets);
-      if (!subs.ok) ctx.notice(`Could not fetch the submodules (run \`git submodule update --init\` in the pod to retry): ${subs.message}`, "warning");
+      // origin/<branch> exists from the start (no "gone" upstream in git status); best effort
+      await kube.exec(pod, ["git", "-C", cwd, "fetch", "-q", "origin"]).catch(() => undefined);
     } finally {
       await made.release().catch(() => undefined);
     }
+  }
+
+  /**
+   * Checks out the submodules in the background so the agent can start at once (a project with many submodules took
+   * over half a minute). Also resumes an interrupted checkout after a suspend; only one runs at a time.
+   */
+  private startSubmodules(kube: Kube, ws: WorkspaceState, pod: string): void {
+    if (ws.submodulesJob) return;
+    const { cwd } = ws.options;
+    const notice = (message: string, level?: "info" | "warning" | "error") => ws.notice?.(message, level);
+    ws.submodulesJob = (async () => {
+      if (!(await submodulesPending(kube, pod, cwd))) return;
+      notice("Fetching the submodules in the background...");
+      const r = await initSubmodules(kube, pod, cwd, ws.targets);
+      if (r.ok) notice("Submodules are ready.");
+      else notice(`Could not fetch the submodules (run \`git submodule update --init\` in the pod to retry): ${r.message}`, "warning");
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        ws.submodulesJob = undefined;
+      });
   }
 
   /** Tells git in the pod which remotes it may fetch from (origin and the submodules at HEAD and at the seed commit). */
@@ -236,7 +331,8 @@ export class KubernetesRuntime {
     const raw = await this.git(["remote", "get-url", "origin"], { cwd }).catch(() => null);
     const originUrl = raw?.code === 0 && raw.stdout.trim() ? raw.stdout.trim() : (await (this.deps.detectRepo ?? detectRepo)(cwd)).url;
     ws.targets = await fetchTargets(this.git, cwd, originUrl, all);
-    await setupMirrors(kube, pod, cwd, ws.targets);
+    const access = (await this.deps.getConfig()).otherRepos;
+    await setupMirrors(kube, pod, cwd, await this.identity(cwd), ws.targets, access.enabled ? access.hosts : []);
   }
 
   private defaultSeeder = async (cwd: string, plan: ClonePlan | null, currentBranch: string): Promise<SeedBundle> => {
@@ -248,16 +344,43 @@ export class KubernetesRuntime {
   private startBridge(kube: Kube, ws: WorkspaceState, ports: Set<number>): void {
     ws.bridge?.close();
     ws.ports = ports;
+    const startedAt = this.now();
     ws.bridge = startBridge(
       kube,
       ws.sandbox!,
       [...ports],
       {
-        handle: (request) =>
-          request.op === "fetch" ? applyFetch(this.git, ws.options.cwd, request, ws.targets) : applyPush(this.git, ws.options.cwd, request),
+        handle: async (request) => {
+          if (request.op === "push" && !request.mirror) return applyPush(this.git, ws.options.cwd, request);
+          // a repository a pod asked for by name is checked against the "Other repositories" setting
+          const mirror = request.mirror;
+          let targets = ws.targets;
+          if (mirror?.startsWith("x:")) {
+            const target = otherRepoTarget(mirror, (await this.deps.getConfig()).otherRepos);
+            if ("refused" in target) return { ok: false, message: `kube-agents: ${target.refused}` };
+            targets = [target];
+          }
+          return request.op === "fetch"
+            ? applyFetch(this.git, ws.options.cwd, request, targets)
+            : pushToMirror(this.git, ws.options.cwd, request, targets);
+        },
       },
-      { mapPort: this.deps.mapTunnelPort },
+      {
+        mapPort: this.deps.mapTunnelPort,
+        onEnd: () => {
+          // the channel to the pod's bridge ended (a network blip, a restarted API server): bring it back while the pod runs
+          if (ws.bridge !== bridge || ws.phase !== "running" || this.stopped) return;
+          ws.bridge = undefined;
+          // one that lived a while was healthy: start the backoff over
+          if (this.now() - startedAt > 60_000) ws.bridgeRetries = 0;
+          const attempt = ws.bridgeRetries++;
+          const delay = Math.min(30_000, 2_000 * 2 ** attempt);
+          const timer = setTimeout(() => void this.restoreBridge(kube, ws).catch(() => undefined), delay);
+          (timer as { unref?: () => void }).unref?.();
+        },
+      },
     );
+    const bridge = ws.bridge;
   }
 
   /** Brings the workspace's pod to a state where a provider process can start; cheap once it already is. */
@@ -295,13 +418,16 @@ export class KubernetesRuntime {
       await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running") }));
       ws.labelled = this.metaKey(this.meta(ws, "running"));
       ws.sandbox = name;
+      ws.image = config.image;
     } else {
       ws.sandbox = sandbox.name;
+      ws.image = sandbox.image ?? ws.image;
       ws.repo ??= sandbox.labels[REPO_LABEL];
       if (sandbox.operatingMode === "Suspended") {
         ctx.notice("Resuming the pod...");
         this.setPhase(ws, "resuming");
         await kube.patchSandbox(sandbox.name, resumePatch(config, cwd));
+        ws.image = config.image; // a resumed pod starts with the current image
       }
     }
     this.setPhase(ws, "resuming");
@@ -315,9 +441,11 @@ export class KubernetesRuntime {
         onProblem: (problem) => ctx.notice(problem, "warning"),
       });
       await installAssets(kube, pod);
+      await ensureJq(kube, pod);
       if (!ws.bridge || grows || ws.readyUid !== info.uid) this.startBridge(kube, ws, wanted); // before seeding: submodules are fetched through it
       await this.seedIfEmpty(kube, ws, pod, ctx);
       await this.refreshTargets(kube, ws, pod);
+      this.startSubmodules(kube, ws, pod);
       if (need.command && !ws.commands.has(need.command)) {
         ctx.notice(`Checking ${need.command} in the pod...`);
         await ensureCommand(kube, pod, need.command);
@@ -341,6 +469,45 @@ export class KubernetesRuntime {
     }
   }
 
+  /** The workspace's files, served from the pod. Only while the pod runs: polling must not keep it awake or wake it. */
+  private fileSystem(): WorkspaceRuntimeFileSystem {
+    const call = async (request: WorkspaceRuntimeFsRequest, op: string, extra: Record<string, unknown> = {}): Promise<unknown> => {
+      const ws = this.workspace(request);
+      const config = await this.deps.getConfig();
+      const kube = this.deps.kubeFor(config);
+      const info = ws.sandbox && ws.phase === "running" ? await kube.podInfo(ws.sandbox).catch(() => null) : null;
+      if (!ws.sandbox || !info?.ready || info.terminating) {
+        throw new Error("EAGAIN: the pod is not running (suspended or not started yet); it starts with the next message to an agent");
+      }
+      const payload = Buffer.from(JSON.stringify({ op, root: ws.options.cwd, path: request.path, ...extra }));
+      const run = () => kube.execInput(ws.sandbox!, ["sh", "-c", 'exec node "$HOME/fs.mjs"'], Readable.from([payload]));
+      let r = await run();
+      if (r.code !== 0 && /Cannot find module/.test(r.stderr)) {
+        await installAssets(kube, ws.sandbox);
+        r = await run();
+      }
+      let out: { ok: boolean; error?: string; result?: unknown };
+      try {
+        out = JSON.parse(r.stdout);
+      } catch {
+        throw new Error(`EIO: the pod could not run the file operation: ${scrub(r.stderr.trim()) || "no answer"}`);
+      }
+      if (!out.ok) throw new Error(out.error ?? "EIO: file operation failed");
+      return out.result;
+    };
+    return {
+      stat: async (r) => ((await call(r, "stat")) as WorkspaceRuntimeFsStat | null) ?? null,
+      readdir: async (r) => (await call(r, "readdir")) as WorkspaceRuntimeFsEntry[],
+      read: async (r) => new Uint8Array(Buffer.from(((await call(r, "read", { offset: r.offset, length: r.length })) as { data: string }).data, "base64")),
+      write: async (r) =>
+        (await call(r, "write", { data: Buffer.from(r.data).toString("base64"), mode: r.mode, exclusive: r.exclusive, expectedMtimeMs: r.expectedMtimeMs })) as WorkspaceRuntimeFsStat,
+      mkdir: async (r) => void (await call(r, "mkdir")),
+      rename: async (r) => void (await call(r, "rename", { to: r.to })),
+      remove: async (r) => void (await call(r, "remove", { recursive: r.recursive })),
+      copy: async (r) => void (await call(r, "copy", { to: r.to })),
+    };
+  }
+
   private meta(ws: WorkspaceState, state: MetaState): PodMeta {
     return {
       workspaceName: ws.options.title ?? ws.options.slug ?? ws.id,
@@ -361,12 +528,16 @@ export class KubernetesRuntime {
     if (!ws.sandbox) return;
     const meta = this.meta(ws, state);
     const key = this.metaKey(meta);
-    if (ws.labelled === key) return;
+    const retry = ws.labelFailedAt !== undefined && this.now() - ws.labelFailedAt > 5 * 60_000;
+    if (ws.labelled === key && !retry) return;
     ws.labelled = key;
+    ws.labelFailedAt = undefined;
     await kube.patchSandbox(ws.sandbox, metaPatch(meta)).catch(() => undefined);
-    const { labels, annotations } = metaPatch(meta).metadata as { labels: Record<string, string>; annotations: Record<string, string> };
-    if (state === "running") await kube.label("pod", ws.sandbox, labels, annotations).catch(() => undefined);
-    await kube.label("pvc", workspaceClaimName(ws.sandbox), labels, annotations).catch(() => undefined);
+    const { labels, annotations } = (metaPatch(meta) as { metadata: unknown }).metadata as { labels: Record<string, string>; annotations: Record<string, string> };
+    const failed: unknown[] = [];
+    if (state === "running") await kube.label("pod", ws.sandbox, labels, annotations).catch((e) => failed.push(e));
+    await kube.label("pvc", workspaceClaimName(ws.sandbox), labels, annotations).catch((e) => failed.push(e));
+    if (failed.length) ws.labelFailedAt = this.now();
   }
 
   /** Brings the labels of every workspace in line with its current name in Paseo (renames). */
@@ -403,9 +574,55 @@ export class KubernetesRuntime {
     for (const ws of this.states.values()) {
       const busy = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
       if (ws.phase === "running" && !busy && this.now() - ws.lastActivity >= limit) {
+        // The activity events this plugin saw are not the whole story: after a plugin reload it has seen none, and a
+        // turn that started before it keeps running. Ask Paseo; if an agent is running (or it cannot say), wait.
+        const running = await (this.deps.workspaceBusy ?? paseoWorkspaceBusy)(ws.options.cwd).catch(() => null);
+        // An agent between turns can still be waiting on a background shell, a timer or a watch inside its process
+        // (it shows as idle); suspending would kill that work. Live children of a claude/codex process mean busy.
+        const background = running === false ? await this.hasBackgroundWork(ws).catch(() => true) : false;
+        if (running !== false || background) {
+          ws.lastActivity = this.now();
+          continue;
+        }
         await this.serial(ws, () => this.suspend(ws)).catch(() => undefined);
       }
     }
+  }
+
+  /**
+   * What the sidebar shows beside the runtime icon: the image's short name, with the pod and its state in the tooltip
+   * and the header. Answered from what is already known: it never starts or reads the pod.
+   */
+  describeWorkspace(request: WorkspaceRuntimeWorkspaceRequest): WorkspaceRuntimeDisplay | null {
+    const ws = this.states.get(request.workspaceId);
+    if (!ws?.sandbox) return { label: "no pod yet", detail: "Kubernetes pod · not started yet" };
+    const short = shortImage(ws.image);
+    const name = short?.split("@")[0]?.split(":")[0];
+    const state = ws.phase === "resuming" ? "starting" : ws.phase === "none" ? "unknown" : ws.phase;
+    return {
+      label: name ?? "pod",
+      tooltip: [
+        `Pod ${ws.sandbox}`,
+        `State: ${state}`,
+        ...(ws.image ? [`Image: ${ws.image}`] : []),
+        ...(ws.repo ? [`Repository: ${ws.repo}`] : []),
+      ].join("\n"),
+      detail: [name ?? "pod", ws.sandbox, state].join(" · "),
+    };
+  }
+
+  /** Tells Paseo to ask `describeWorkspace` again: the pod changed state. */
+  private stateChanged(ws: WorkspaceState, message: string): void {
+    ws.notice?.(message);
+  }
+
+  /** Whether a provider process in the pod has live child processes (background shells and timers of an idle agent). */
+  private async hasBackgroundWork(ws: WorkspaceState): Promise<boolean> {
+    if (!ws.sandbox) return false;
+    const config = await this.deps.getConfig();
+    const r = await this.deps.kubeFor(config).exec(ws.sandbox, ["ps", "-eo", "pid=,ppid=,stat=,args="]);
+    if (r.code !== 0) return true; // cannot tell: keep the pod
+    return liveProviderChildren(r.stdout);
   }
 
   /** The registration Paseo's fork takes. */
@@ -413,17 +630,21 @@ export class KubernetesRuntime {
     return {
       id: "kubernetes",
       label: RUNTIME_LABEL,
+      icon: "icons/ship-wheel.svg", // the Lucide ship wheel, shown beside the workspace's host in the sidebar
       describe: () => ({ protocolVersion: 1, capabilities: { pipes: true, pty: false } }),
       create: async (request) => {
         this.workspace(request); // validates the options; nothing exists in the cluster until a process is about to start
       },
       inspect: (request) => this.inspect(request),
+      describeWorkspace: (request) => this.describeWorkspace(request),
       destroy: (request) => this.destroy(request),
-      reconcile: () => this.reconcile(),
+      reconcile: (request) => this.reconcile(request),
+      checkCommand: (request) => this.checkCommand(request),
       prepare: (request, ctx) => this.prepare(request, ctx),
       beforeInput: (request, ctx) => this.beforeInput(request, ctx),
       onActivity: (event) => this.onActivity(event),
       exec: (request, ctx) => this.exec(request, ctx),
+      fs: this.fileSystem(),
     };
   }
 
@@ -440,14 +661,13 @@ export class KubernetesRuntime {
   }
 
   /**
-   * Paseo gives `prepare` and `beforeInput` 30 seconds, and a first pod (scheduling, image pull, volume, seeding,
-   * installing the CLI) can take longer. Work runs on the workspace's queue regardless; the call returns when it is
-   * done or when the window ends, and `exec`, which has no deadline, waits for the rest.
+   * Paseo gives `prepare` and `beforeInput` 15 minutes. Work runs on the workspace's queue regardless; the call
+   * returns when it is done or when the window ends, and `exec`, which has no deadline, waits for the rest.
    */
   private async withinWindow(ws: WorkspaceState, ctx: WorkspaceRuntimeContext, work: () => Promise<void>): Promise<void> {
     ws.notice = ctx.notice;
     const job = this.serial(ws, work);
-    const window = this.deps.startWindowMs ?? 20_000;
+    const window = this.deps.startWindowMs ?? 14 * 60_000; // Paseo's deadline for these calls is 15 minutes
     let timer: ReturnType<typeof setTimeout> | undefined;
     const waited = await Promise.race([
       job.then(() => "done" as const),
@@ -496,7 +716,63 @@ export class KubernetesRuntime {
 
   /** The workspace was archived: its pod and volume go. */
   async destroy(request: WorkspaceRuntimeWorkspaceRequest): Promise<void> {
-    const ws = this.workspace(request);
+    await this.destroyWorkspace(this.workspace(request));
+  }
+
+  /** Why this workspace's pod must not be taken down right now, or null: an agent is running, or one waits on background work. */
+  async busyReason(ws: WorkspaceState): Promise<string | null> {
+    const running = await (this.deps.workspaceBusy ?? paseoWorkspaceBusy)(ws.options.cwd).catch(() => null);
+    if (running === true) return "an agent is running in this workspace";
+    if (running === null) return "Paseo could not say whether an agent is running in this workspace";
+    if (ws.phase === "running" && (await this.hasBackgroundWork(ws).catch(() => true))) return "an agent has a background command running in the pod";
+    return null;
+  }
+
+  /**
+   * The screen's per-pod actions. A pod with a running agent (or background work) is only touched with `force`;
+   * without it the answer says what is running so the screen can ask first.
+   */
+  async podAction(
+    workspaceId: string,
+    action: "suspend" | "resume" | "restart" | "delete",
+    options: { force?: boolean; archive?: boolean } = {},
+  ): Promise<{ ok: boolean; busy?: string; message?: string }> {
+    if (!this.states.has(workspaceId)) await this.adopt().catch(() => undefined);
+    const ws = this.states.get(workspaceId);
+    if (!ws?.sandbox) return { ok: false, message: "This workspace has no pod." };
+    const quiet = { notice: () => undefined, signal: new AbortController().signal };
+    const guard = async (): Promise<{ ok: false; busy: string } | null> => {
+      if (options.force) return null;
+      const busy = await this.busyReason(ws);
+      return busy ? { ok: false, busy } : null;
+    };
+    if (action === "resume") {
+      if (ws.phase === "running") return { ok: true, message: "The pod is already running." };
+      await this.serial(ws, () => this.ensureReady(ws, this.detached(ws, quiet), {}));
+      return { ok: true };
+    }
+    if (action === "suspend" || action === "restart") {
+      if (ws.phase === "running") {
+        const busy = await guard();
+        if (busy) return busy;
+        await this.serial(ws, () => this.suspend(ws));
+      } else if (action === "suspend") {
+        return { ok: true, message: "The pod is not running." };
+      }
+      if (action === "restart") await this.serial(ws, () => this.ensureReady(ws, this.detached(ws, quiet), {}));
+      return { ok: true };
+    }
+    // delete
+    if (ws.phase === "running") {
+      const busy = await guard();
+      if (busy) return busy;
+    }
+    await this.destroyWorkspace(ws);
+    if (options.archive) await (this.deps.archiveWorkspace ?? paseoArchiveWorkspace)(workspaceId).catch(() => undefined);
+    return { ok: true };
+  }
+
+  private async destroyWorkspace(ws: WorkspaceState): Promise<void> {
     await this.serial(ws, async () => {
       const config = await this.deps.getConfig();
       const kube = this.deps.kubeFor(config);
@@ -510,8 +786,11 @@ export class KubernetesRuntime {
     });
   }
 
-  /** After a pod was lost: forget what was set up in it, so the next launch sets up the replacement. */
-  async reconcile(): Promise<void> {
+  /**
+   * After a daemon restart, a plugin reload or a lost pod: forget what was set up in the pods, adopt the workspaces
+   * Paseo lists, and delete the Sandbox of any workspace it no longer has (archived while the plugin was away).
+   */
+  async reconcile(request?: WorkspaceRuntimeReconcileRequest): Promise<void> {
     for (const ws of this.states.values()) {
       ws.bridge?.close();
       ws.bridge = undefined;
@@ -519,13 +798,55 @@ export class KubernetesRuntime {
       ws.commands.clear();
     }
     await this.adopt().catch(() => undefined);
+    if (!Array.isArray(request?.workspaces)) return; // an older Paseo calls reconcile without the list
+    for (const listed of request.workspaces) {
+      const ws = this.states.get(listed.workspaceId);
+      if (ws) {
+        ws.options = { ...ws.options, cwd: listed.cwd };
+        ws.cwdFixed = true;
+      } else {
+        const options = parseRuntimeOptions({ ...(listed.options ?? {}), cwd: listed.cwd });
+        this.newState(listed.workspaceId, { ...options, cwd: listed.cwd }).cwdFixed = true;
+      }
+    }
+    if (!this.deps.daemonId) return;
+    const live = new Set(request.workspaces.map((w) => w.workspaceId));
+    const config = await this.deps.getConfig();
+    const kube = this.deps.kubeFor(config);
+    for (const sandbox of await kube.listSandboxes(`${DAEMON_LABEL}=${this.deps.daemonId}`).catch(() => [])) {
+      const id = sandbox.labels[WORKSPACE_ID_LABEL];
+      if (!id || live.has(id) || this.now() - (sandbox.createdAt ? Date.parse(sandbox.createdAt) : 0) < 5 * 60_000) continue;
+      this.log(`[kubernetes-runtime] reconcile: deleting sandbox ${sandbox.name} (workspace ${id} no longer exists)`);
+      const ws = this.states.get(id);
+      ws?.bridge?.close();
+      this.states.delete(id);
+      this.deps.registry?.delete(id);
+      await kube.delete("sandbox", sandbox.name).catch(() => undefined);
+      await kube.delete("pvc", workspaceClaimName(sandbox.name)).catch(() => undefined);
+    }
+  }
+
+  /** Whether a provider or MCP server binary exists in the pod. claude and codex are installed on first use, so they do. */
+  async checkCommand(request: WorkspaceRuntimeCommandRequest): Promise<boolean> {
+    const name = request.command.split("/").pop() ?? request.command;
+    if (name in INSTALLABLE_CLIS) return true;
+    const ws = this.workspace(request);
+    if (!ws.sandbox || ws.phase !== "running") return true; // no pod to ask yet; the launch finds out
+    const config = await this.deps.getConfig();
+    const kube = this.deps.kubeFor(config);
+    const found = await kube.exec(ws.sandbox, ["sh", "-c", 'export PATH="$HOME/bin:$HOME/.npm-global/bin:$PATH"; command -v "$1" >/dev/null 2>&1', "sh", request.command]);
+    return found.code === 0;
   }
 
   async exec(request: WorkspaceRuntimeExecRequest, ctx: WorkspaceRuntimeContext & { signal: AbortSignal }): Promise<WorkspaceRuntimeProcess> {
     const ws = this.workspace(request);
     if (request.purpose === "probe") throw new Error("Probes run on the daemon host; the Kubernetes Runtime does not start them");
+    // Git and other short tools Paseo runs for the workspace. A background refresh must not wake a suspended pod.
+    if (request.purpose === "command" && request.interactive === false && ws.phase !== "running") {
+      throw new Error("The pod is not running; background refreshes do not wake it");
+    }
     ws.notice = ctx.notice;
-    await this.serial(ws, () => this.ensureReady(ws, this.detached(ws, ctx), { command: request.argv[0], env: request.env }));
+    await this.serial(ws, () => this.ensureReady(ws, this.detached(ws, ctx), { command: request.purpose === "command" ? undefined : request.argv[0], env: request.env }));
     const config = await this.deps.getConfig();
     const kube = this.deps.kubeFor(config);
     const pod = ws.sandbox!;
@@ -552,10 +873,45 @@ export class KubernetesRuntime {
           this.log(`[kubernetes-runtime] ${request.argv[0]} in ${pod} exited with ${code ?? signal}${lost ? " (pod lost or suspended)" : ""}${stderrTail.trim() ? `: ${scrub(stderrTail.trim())}` : ""}`);
         }
         if (lost && code !== 0) {
-          return { code, signal, reason: "runtime-lost" as const, message: "The pod was suspended or lost; the next message brings it back" };
+          // Our own idle suspension is a planned, clean stop (agents drop it quietly); a pod that vanished is not.
+          if (ws.phase === "suspended") return { code, signal, reason: "suspended" as const, message: "The idle pod was suspended; the next message brings it back" };
+          return { code, signal, reason: "runtime-lost" as const, message: "The pod was lost; the next message brings it back" };
         }
         return { code, signal, reason: "exited" as const };
       }),
     };
   }
+}
+
+/** A workspace slug from a directory name (for labelling and pod names of workspaces that inherited a runtime). */
+function slugFor(cwd: string): string {
+  const base = cwd.split("/").filter(Boolean).pop() ?? "workspace";
+  return base.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[^A-Za-z0-9]+/, "").slice(0, 63) || "workspace";
+}
+
+/**
+ * True when a `claude` or `codex` process listed by `ps -eo pid=,ppid=,stat=,args=` has a living (not zombie)
+ * descendant: its agent is running background work even if Paseo shows it idle.
+ */
+export function liveProviderChildren(psOutput: string): boolean {
+  const rows = psOutput
+    .split("\n")
+    .map((line) => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line))
+    .filter((m): m is RegExpExecArray => m !== null)
+    .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), stat: m[3]!, args: m[4]! }));
+  const provider = new Set(rows.filter((r) => /^(claude|codex)(\s|$)/.test(r.args)).map((r) => r.pid));
+  if (provider.size === 0) return false;
+  const byPid = new Map(rows.map((r) => [r.pid, r]));
+  return rows.some((r) => {
+    if (r.stat.startsWith("Z") || provider.has(r.pid)) return false;
+    for (let at = byPid.get(r.ppid), hops = 0; at && hops < 20; at = byPid.get(at.ppid), hops++) {
+      if (provider.has(at.pid)) return true;
+    }
+    return false;
+  });
+}
+
+async function paseoArchiveWorkspace(workspaceId: string): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  await new Promise<void>((resolve, reject) => execFile("paseo", ["workspace", "archive", workspaceId], { timeout: 30_000 }, (e) => (e ? reject(e) : resolve())));
 }

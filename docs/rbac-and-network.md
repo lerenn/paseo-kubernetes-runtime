@@ -45,7 +45,7 @@ reads the Secret through a `secretKeyRef` via the kubelet. The plugin sets a key
 only that key). It must not use `kubectl patch`, which GETs the object first and would be refused without `get`.
 Server-side apply needs only `patch`; the lab creates the Secret placeholder, so `create` is not needed. One field manager
 per key keeps writes to different keys independent.
-Because values can't be read, the UI's "set / not set" comes from plugin-local state, not the cluster. No ClusterRole needed. The extension CRDs (claims, warm pools, templates) are not used.
+Because values can't be read, the UI's "set / not set" comes from plugin-local state, not the cluster. No ClusterRole needed. Only the core `Sandbox` resource is used; the extension CRDs are not.
 
 ## 3b. Workspace storage
 

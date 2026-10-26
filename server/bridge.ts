@@ -12,7 +12,7 @@ export interface BridgeReply {
   pack?: string;
 }
 
-export type PushRequest = { op: "push"; ref: string; old: string; new: string; base: string; pack: string };
+export type PushRequest = { op: "push"; ref: string; old: string; new: string; base: string; pack: string; /** A submodule's mirror in the pod; absent for the project's own branches. */ mirror?: string };
 export type BridgeRequest = PushRequest | FetchRequest;
 
 export interface BridgeHandlers {
@@ -29,6 +29,8 @@ export interface TcpFrame {
 
 const SHA = /^[0-9a-f]{40}$/;
 const BRANCH_REF = /^refs\/heads\/[A-Za-z0-9._/-]+$/;
+const TAG_REF = /^refs\/tags\/[A-Za-z0-9._/-]+$/;
+const ZERO_SHA = "0".repeat(40);
 const MAX_PACK_BYTES = 64 * 1024 * 1024;
 
 /**
@@ -39,21 +41,25 @@ export async function applyPush(
   git: GitRunner,
   projectDir: string,
   request: PushRequest,
+  /** Where the commits are applied and what is pushed to; the project's origin unless a mirror asked. */
+  destination: { dir: string; remote: string } = { dir: projectDir, remote: "origin" },
 ): Promise<BridgeReply> {
   const { ref, new: sha, old, base } = request;
-  if (!BRANCH_REF.test(ref) || ref.includes("..")) return { ok: false, message: `kube-agents: refusing to push ${ref}: only branches are pushed from pods` };
+  if (!(BRANCH_REF.test(ref) || TAG_REF.test(ref)) || ref.includes("..")) return { ok: false, message: `kube-agents: refusing to push ${ref}: only branches and new tags are pushed from pods` };
+  // a tag is only ever created: moving one is refused here as well as in the pod's hook
+  if (TAG_REF.test(ref) && old !== ZERO_SHA) return { ok: false, message: `kube-agents: moving the existing tag ${ref.replace("refs/tags/", "")} from a pod is not supported` };
   if (![sha, old, base].every((v) => SHA.test(v))) return { ok: false, message: "kube-agents: malformed push request" };
   const pack = Buffer.from(request.pack, "base64");
   if (pack.length > MAX_PACK_BYTES) return { ok: false, message: "kube-agents: push is too large to relay (over 64MB)" };
 
   if (pack.length > 0) {
-    const indexed = await git(["index-pack", "--stdin", "--fix-thin"], { cwd: projectDir, input: pack });
+    const indexed = await git(["index-pack", "--stdin", "--fix-thin"], { cwd: destination.dir, input: pack });
     if (indexed.code !== 0) return { ok: false, message: `kube-agents: could not read the pushed commits: ${scrub(indexed.stderr.trim())}` };
   }
-  const known = await git(["cat-file", "-e", `${sha}^{commit}`], { cwd: projectDir });
+  const known = await git(["cat-file", "-e", `${sha}^{commit}`], { cwd: destination.dir });
   if (known.code !== 0) return { ok: false, message: "kube-agents: the pushed commit is missing on the daemon" };
 
-  const pushed = await git(["push", "origin", `${sha}:${ref}`], { cwd: projectDir });
+  const pushed = await git(["push", destination.remote, `${sha}:${ref}`], { cwd: destination.dir });
   if (pushed.code !== 0) {
     return { ok: false, message: `kube-agents: push to ${ref} rejected by the remote:\n${scrub(pushed.stderr.trim())}` };
   }
@@ -137,7 +143,7 @@ export function startBridge(
   pod: string,
   ports: readonly number[],
   handlers: BridgeHandlers,
-  options: { mapPort?: (port: number) => number } = {},
+  options: { mapPort?: (port: number) => number; /** Called when the channel ended without `close()` (the pod or the plugin's exec was lost). */ onEnd?: () => void } = {},
 ): RunningBridge {
   const stream = kube.execStream(pod, [
     "sh",
@@ -158,6 +164,7 @@ export function startBridge(
       const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true }));
       if (done || closed) {
         tunnels.closeAll();
+        if (!closed) options.onEnd?.();
         return;
       }
       if ((value as { tcp?: string }).tcp) {

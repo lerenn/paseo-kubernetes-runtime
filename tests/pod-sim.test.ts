@@ -1,12 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ConfigSchema } from "../shared/settings.js";
 import { KubernetesRuntime } from "../server/runtime.js";
+import { runGit } from "../server/git.js";
 import { LocalPodKube } from "./local-pod.js";
 
 const ID = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
@@ -55,11 +56,12 @@ afterEach(() => {
   while (cleanups.length) cleanups.pop()!();
 });
 
-async function openSession(argv0 = "sh", mcpServers: Record<string, any> = {}, tunnel?: { pod: number; daemon: number }, env: Record<string, string> = {}, withSubmodule = false) {
+async function openSession(argv0 = "sh", mcpServers: Record<string, any> = {}, tunnel?: { pod: number; daemon: number }, env: Record<string, string> = {}, withSubmodule = false, extra: { config?: object; git?: (args: string[], o?: any) => Promise<any> } = {}) {
   const { origin, project, sub, root } = repos(withSubmodule);
   const kube = new LocalPodKube(project);
   const runtime = new KubernetesRuntime({
-    getConfig: async () => ConfigSchema.parse({ readyTimeoutSeconds: 5 }),
+    getConfig: async () => ConfigSchema.parse({ readyTimeoutSeconds: 5, ...extra.config }),
+    ...(extra.git ? { git: extra.git as never } : {}),
     kubeFor: () => kube,
     daemonId: "srv_ME",
     log: () => undefined,
@@ -85,6 +87,8 @@ describe("seeded pod workspace and push-back (real git, real pod scripts)", () =
     expect(sh(podDir, "log", "-1", "--format=%s")).toBe("one");
     expect(sh(podDir, "branch", "--show-current")).toBe("main");
     expect(sh(podDir, "config", "remote.origin.pushurl")).toContain("outbox.git");
+    expect(sh(podDir, "status", "-sb")).not.toContain("gone"); // origin/main was fetched after the seed
+    expect(sh(podDir, "rev-parse", "origin/main")).toBe(sh(podDir, "rev-parse", "HEAD"));
     expect(sh(podDir, "config", "user.name")).toBeTruthy();
     expect(sh(project, "for-each-ref", "refs/kube-seed")).toBe(""); // temporary ref cleaned up
     expect((await kube.as(["sh", "-c", "env | grep -c GH_TOKEN || true"])).stdout.trim()).toBe("0");
@@ -136,10 +140,51 @@ describe("seeded pod workspace and push-back (real git, real pod scripts)", () =
     const del = await kube.as(["git", "push", "origin", ":refs/heads/throwaway"], { cwd: podDir });
     expect(del.code).not.toBe(0);
     expect(del.stderr).toMatch(/not supported/);
+    const notes = await kube.as(["git", "push", "origin", "HEAD:refs/notes/x"], { cwd: podDir });
+    expect(notes.code).not.toBe(0);
+    expect(notes.stderr).toMatch(/only branches and new tags/);
+  });
+
+  it("pushes a new tag, but never moves or deletes one", async () => {
+    const { origin, kube, podDir } = await openSession();
     sh(podDir, "tag", "v1");
-    const tag = await kube.as(["git", "push", "origin", "refs/tags/v1"], { cwd: podDir });
-    expect(tag.code).not.toBe(0);
-    expect(tag.stderr).toMatch(/only branches/);
+    const created = await kube.as(["git", "push", "origin", "refs/tags/v1"], { cwd: podDir });
+    expect(created.code, created.stderr).toBe(0);
+    expect(sh(origin, "rev-parse", "refs/tags/v1")).toBe(sh(podDir, "rev-parse", "HEAD"));
+    sh(podDir, "tag", "-a", "-m", "annotated", "v2");
+    expect((await kube.as(["git", "push", "origin", "refs/tags/v2"], { cwd: podDir })).code).toBe(0);
+    expect(sh(origin, "cat-file", "-t", "refs/tags/v2")).toBe("tag");
+
+    writeFileSync(join(podDir, "t.txt"), "t\n");
+    sh(podDir, "add", ".");
+    sh(podDir, "commit", "-qm", "later");
+    sh(podDir, "tag", "-f", "v1");
+    const moved = await kube.as(["git", "push", "--force", "origin", "refs/tags/v1"], { cwd: podDir });
+    expect(moved.code).not.toBe(0);
+    expect(moved.stderr).toMatch(/moving the existing tag|not supported/);
+    const del = await kube.as(["git", "push", "origin", ":refs/tags/v1"], { cwd: podDir });
+    expect(del.code).not.toBe(0);
+    expect(del.stderr).toMatch(/not supported/);
+  });
+
+  it("leaves repositories that have nothing to do with the daemon alone (local bare repos work)", async () => {
+    const { kube, podDir } = await openSession();
+    const bare = join(kube.root, "tmp-bare.git");
+    sh(kube.root, "init", "-q", "--bare", "-b", "main", bare);
+    const work = join(kube.root, "tmp-work");
+    for (const argv of [["git", "clone", "-q", bare, work]]) {
+      const r = await kube.as(argv);
+      expect(r.code, r.stderr).toBe(0);
+    }
+    writeFileSync(join(work, "a.txt"), "a\n");
+    for (const argv of [["git", "add", "."], ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "local"], ["git", "push", "-q", "origin", "HEAD:main"], ["git", "fetch", "origin"], ["git", "pull", "--ff-only", "origin", "main"]]) {
+      const r = await kube.as(argv, { cwd: work });
+      expect(r.code, `${argv.join(" ")}: ${r.stderr}`).toBe(0);
+    }
+    const again = join(kube.root, "tmp-again");
+    const cloned = await kube.as(["git", "clone", "-q", bare, again]);
+    expect(cloned.code, cloned.stderr).toBe(0);
+    expect(podDir).toBeTruthy();
   });
 });
 
@@ -161,19 +206,24 @@ describe("fetching through the daemon (real git, real pod scripts)", () => {
     expect(sh(podDir, "tag", "--list", "v9")).toBe("v9");
     expect((await kube.as(["git", "config", "--global", "--get-regexp", "insteadof"])).stdout).toContain("mirrors/");
 
+    expect(sh(podDir, "config", "branch.main.merge")).toBe("refs/heads/main"); // a plain `git pull` knows where from
     // a second upstream commit arrives through pull, sending only what the pod lacks
     writeFileSync(join(other, "more.txt"), "more\n");
     sh(other, "add", ".");
     sh(other, "commit", "-qm", "more upstream work");
     sh(other, "push", "-q", "origin", "main");
-    const pulled = await kube.as(["git", "pull", "--ff-only", "origin", "main"], { cwd: podDir });
+    const pulled = await kube.as(["git", "pull", "--ff-only"], { cwd: podDir });
     expect(pulled.code, pulled.stderr).toBe(0);
     expect(sh(podDir, "log", "-1", "--format=%s")).toBe("more upstream work");
   });
 
   it("checks out the submodules of the seeded commit and updates them through the daemon", async () => {
     const { sub, root, kube, podDir, notices } = await openSession("sh", {}, undefined, {}, true);
-    expect(notices.join("\n")).not.toMatch(/submodules/);
+    // the agent can start before the submodules are in: they are fetched in the background
+    await wait(() => existsSync(join(podDir, "vendor/lib/lib.txt")));
+    await wait(() => notices.some((n) => /Submodules are ready/.test(n)));
+    expect(notices.join("\n")).toMatch(/Fetching the submodules in the background/);
+    expect(notices.join("\n")).not.toMatch(/Could not fetch/);
     expect(sh(podDir, "submodule", "status")).toContain("vendor/lib");
     expect(sh(join(podDir, "vendor/lib"), "log", "-1", "--format=%s")).toBe("lib one");
 
@@ -185,7 +235,118 @@ describe("fetching through the daemon (real git, real pod scripts)", () => {
     const updated = await kube.as(["git", "submodule", "update", "--remote", "vendor/lib"], { cwd: podDir });
     expect(updated.code, updated.stderr).toBe(0);
     expect(sh(join(podDir, "vendor/lib"), "log", "-1", "--format=%s")).toBe("lib two");
-    expect(sub).toBeTruthy();
+
+    // the pod commits in the submodule with the daemon's identity (no identity set up by the agent) and pushes a branch
+    const lib = join(podDir, "vendor/lib");
+    writeFileSync(join(lib, "pod.txt"), "from the pod\n");
+    const steps = [["git", "switch", "-q", "-c", "pod-branch"], ["git", "add", "."], ["git", "commit", "-qm", "pod change"], ["git", "push", "origin", "pod-branch"]];
+    for (const argv of steps) {
+      const r = await kube.as(argv, { cwd: lib });
+      expect(r.code, `${argv.join(" ")}: ${r.stderr}`).toBe(0);
+    }
+    expect(sh(sub, "log", "-1", "--format=%s", "refs/heads/pod-branch")).toBe("pod change");
+    expect(sh(sub, "log", "-1", "--format=%an", "refs/heads/pod-branch")).toBeTruthy();
+    const del = await kube.as(["git", "push", "origin", ":pod-branch"], { cwd: lib });
+    expect(del.code).not.toBe(0);
+    expect(del.stderr).toMatch(/not supported/);
+  });
+});
+
+describe("other repositories through the daemon (real git, real pod scripts)", () => {
+  /** A bare repo standing in for git@example.test:o/r.git, reached by the daemon through an insteadOf rule. */
+  function otherRepo() {
+    const root = mkdtempSync(join(tmpdir(), "kube-other-"));
+    const bare = join(root, "r.git");
+    mkdirSync(bare);
+    sh(bare, "init", "-q", "--bare", "-b", "main");
+    const work = join(root, "w");
+    sh(root, "clone", "-q", bare, work);
+    writeFileSync(join(work, "readme.txt"), "other repo\n");
+    sh(work, "add", ".");
+    sh(work, "commit", "-qm", "first");
+    sh(work, "push", "-q", "origin", "main");
+    const git = (args: string[], o?: any) => runGit(["-c", `url.${bare}.insteadOf=git@example.test:o/r.git`, ...args], o);
+    return { bare, git };
+  }
+  const session = (git: (a: string[], o?: any) => Promise<any>, allow = ["o/*"], enabled = true) =>
+    openSession("sh", {}, undefined, {}, false, { config: { otherRepos: { enabled, hosts: ["example.test"], allow } }, git });
+  const asAgent = (kube: any, argv: string[], cwd?: string) => kube.as(argv, { cwd, env: { PATH: `${kube.home}/bin:${process.env.PATH}` } });
+
+  it("clones, fetches and pushes a branch of a repository nobody mentioned, with no credential in the pod", async () => {
+    const { bare, git } = otherRepo();
+    const { kube, root: _r } = await session(git);
+    const dest = join(kube.root, "other-clone");
+    const cloned = await asAgent(kube, ["git", "clone", "https://example.test/o/r", dest]);
+    expect(cloned.code, cloned.stderr).toBe(0);
+    expect(sh(dest, "log", "-1", "--format=%s")).toBe("first");
+
+    // upstream moves on, the pod fetches it through the daemon
+    const other = join(mkdtempSync(join(tmpdir(), "kube-up-")), "u");
+    sh(tmpdir(), "clone", "-q", bare, other);
+    writeFileSync(join(other, "more.txt"), "more\n");
+    sh(other, "add", ".");
+    sh(other, "commit", "-qm", "second");
+    sh(other, "push", "-q", "origin", "main");
+    const pulled = await asAgent(kube, ["git", "pull", "--ff-only"], dest);
+    expect(pulled.code, pulled.stderr).toBe(0);
+    expect(sh(dest, "log", "-1", "--format=%s")).toBe("second");
+
+    // a branch pushed from the pod is pushed by the daemon; a deletion is refused
+    writeFileSync(join(dest, "pod.txt"), "from the pod\n");
+    for (const argv of [["git", "switch", "-q", "-c", "pod-branch"], ["git", "add", "."], ["git", "commit", "-qm", "pod change"], ["git", "push", "origin", "pod-branch"]]) {
+      const r = await asAgent(kube, argv, dest);
+      expect(r.code, `${argv.join(" ")}: ${r.stderr}`).toBe(0);
+    }
+    expect(sh(bare, "log", "-1", "--format=%s", "refs/heads/pod-branch")).toBe("pod change");
+    const del = await asAgent(kube, ["git", "push", "origin", ":pod-branch"], dest);
+    expect(del.code).not.toBe(0);
+    expect(del.stderr).toMatch(/not supported/);
+  });
+
+  it("refuses repositories outside the allowlist, and everything when the setting is off", async () => {
+    const { git } = otherRepo();
+    const allowed = await session(git, ["o/other-only"]);
+    const denied = await asAgent(allowed.kube, ["git", "clone", "https://example.test/o/r", join(allowed.kube.root, "nope")]);
+    expect(denied.code).not.toBe(0);
+    expect(denied.stderr).toMatch(/not in the allowed repositories/);
+    const off = await session(git, [], false);
+    const refused = await asAgent(off.kube, ["git", "ls-remote", "https://example.test/o/r"]);
+    expect(refused.code).not.toBe(0);
+  });
+});
+
+describe("the Files panel through the runtime (real node script)", () => {
+  it("reads, writes, lists and refuses paths that leave the workspace", async () => {
+    const { project, runtime } = await openSession();
+    const fs = runtime.registration().fs!;
+    const ask = (path: string, extra: object = {}) => ({ workspaceId: "wks_1", options: { cwd: project, slug: "brave-otter-12", ref: null }, path, ...extra }) as never;
+    const file = join(project, "docs", "note.txt");
+
+    await fs.mkdir(ask(join(project, "docs")));
+    await expect(fs.mkdir(ask(join(project, "docs")))).rejects.toThrow(/^EEXIST/);
+    const written = await fs.write(ask(file, { data: new TextEncoder().encode("hello"), exclusive: true }));
+    expect(written).toMatchObject({ kind: "file", size: 5, mode: 0o644 });
+    await expect(fs.write(ask(file, { data: new TextEncoder().encode("x"), exclusive: true }))).rejects.toThrow(/^EEXIST/);
+    await expect(fs.write(ask(file, { data: new TextEncoder().encode("y"), expectedMtimeMs: written.mtimeMs - 5000 }))).rejects.toThrow(/^ECONFLICT/);
+    const replaced = await fs.write(ask(file, { data: new TextEncoder().encode("hello world"), expectedMtimeMs: written.mtimeMs }));
+    expect(replaced.size).toBe(11);
+    expect(new TextDecoder().decode(await fs.read(ask(file, { offset: 6 })))).toBe("world");
+    expect((await fs.readdir(ask(join(project, "docs")))).map((e) => e.name)).toEqual(["note.txt"]);
+    expect(await fs.stat(ask(join(project, "missing")))).toBeNull();
+    await expect(fs.read(ask(join(project, "missing")))).rejects.toThrow(/^ENOENT/);
+
+    await fs.copy(ask(file, { to: join(project, "docs", "copy.txt") }));
+    await fs.rename(ask(join(project, "docs", "copy.txt"), { to: join(project, "docs", "moved.txt") }));
+    await fs.remove(ask(join(project, "docs"), { recursive: true }));
+    expect(await fs.stat(ask(join(project, "docs")))).toBeNull();
+
+    // confinement: outside paths, relative paths, and a symlink out of the workspace
+    await expect(fs.read(ask("/etc/hostname"))).rejects.toThrow(/^EACCES/);
+    await expect(fs.stat(ask("docs/x"))).rejects.toThrow(/^EINVAL/);
+    symlinkSync("/etc", join(project, "escape"));
+    await expect(fs.readdir(ask(join(project, "escape")))).rejects.toThrow(/^EACCES/);
+    await expect(fs.write(ask(join(project, "escape", "pwn"), { data: new Uint8Array([1]) }))).rejects.toThrow(/^EACCES/);
+    await expect(fs.remove(ask(project, { recursive: true }))).rejects.toThrow(/^EACCES/);
   });
 });
 

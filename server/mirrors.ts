@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { applyPush, type BridgeReply, type PushRequest } from "./bridge.js";
 import { type GitRunner, scrub } from "./git.js";
 import { toHttpsRemote } from "./workspace.js";
 
@@ -18,7 +19,50 @@ export interface FetchTarget {
   daemonUrl: string;
   /** The project's origin: its mirror borrows objects from the pod's checkout. */
   origin: boolean;
+  /** Tried in turn when `daemonUrl` fails (a repository made on demand is first tried over ssh, then https). */
+  fallbackUrls?: string[];
 }
+
+/** What a pod may reach besides the project's own remotes (the "Other repositories" setting). */
+export interface RepoAccess {
+  enabled: boolean;
+  hosts: string[];
+  allow: string[];
+}
+
+const REPO_PART = /^[A-Za-z0-9_.-]+$/;
+
+/** Whether `owner/repo` matches one of the `owner/*` or `owner/repo` patterns (an empty list allows all). */
+export function repoAllowed(ownerRepo: string, allow: readonly string[]): boolean {
+  if (allow.length === 0) return true;
+  const [owner, repo] = ownerRepo.toLowerCase().split("/");
+  return allow.some((pattern) => {
+    const [o, r] = pattern.toLowerCase().split("/");
+    return o === owner && (r === "*" || r === repo);
+  });
+}
+
+/** The target for a repository a pod asked for by name (`x:host/owner/repo`), or why it is refused. */
+export function otherRepoTarget(id: string, access: RepoAccess): FetchTarget | { refused: string } {
+  if (!access.enabled) return { refused: "fetching other repositories from a pod is turned off in the Kubernetes Runtime settings" };
+  const m = /^x:([A-Za-z0-9.-]+)\/([^/]+)\/([^/]+)$/.exec(id);
+  if (!m) return { refused: "malformed repository name" };
+  const [, host, owner, repo] = m as unknown as [string, string, string, string];
+  if (!REPO_PART.test(owner) || !REPO_PART.test(repo) || owner.startsWith(".") || repo.startsWith(".")) return { refused: "malformed repository name" };
+  if (!access.hosts.some((h) => h.toLowerCase() === host.toLowerCase())) return { refused: `${host} is not one of the hosts pods may reach (${access.hosts.join(", ") || "none"})` };
+  if (!repoAllowed(`${owner}/${repo}`, access.allow)) return { refused: `${owner}/${repo} is not in the allowed repositories` };
+  return {
+    id,
+    podUrls: [],
+    // the daemon's ssh key first (it is the one that reaches a user's own repositories), then its https credentials
+    daemonUrl: `git@${host}:${owner}/${repo}.git`,
+    fallbackUrls: [`https://${host}/${owner}/${repo}.git`],
+    origin: false,
+  };
+}
+
+/** The URL that worked last for a target, so the next fetch and a push use it directly. */
+const workingUrls = new Map<string, string>();
 
 const MAX_PACK_BYTES = 64 * 1024 * 1024;
 const SHA = /^[0-9a-f]{40}$/;
@@ -83,8 +127,17 @@ export async function fetchTargets(
 export const MIRROR_SETUP_SCRIPT = `set -e
 mkdir -p "$HOME/mirrors"
 git config --global protocol.file.allow always
+git config --global push.autoSetupRemote true
 git config --global remote.origin.uploadpack "$HOME/bin/paseo-upload-pack"
-cwd="$1"; shift
+cwd="$1"; name="$2"; email="$3"; hosts="$4"; shift 4
+# every URL of an allowed host goes through git-remote-paseo, which serves a mirror of that repository; the longer
+# rules for the project's own remotes below win over these
+for h in $hosts; do
+  git config --global --unset-all "url.paseo://$h/.insteadOf" || true
+  for prefix in "https://$h/" "git@$h:" "ssh://git@$h/"; do git config --global --add "url.paseo://$h/.insteadOf" "$prefix"; done
+done
+git config --global user.name "$name"
+git config --global user.email "$email"
 while [ $# -gt 0 ]; do
   id="$1"; origin="$2"; shift 2
   urls=""
@@ -102,8 +155,13 @@ done
 `;
 
 /** Arguments of `MIRROR_SETUP_SCRIPT` after `sh -c <script> sh`. */
-export function mirrorSetupArgs(cwd: string, targets: readonly FetchTarget[]): string[] {
-  return [cwd, ...targets.flatMap((t) => [t.id, t.origin ? "1" : "0", ...t.podUrls, "--"])];
+export function mirrorSetupArgs(
+  cwd: string,
+  identity: { name: string; email: string },
+  targets: readonly FetchTarget[],
+  hosts: readonly string[] = [],
+): string[] {
+  return [cwd, identity.name, identity.email, hosts.join(" "), ...targets.flatMap((t) => [t.id, t.origin ? "1" : "0", ...t.podUrls, "--"])];
 }
 
 export type FetchRequest = { op: "fetch"; mirror: string; haves: string[] };
@@ -118,10 +176,10 @@ export interface FetchReply {
 }
 
 /** The daemon-side cache a target is fetched into (a bare repository next to the project's git dir). */
-async function cacheDir(git: GitRunner, cwd: string, target: FetchTarget): Promise<string> {
+export async function cacheDir(git: GitRunner, cwd: string, target: FetchTarget): Promise<string> {
   const common = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd });
   if (common.code !== 0) throw new Error(`not a git checkout: ${scrub(common.stderr.trim())}`);
-  const dir = join(common.stdout.trim(), "kube-mirrors", `${target.id}.git`);
+  const dir = join(common.stdout.trim(), "kube-mirrors", `${target.id.startsWith("x:") ? `x-${mirrorId(target.id)}` : target.id}.git`);
   const exists = await git(["rev-parse", "--git-dir"], { cwd: dir }).then((r) => r.code === 0, () => false);
   if (!exists) {
     await mkdir(dir, { recursive: true });
@@ -151,14 +209,26 @@ export async function applyFetch(
   if (!Array.isArray(request.haves) || !request.haves.every((h) => SHA.test(h))) return { ok: false, message: "kube-agents: malformed fetch request" };
   const dir = await cacheDir(git, cwd, target);
 
-  const fetched = await git(
-    ["fetch", "--prune", "--force", "--no-tags", target.daemonUrl, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"],
-    { cwd: dir },
-  );
-  if (fetched.code !== 0) {
-    return { ok: false, message: `kube-agents: fetch from ${scrub(target.daemonUrl)} failed on the daemon:\n${scrub(fetched.stderr.trim())}` };
+  const candidates = [workingUrls.get(target.id), target.daemonUrl, ...(target.fallbackUrls ?? [])].filter((u, i, all): u is string => !!u && all.indexOf(u) === i);
+  let url = candidates[0]!;
+  let fetched = { code: 1, stdout: "", stderr: "" };
+  const failures: string[] = [];
+  for (const candidate of candidates) {
+    fetched = await git(
+      ["fetch", "--prune", "--force", "--no-tags", candidate, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"],
+      { cwd: dir },
+    );
+    if (fetched.code === 0) {
+      url = candidate;
+      workingUrls.set(target.id, candidate);
+      break;
+    }
+    failures.push(`${scrub(candidate)}: ${scrub(fetched.stderr.trim())}`);
   }
-  const symref = await git(["ls-remote", "--symref", target.daemonUrl, "HEAD"], { cwd: dir });
+  if (fetched.code !== 0) {
+    return { ok: false, message: `kube-agents: fetch failed on the daemon:\n${failures.join("\n")}` };
+  }
+  const symref = await git(["ls-remote", "--symref", url, "HEAD"], { cwd: dir });
   const head = /^ref: (refs\/heads\/\S+)\s+HEAD/m.exec(symref.stdout)?.[1];
   const listed = await git(["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags"], { cwd: dir });
   if (listed.code !== 0) return { ok: false, message: `kube-agents: ${scrub(listed.stderr.trim())}` };
@@ -185,4 +255,17 @@ export async function applyFetch(
     if (pack.length > MAX_PACK_BYTES * 1.4) return { ok: false, message: "kube-agents: the fetch is too large to relay through the cluster API (over 64MB)" };
   }
   return { ok: true, refs, ...(head ? { head } : {}), ...(pack ? { pack } : {}) };
+}
+
+/** A pod's push to a submodule's mirror: applied in the daemon's cache of that remote and pushed from there. */
+export async function pushToMirror(
+  git: GitRunner,
+  cwd: string,
+  request: PushRequest,
+  targets: readonly FetchTarget[],
+): Promise<BridgeReply> {
+  const target = targets.find((t) => t.id === request.mirror);
+  if (!target) return { ok: false, message: "kube-agents: this remote is not part of the project (only its origin and submodules can be pushed to from a pod)" };
+  const dir = await cacheDir(git, cwd, target);
+  return applyPush(git, cwd, request, { dir, remote: workingUrls.get(target.id) ?? target.daemonUrl });
 }

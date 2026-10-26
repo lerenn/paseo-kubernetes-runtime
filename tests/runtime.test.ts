@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { KubernetesRuntime } from "../server/runtime.js";
+import { KubernetesRuntime, liveProviderChildren } from "../server/runtime.js";
 import { PodRegistry } from "../server/registry.js";
 import type { WorkspaceRuntimeRegistration } from "../server/runtime-types.js";
 import { ConfigSchema } from "../shared/settings.js";
@@ -25,6 +25,7 @@ function setup(settings: object = {}, extra: object = {}, kube = new FakeKube())
     now: () => clock++, // every read moves the clock a little, so a pod that never becomes ready times out
     ticker: () => () => undefined,
     log: () => undefined,
+    workspaceBusy: async () => false,
     ...extra,
   });
   const reg: WorkspaceRuntimeRegistration = runtime.registration();
@@ -167,6 +168,16 @@ describe("exec: real provider processes in the pod", () => {
     expect(await c.exit).toMatchObject({ reason: "runtime-lost", message: expect.stringContaining("next message brings it back") });
   });
 
+  it("reports a process that ended because the plugin suspended the idle workspace as a planned stop", async () => {
+    const t = setup({ podIdleMinutes: 30 });
+    const p = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.advance(31 * MIN);
+    await t.tick(); // suspends: the phase changes before the pod goes
+    t.kube.pods = [{ uid: "x", ready: false, terminating: true }];
+    t.kube.procs[0]!.end(137);
+    expect(await p.exit).toMatchObject({ reason: "suspended", message: expect.stringContaining("idle pod was suspended") });
+  });
+
   it("stops the process when Paseo aborts the launch or signals it", async () => {
     const t = setup();
     const abort = new AbortController();
@@ -174,6 +185,198 @@ describe("exec: real provider processes in the pod", () => {
     await proc.signal("SIGINT");
     abort.abort();
     expect(t.kube.procs[0]!.killed).toEqual(["SIGINT", "SIGTERM"]);
+  });
+});
+
+describe("inherited runtimes and command execs", () => {
+  it("a workspace that inherited the caller's runtime options uses its own directory and no branch choice", async () => {
+    const seen: { cwd: string; plan: unknown }[] = [];
+    const t = setup({}, { seeder: async (cwd: string, plan: unknown) => (seen.push({ cwd, plan }), fakeSeeder(cwd, plan as never, "main")) });
+    const inherited = { cwd: CWD, slug: "caller-slug", ref: { action: "branch-off", refName: "refs/heads/main" }, title: "caller" };
+    await t.reg.create!({ workspaceId: "wks_new", options: inherited, cwd: "/home/me/.paseo/worktrees/x/feature" } as never, t.ctx);
+    await t.reg.prepare!({ workspaceId: "wks_new", options: inherited, purpose: "session", argv: ["claude"], env: { PASEO_AGENT_ID: "a1" }, mcpServers: {} } as never, t.ctx);
+    expect(seen).toEqual([{ cwd: "/home/me/.paseo/worktrees/x/feature", plan: null }]);
+    expect((t.kube.applied[0] as any).metadata.annotations["paseo.sh/cwd"]).toBe("/home/me/.paseo/worktrees/x/feature");
+  });
+
+  it("a workspace created with just the runtime id (no options) uses its own directory", async () => {
+    const seen: string[] = [];
+    const t = setup({}, { seeder: async (cwd: string) => (seen.push(cwd), fakeSeeder(cwd, null, "main")) });
+    await t.reg.create!({ workspaceId: "wks_bare", cwd: "/home/me/other" } as never, t.ctx);
+    await t.reg.prepare!({ workspaceId: "wks_bare", workspaceCwd: "/home/me/other", purpose: "session", argv: ["claude"], env: {}, mcpServers: {} } as never, t.ctx);
+    expect(seen).toEqual(["/home/me/other"]);
+  });
+
+  it("runs Git-style commands without a prepare, never installs a CLI for them, and does not wake a suspended pod for a background refresh", async () => {
+    const t = setup({ podIdleMinutes: 30 });
+    const exec = (over: object) => t.reg.exec!({ ...t.base, purpose: "command", argv: ["git", "status"], env: {}, ...over } as never, t.ctx);
+    await expect(exec({ interactive: false })).rejects.toThrow(/background refreshes do not wake it/);
+    const proc = await exec({ interactive: true });
+    expect(proc).toBeTruthy();
+    expect(t.kube.applied).toHaveLength(1); // an interactive command started the pod
+    expect(t.kube.execs.some((e) => e.argv.join(" ").includes('command -v "$1"'))).toBe(false); // git is not a provider CLI
+    t.advance(31 * MIN);
+    await t.tick();
+    await expect(exec({ interactive: false })).rejects.toThrow(/background refreshes/);
+  });
+});
+
+describe("idle suspension asks Paseo before ending a pod", () => {
+  it("does not suspend while Paseo says an agent is running in the workspace (a turn the plugin never saw start)", async () => {
+    let busy: boolean | null = true;
+    const t = setup({ podIdleMinutes: 30 }, { workspaceBusy: async () => busy });
+    await t.prepare();
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running"); // an agent is running: left alone, and the idle clock restarts
+    busy = null;
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running"); // unknown counts as busy
+    busy = false;
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+});
+
+describe("idle suspension and background work inside an agent's process", () => {
+  const idleTree = [
+    "    1     0 Ss   sleep infinity",
+    " 6433     0 Ssl  claude --output-format stream-json --verbose",
+    " 6345     0 Ssl  node /workspace/.home/bridge.mjs serve 47821",
+    "  974     1 Z    [esbuild] <defunct>",
+  ].join("\n");
+
+  it("sees a live child of the provider process as background work, and zombies and the bridge as nothing", () => {
+    expect(liveProviderChildren(idleTree)).toBe(false);
+    expect(liveProviderChildren(`${idleTree}\n15452  6433 Ss   /bin/bash -c sleep 240\n15483 15452 S    sleep 240`)).toBe(true);
+    expect(liveProviderChildren(`${idleTree}\n15452  6433 Z    [bash] <defunct>`)).toBe(false);
+    expect(liveProviderChildren("    1     0 Ss   sleep infinity\n 2 1 S unrelated")).toBe(false); // no provider process at all
+  });
+
+  it("does not suspend a workspace whose idle agent still has a background command running", async () => {
+    const t = setup({ podIdleMinutes: 30 });
+    await t.prepare();
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json\n15483  6433 S    sleep 240", stderr: "" };
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running");
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json", stderr: "" };
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+});
+
+describe("submodules do not hold the agent back", () => {
+  it("returns from prepare while the submodule checkout is still running, then reports it", async () => {
+    const t = setup();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const exec = t.kube.exec.bind(t.kube);
+    t.kube.exec = async (pod: string, argv: string[]) => {
+      if (argv.includes("submodule") && argv.includes("update")) await gate; // a slow checkout
+      if (argv[2]?.includes("submodule status")) return { code: 0, stdout: "-abc123 vendor/lib\n", stderr: "" };
+      return exec(pod, argv);
+    };
+    await t.prepare(); // does not wait for the gate
+    expect(t.notices.map((n) => n[0])).toContain("Fetching the submodules in the background...");
+    expect(t.notices.map((n) => n[0])).not.toContain("Submodules are ready.");
+    release();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(t.notices.map((n) => n[0])).toContain("Submodules are ready.");
+  });
+});
+
+describe("describeWorkspace for the sidebar badge", () => {
+  it("answers without touching the cluster: no pod yet, then image/pod/state, following suspension", async () => {
+    const t = setup({ image: "ghcr.io/lerenn/paseo-kubernetes-runtime-default@sha256:f4aedb1145658527f3e43dd1ae6d95a917b39e94799491eae6f9c400ccd8e3b5", podIdleMinutes: 30 });
+    const describe = () => t.reg.describeWorkspace!({ ...t.base } as never);
+    expect(await describe()).toMatchObject({ label: "no pod yet" });
+    await t.prepare();
+    const calls = t.kube.calls.length;
+    const running = await describe();
+    expect(t.kube.calls).toHaveLength(calls); // nothing read or started
+    expect(running).toMatchObject({ label: "paseo-kubernetes-runtime-default" });
+    expect(running!.tooltip).toContain("State: running");
+    expect(running!.tooltip).toMatch(/Pod pka-/);
+    expect(running!.tooltip).toContain("Image: ghcr.io/lerenn/paseo-kubernetes-runtime-default@sha256:f4aedb11");
+    expect(running!.detail).toMatch(/^paseo-kubernetes-runtime-default · pka-.* · running$/);
+    t.advance(31 * MIN);
+    await t.tick();
+    expect((await describe())!.detail).toMatch(/· suspended$/);
+    expect(t.notices.map((n) => n[0])).toContain("The pod is suspended."); // makes Paseo ask again
+  });
+});
+
+describe("the pod actions of the screen", () => {
+  async function running(extra: object = {}) {
+    const archived: string[] = [];
+    const t = setup({ podIdleMinutes: 30 }, { workspaceBusy: async () => false, archiveWorkspace: async (id: string) => void archived.push(id), ...extra });
+    await t.prepare();
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json", stderr: "" }; // no background work
+    return { t, archived };
+  }
+
+  it("suspends a quiet pod and resumes it", async () => {
+    const { t } = await running();
+    expect(await t.runtime.podAction("wks_1", "suspend")).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+    expect(await t.runtime.podAction("wks_1", "resume")).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("running");
+    expect(await t.runtime.podAction("wks_1", "resume")).toMatchObject({ ok: true, message: expect.stringContaining("already") });
+  });
+
+  it("refuses to touch a pod with a running agent or background work unless forced, and says why", async () => {
+    let busy: boolean | null = true;
+    const { t } = await running({ workspaceBusy: async () => busy });
+    expect(await t.runtime.podAction("wks_1", "suspend")).toMatchObject({ ok: false, busy: expect.stringContaining("agent is running") });
+    expect(await t.runtime.podAction("wks_1", "delete")).toMatchObject({ ok: false, busy: expect.stringContaining("agent is running") });
+    busy = null;
+    expect(await t.runtime.podAction("wks_1", "restart")).toMatchObject({ ok: false, busy: expect.stringContaining("could not say") });
+    busy = false;
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json\n15483  6433 S    sleep 240", stderr: "" };
+    expect(await t.runtime.podAction("wks_1", "suspend")).toMatchObject({ ok: false, busy: expect.stringContaining("background command") });
+    expect(t.registry.list()[0]!.state).toBe("running");
+    expect(await t.runtime.podAction("wks_1", "suspend", { force: true })).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+
+  it("restarts a quiet pod (suspend then resume on the same volume)", async () => {
+    const { t } = await running();
+    expect(await t.runtime.podAction("wks_1", "restart")).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("running");
+    const modes = t.kube.patches2.map((p) => p.patch.spec?.operatingMode).filter(Boolean);
+    expect(modes).toEqual(["Suspended", "Running"]);
+  });
+
+  it("deletes the Sandbox and volume, optionally archiving the workspace", async () => {
+    const { t, archived } = await running();
+    expect(await t.runtime.podAction("wks_1", "delete", { archive: true })).toEqual({ ok: true });
+    expect(t.kube.calls.filter((c) => c.startsWith("delete:"))).toEqual([expect.stringMatching(/^delete:sandbox\/pka-/), expect.stringMatching(/^delete:pvc\/workspace-pka-/)]);
+    expect(archived).toEqual(["wks_1"]);
+    expect(await t.runtime.podAction("wks_1", "suspend")).toMatchObject({ ok: false, message: expect.stringContaining("no pod") });
+  });
+});
+
+describe("the tunnels survive a plugin restart", () => {
+  it("restarts the bridge of a running pod when the plugin starts, with the ports its processes still use", async () => {
+    const t = setup();
+    t.kube.sandboxes = [{ name: "pka-running", labels: { "paseo.sh/daemon": "srv_ME", "paseo.sh/workspace-id": "wks_1" }, annotations: { "paseo.sh/cwd": CWD }, operatingMode: "Running" as const, createdAt: new Date(0).toISOString() }];
+    t.kube.execResult = { code: 0, stdout: "8123\n9000\nnot-a-port\n", stderr: "" };
+    await t.runtime.start();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(t.kube.streams).toHaveLength(1);
+    expect(t.kube.streams[0]!.argv.at(-1)).toBe("8123,9000");
+  });
+
+  it("does not start a bridge for a suspended pod", async () => {
+    const t = setup();
+    t.kube.sandboxes = [{ name: "pka-s", labels: { "paseo.sh/daemon": "srv_ME", "paseo.sh/workspace-id": "wks_1" }, annotations: { "paseo.sh/cwd": CWD }, operatingMode: "Suspended" as const, createdAt: new Date(0).toISOString() }];
+    await t.runtime.start();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(t.kube.streams).toHaveLength(0);
   });
 });
 
@@ -200,6 +403,35 @@ describe("the 30 second limit on prepare", () => {
     const t = setup({ readyTimeoutSeconds: 1 });
     t.kube.pods = [{ uid: "u", ready: false, terminating: false, problem: "Pod cannot be scheduled: no capacity" }];
     await expect(t.prepare()).rejects.toThrow(/could not start the pod/);
+  });
+});
+
+describe("workspaceCwd, reconcile with the workspace list, and checkCommand", () => {
+  it("takes the workspace directory from workspaceCwd on any call, not from the (possibly inherited) options", async () => {
+    const t = setup();
+    const inherited = { cwd: "/caller/dir", slug: "caller", ref: null };
+    await t.reg.prepare!({ workspaceId: "wks_i", options: inherited, workspaceCwd: "/home/me/.paseo/worktrees/x/own", purpose: "session", argv: ["claude"], env: {}, mcpServers: {} } as never, t.ctx);
+    expect((t.kube.applied[0] as any).metadata.annotations["paseo.sh/cwd"]).toBe("/home/me/.paseo/worktrees/x/own");
+  });
+
+  it("reconcile deletes the Sandbox of a workspace the list no longer has, keeps listed and young ones", async () => {
+    const t = setup();
+    const old = new Date(0).toISOString(); // the test clock starts at 1,000,000 ms
+    const sb = (name: string, id: string, createdAt: string) => ({ name, labels: { "paseo.sh/daemon": "srv_ME", "paseo.sh/workspace-id": id }, annotations: { "paseo.sh/cwd": CWD }, operatingMode: "Running" as const, createdAt });
+    t.kube.sandboxes = [sb("gone", "wks_gone", old), sb("kept", "wks_kept", old), sb("young", "wks_young", new Date(999_000).toISOString())];
+    await t.reg.reconcile!({ workspaces: [{ workspaceId: "wks_kept", options: t.options, cwd: CWD }] }, t.ctx);
+    expect(t.kube.calls.filter((c) => c.startsWith("delete:sandbox"))).toEqual(["delete:sandbox/gone"]);
+  });
+
+  it("checkCommand: claude and codex are installed on demand; other commands are looked up in a running pod", async () => {
+    const t = setup();
+    const ask = (command: string) => t.reg.checkCommand!({ ...t.base, command } as never);
+    expect(await ask("claude")).toBe(true);
+    expect(await ask("/usr/local/bin/codex")).toBe(true);
+    expect(await ask("some-mcp")).toBe(true); // no pod yet: nothing to ask
+    await t.prepare();
+    t.kube.execResult = { code: 1, stdout: "", stderr: "" };
+    expect(await ask("some-mcp")).toBe(false);
   });
 });
 
@@ -324,7 +556,7 @@ describe("suspend, resume and destroy", () => {
     await t.prepare();
     const installs = () => t.kube.inputs.filter((i) => i.argv[4] === "bridge.mjs").length;
     expect(installs()).toBe(1);
-    await t.reg.reconcile!(t.ctx);
+    await t.reg.reconcile!({ workspaces: [{ workspaceId: "wks_1", options: t.options, cwd: CWD }] }, t.ctx);
     t.kube.pods = [{ uid: "replacement", ready: true, terminating: false }];
     await t.prepare();
     expect(installs()).toBe(2);

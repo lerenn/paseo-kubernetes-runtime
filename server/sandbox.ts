@@ -62,9 +62,15 @@ export function metaAnnotations(meta: PodMeta): Record<string, string> {
   return dropUndefined({ [WORKSPACE_NAME_ANNOTATION]: meta.workspaceName, [REPO_URL_ANNOTATION]: meta.repoUrl?.replace(/\/\/[^/@]*@/, "//") });
 }
 
-/** Merge patch that brings a Sandbox's labels and annotations up to date (the pod and claim are labelled separately). */
+/**
+ * Merge patch that brings a Sandbox's labels and annotations up to date. The pod template carries them too: the
+ * controller copies its labels onto the running pod (without restarting it) and would undo a label set on the pod
+ * alone. The volume claim is labelled separately.
+ */
 export function metaPatch(meta: PodMeta): Record<string, unknown> {
-  return { metadata: { labels: metaLabels(meta), annotations: metaAnnotations(meta) } };
+  const labels = metaLabels(meta);
+  const annotations = metaAnnotations(meta);
+  return { metadata: { labels, annotations }, spec: { podTemplate: { metadata: { labels, annotations } } } };
 }
 
 const slugify = (text: string, max: number) =>
