@@ -45,6 +45,7 @@ export default function contribute(server: PluginServerContext) {
   };
   const runtime = new KubernetesRuntime({ getConfig, kubeFor, daemonId, registry, agentsBusy: (workspaceId) => workspaceAgentsBusy(paseoApi, workspaceId),
     recoveryStateFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "interruptions.json"),
+    oomStateFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "oom.json"),
     // `skip` is the fork's (not in the published SDK's types); a host without it is handled in sendUnlessBusy
     messenger: {
       async send(agentId, text, behavior) {
@@ -120,7 +121,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(kubeStatus, async () => {
     const config = await getConfig();
     const [titles, agents] = await Promise.all([paseoWorkspaces(), paseoAgents()]);
-    const pods = await readPodRows(kubeFor(config), daemonId, registry.list(), titles, agents);
+    const pods = await readPodRows(kubeFor(config), daemonId, registry.list(), titles, agents, runtime.oomStats());
     return { reaper: reaper.current(), pods };
   });
   server.handle(kubePodAction, ({ workspaceId, action, force, archive }) => runtime.podAction(workspaceId, action, { force, archive }));

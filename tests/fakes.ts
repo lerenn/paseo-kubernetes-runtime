@@ -89,6 +89,10 @@ export class FakeKube implements Kube {
   async label(kind: string, name: string, labels: Record<string, string>, annotations: Record<string, string> = {}) {
     this.labelled.push({ kind, name, labels, annotations });
   }
+  annotated: { name: string; set: Record<string, string>; remove: string[] }[] = [];
+  async annotatePod(name: string, set: Record<string, string>, remove: string[] = []) {
+    this.annotated.push({ name, set, remove });
+  }
   async patchSandbox(name: string, patch: Record<string, unknown>) {
     this.calls.push(`patch:${name}`);
     this.patches2.push({ name, patch });

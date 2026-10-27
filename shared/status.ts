@@ -17,6 +17,8 @@ export const PodRowSchema = z.object({
   /** Short image name and digest, e.g. paseo-kubernetes-runtime-default@f4aedb114565. */
   image: z.string().optional(),
   size: z.string().optional(),
+  /** Out-of-memory kills of this workspace's pod processes. */
+  oom: z.object({ count: z.number(), lastAt: z.string(), limit: z.string().optional(), peakMi: z.number().optional() }).optional(),
   agents: z.array(z.object({ id: z.string(), title: z.string(), status: z.string() })),
 });
 export type PodRow = z.infer<typeof PodRowSchema>;
