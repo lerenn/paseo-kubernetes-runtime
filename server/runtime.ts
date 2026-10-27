@@ -30,6 +30,7 @@ import {
   type Verdict,
 } from "./autoarchive.js";
 import type { AutoArchiveStatus } from "../shared/status.js";
+import { PINNED_TEXT } from "../shared/pods-view.js";
 import { WARM_PREFIX, shortImage } from "./status.js";
 import { PodRegistry, type PodState } from "./registry.js";
 import type {
@@ -916,7 +917,7 @@ export class KubernetesRuntime {
   /** The pods-table badge of a workspace. */
   autoArchiveBadge(workspaceId: string): { autoArchive: "scheduled" | "blocked" | "kept"; autoArchiveText: string } | undefined {
     const ws = this.states.get(workspaceId);
-    if (ws?.keep) return { autoArchive: "kept", autoArchiveText: "kept: never auto-archived" };
+    if (ws?.keep) return { autoArchive: "kept", autoArchiveText: PINNED_TEXT };
     const scheduled = this.archiveSummary.scheduled.find((e) => e.workspaceId === workspaceId);
     if (scheduled) return { autoArchive: "scheduled", autoArchiveText: `archive ${new Date(scheduled.archiveAt).toISOString().slice(0, 16).replace("T", " ")}Z` };
     const blocked = this.archiveSummary.blocked.find((e) => e.workspaceId === workspaceId);
@@ -1066,7 +1067,7 @@ export class KubernetesRuntime {
       ws.activityAt ??= this.now(); // a workspace from before the clock was kept: it starts now
       await this.persistActivity(kube, ws);
       if (ws.keep) {
-        next.kept.set(ws.id, "kept: never auto-archived");
+        next.kept.set(ws.id, PINNED_TEXT);
         ws.archiveAt = undefined;
         continue;
       }

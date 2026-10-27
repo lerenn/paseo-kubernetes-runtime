@@ -13,6 +13,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Linking, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { CREDENTIAL_KEYS, type CredentialKey, credentialsRemove, credentialsSet, credentialsStatus } from "../shared/credentials.js";
 import { type KubernetesRuntimeConfig, kubeSettings } from "../shared/settings.js";
+import { AutoArchiveSection } from "./auto-archive.js";
 import { PodsTable } from "./pods-table.js";
 
 /** Optional host components; older apps may not provide them, so never render an undefined element. */
@@ -367,6 +368,39 @@ export function KubernetesRuntimeScreen({ theme, layout, navigation }: PluginScr
                 }}
               />
               <SettingsSwitch
+                label="Auto-archive idle workspaces"
+                hint="Warns, then archives workspaces idle for the days below, only when nothing in the pod is unpushed. Details in the Auto-archive section."
+                value={draft.autoArchive.enabled}
+                onValueChange={(enabled) => setDraft({ ...draft, autoArchive: { ...draft.autoArchive, enabled } })}
+              />
+              {draft.autoArchive.enabled ? (
+                <>
+                  <SettingsSwitch
+                    label="Auto-archive dry run"
+                    hint="Warn and log what would be archived, but archive nothing. Turn off once the log looks right."
+                    value={draft.autoArchive.dryRun}
+                    onValueChange={(dryRun) => setDraft({ ...draft, autoArchive: { ...draft.autoArchive, dryRun } })}
+                  />
+                  <SettingsInput
+                    label="Archive after idle days"
+                    hint="Must be longer than the pod idle suspension. 0 = never."
+                    initialValue={String(draft.autoArchive.idleDays)}
+                    onChangeText={(t) => {
+                      const n = Number(t);
+                      if (Number.isFinite(n) && n >= 0) setDraft({ ...draft, autoArchive: { ...draft.autoArchive, idleDays: n } });
+                    }}
+                  />
+                  <SettingsInput
+                    label="Warn this many hours before"
+                    initialValue={String(draft.autoArchive.warnHours)}
+                    onChangeText={(t) => {
+                      const n = Number(t);
+                      if (Number.isFinite(n) && n >= 0) setDraft({ ...draft, autoArchive: { ...draft.autoArchive, warnHours: n } });
+                    }}
+                  />
+                </>
+              ) : null}
+              <SettingsSwitch
                 label="Warm pool"
                 hint="Keeps pods running ahead of workspaces so a new one starts in seconds. Each idle pod costs its CPU/memory request and a volume."
                 value={draft.warmPool.enabled}
@@ -420,6 +454,8 @@ export function KubernetesRuntimeScreen({ theme, layout, navigation }: PluginScr
       </SettingsSection>
 
       <PodsTable theme={theme} layout={layout} navigation={navigation} />
+
+      <AutoArchiveSection theme={theme} />
 
       <CredentialsSection theme={theme} />
 

@@ -191,6 +191,34 @@ and list daemon directories to copy into the volume once:
 - Making such a workspace: create a Pod workspace on the project that holds the code (for prbr-picky, a dedicated clone of anyshift-io/pr-blast-reviewer; set `PRBR_SUBMODULE` to its path in the pod, not the daemon's shared monorepo submodule) with the
   runtime options `{ "cwd": "<the daemon's checkout>", "profile": "prbr-picky" }`; the data appears next to the checkout at `/workspace/prbr-picky`.
 
+## Auto-archive (dry run by default)
+
+A workspace nobody has used for `idleDays` (default 2) is archived, after a warning, and the reaper then removes its pod and volume. The setting is `autoArchive` in the plugin settings:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Turn the whole thing off. |
+| `dryRun` | `true` | Warn and log what would be archived, archive nothing. Turn it off after the first week, once the log looks right. |
+| `idleDays` | `2` | Days since the last activity. `0` = never. Must be longer than `podIdleMinutes`. |
+| `warnHours` | `12` | The warning (a notice in the workspace, "archives in Xh unless activity" in its tooltip) comes this long before the archive. Any input clears it. |
+| `exemptLabels` | `["paseo.keep=1"]` | A workspace with an agent carrying one of these labels is never archived. |
+| `maxPerRun` | `3` | At most this many per run (every minute). |
+| `ephemeral` | `{ label: "paseo.ephemeral=1", idleHours: 6 }` | Throwaway workspaces are archived after `idleHours`. |
+| `maxAgeDays` | unset | A ceiling on a workspace's age, whatever its activity. It still skips workspaces that are dirty or unpushed. |
+| `podQuota` | unset | The namespace's pod limit. A suspended workspace without a stored check is resumed briefly to take one only while fewer than `podQuota - 2` pods run. |
+
+The idle clock is the last activity (input, a turn, an agent at work), kept on the Sandbox (`paseo.sh/last-activity`, written at most every 10 minutes and at suspend) so a plugin restart does not reset it.
+
+**Nothing is archived unless every check passes.** A workspace that fails one is never archived and is listed in the Auto-archive section of the Kubernetes Runtime screen with the reason and how long it has been idle:
+
+- an in-pod git probe, after a `git fetch --prune`: no uncommitted or untracked files, no stash, no local branch or HEAD commit that is on no remote, no rebase or merge in progress, nothing in `outbox.git` or the mirrors that is not on a remote, and the same for every initialised submodule. A probe that cannot run counts as a finding. (A branch whose PR was squash-merged and whose remote branch was deleted still has commits that are on no remote, so it blocks: delete the local branch, or press Keep.)
+- no `profile.seed` data (a profile with seeds, or a `/workspace/.seeded` marker on the volume);
+- no open turn, no pending permission, no background work in the pod, and Paseo able to say so (an unreadable answer counts as busy);
+- a suspended workspace is judged by the probe run as it was suspended (stored on the Sandbox, cleared by a resume). One suspended before this existed is resumed briefly to take it, one at a time;
+- a final re-check under the workspace's queue right before the archive.
+
+The archive is `paseo workspace archive <id>`, with `--reason "auto-archived: idle Nd" --if-idle` when the `paseo` CLI supports them (the fork's change; detected from `--help`), so the daemon itself refuses if an agent has an open turn by then. Each decision is logged and the last 100 are kept in `plugin-data/kubernetes-runtime/auto-archive.json`. To keep a workspace, press Keep (Pods table or the Auto-archive section; it is a `paseo.sh/keep` annotation) or give its agent the label `paseo.keep=1`.
+
 ## Cluster requirements
 
 See [docs/rbac-and-network.md](docs/rbac-and-network.md): Role for the daemon ServiceAccount, the credentials Secret,

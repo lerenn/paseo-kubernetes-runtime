@@ -8,6 +8,18 @@ export function ago(iso: string): string {
   return hours < 48 ? `${hours} h ago` : `${Math.round(hours / 24)} d ago`;
 }
 
+/** "in 5 h" / "in 20 min" / "now" for a time ahead. */
+export function until(iso: string, now = Date.now()): string {
+  const minutes = Math.round((Date.parse(iso) - now) / 60_000);
+  if (minutes <= 0) return "now";
+  if (minutes < 60) return `in ${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `in ${hours} h` : `in ${Math.round(hours / 24)} d`;
+}
+
+/** The text of the pinned-by-Keep badge: the Keep button toggles it. */
+export const PINNED_TEXT = "kept: never auto-archived";
+
 export function reaperLine(r: { lastRunAt?: string; removed: number; error?: string; unlabelled: string[] }): string {
   if (r.error && !r.lastRunAt) return `Orphan cleanup: ${r.error}`;
   if (!r.lastRunAt) return "Orphan cleanup: not run yet";
