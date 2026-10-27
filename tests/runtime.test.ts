@@ -797,6 +797,33 @@ describe("the bridge is kept alive", () => {
     expect(t.kube.execs.some((e) => e.argv.join(" ").includes("rm -f") && e.argv.join(" ").includes("bridge.sock"))).toBe(true);
   });
 
+  it("probes an open channel and restores the bridge when it does not answer", async () => {
+    const { t, logs } = await started();
+    const probes = () => t.kube.execs.filter((e) => e.argv[0] === "node" && e.argv[1] === "-e").length;
+    t.runtime.checkBridges();
+    await settle();
+    expect(probes()).toBe(1);
+    expect(t.kube.streams).toHaveLength(1); // answers (exit 0): left alone
+    t.runtime.checkBridges();
+    await settle();
+    expect(probes()).toBe(1); // rate limited
+    t.advance(60_000);
+    t.kube.execResult = { code: 7, stdout: "", stderr: "" }; // connection refused: serve is gone
+    t.runtime.checkBridges();
+    await settle();
+    expect(probes()).toBe(2);
+    expect(t.kube.streams).toHaveLength(2);
+    expect(logs.some((l) => l.includes("does not answer"))).toBe(true);
+  });
+
+  it("leaves the bridge alone when the probe itself cannot run", async () => {
+    const { t } = await started();
+    t.kube.execResult = { code: 1, stdout: "", stderr: "exec failed" };
+    t.runtime.checkBridges();
+    await settle();
+    expect(t.kube.streams).toHaveLength(1);
+  });
+
   it("does not restore for a suspended workspace", async () => {
     const { t } = await started();
     const ws = (t.runtime as any).states.get("wks_1");

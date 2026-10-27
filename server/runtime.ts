@@ -183,6 +183,9 @@ interface WorkspaceState {
   docker?: boolean;
   /** The submodule checkout running in the background, if any. */
   submodulesJob?: Promise<void>;
+  /** When the bridge was last probed in the pod, and whether a probe is in flight. */
+  lastProbe?: number;
+  probing?: boolean;
   /** A bridge reconnect loop is running for this workspace. */
   reviving?: boolean;
   /** The bridge stayed down after its retries (a notice was shown); the liveness check keeps trying. */
@@ -411,14 +414,39 @@ export class KubernetesRuntime {
     }
   }
 
-  /** Liveness: a running workspace without an open bridge channel gets it restored (the channel end handler may have given up). */
+  /** Whether `bridge.mjs serve` answers on its socket in the pod; null when the probe itself could not run (an exec error says nothing about the bridge). */
+  private async probeBridge(kube: Kube, pod: string): Promise<boolean | null> {
+    const script = 'const s=require("net").connect(process.env.HOME+"/bridge.sock");const t=setTimeout(()=>process.exit(8),2000);s.on("connect",()=>{clearTimeout(t);s.end();process.exit(0)});s.on("error",()=>process.exit(7))';
+    const r = await kube.exec(pod, ["node", "-e", script]).catch(() => null);
+    if (!r) return null;
+    if (r.code === 0) return true;
+    return r.code === 7 || r.code === 8 ? false : null;
+  }
+
+  /** Liveness: a running workspace gets its bridge restored when the channel is gone, or when it looks open but the bridge in the pod does not answer (probed at most once a minute). */
   checkBridges(): void {
     if (this.stopped) return;
     for (const ws of this.states.values()) {
-      if (ws.phase !== "running" || !ws.sandbox || ws.bridge || ws.reviving) continue;
+      if (ws.phase !== "running" || !ws.sandbox || ws.reviving || ws.probing) continue;
+      const pod = ws.sandbox;
       void (async () => {
         const kube = this.deps.kubeFor(await this.deps.getConfig());
-        await this.reviveBridge(kube, ws, "a liveness check found it down");
+        if (!ws.bridge) return this.reviveBridge(kube, ws, "a liveness check found it down");
+        const t = this.now();
+        if (ws.lastProbe !== undefined && t - ws.lastProbe < 50_000) return;
+        ws.lastProbe = t;
+        ws.probing = true;
+        let alive: boolean | null;
+        try {
+          alive = await this.probeBridge(kube, pod);
+        } finally {
+          ws.probing = false;
+        }
+        if (alive !== false || !ws.bridge || ws.phase !== "running" || ws.sandbox !== pod) return;
+        this.log(`[kubernetes-runtime] bridge ${ws.id} (${pod}) channel looks open but the bridge in the pod does not answer: restarting it`);
+        ws.bridge.close();
+        ws.bridge = undefined;
+        await this.reviveBridge(kube, ws, "the liveness probe failed");
       })().catch((e: Error) => this.log(`[kubernetes-runtime] bridge liveness check failed for ${ws.id}: ${e.message}`));
     }
   }
