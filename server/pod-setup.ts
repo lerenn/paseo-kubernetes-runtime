@@ -27,21 +27,21 @@ export async function installAssets(kube: Kube, pod: string): Promise<void> {
   await write(kube, pod, "mirror-pre-receive", MIRROR_PRE_RECEIVE, "755");
 }
 
-/** The Daemon Ops variables of an agent launch: its endpoint on the daemon's loopback and its capability token. */
+/** The Scoped Daemon Access variables of an agent launch: its endpoint on the daemon's loopback and its capability token. */
 export function opsEnv(env: Readonly<Record<string, string>> | undefined): { url: string; capability: string } | undefined {
-  const url = env?.PASEO_DAEMON_OPS_URL;
-  const capability = env?.PASEO_DAEMON_OPS_CAPABILITY;
+  const url = env?.PASEO_SCOPED_DAEMON_ACCESS_URL;
+  const capability = env?.PASEO_SCOPED_DAEMON_ACCESS_CAPABILITY;
   return url && capability ? { url, capability } : undefined;
 }
 
 /**
- * Puts the scoped `paseo` of Daemon Ops on the pod's PATH. The daemon plugin serves it to the agent's own capability
+ * Puts the scoped `paseo` of Scoped Daemon Access on the pod's PATH. The daemon plugin serves it to the agent's own capability
  * (so it is always the current version, and only agents that have the tools get it); the pod reaches the endpoint
  * itself through the tunnel with the same token.
  */
 export async function installOpsShim(kube: Kube, pod: string, ops: { url: string; capability: string }, fetcher: typeof fetch = fetch): Promise<void> {
   const res = await fetcher(`${ops.url}/shim`, { headers: { authorization: `Bearer ${ops.capability}` } });
-  if (!res.ok) throw new Error(`Daemon Ops did not serve the paseo shim (${res.status})`);
+  if (!res.ok) throw new Error(`Scoped Daemon Access did not serve the paseo shim (${res.status})`);
   await write(kube, pod, "bin/paseo", await res.text(), "755");
 }
 

@@ -103,10 +103,10 @@ describe("prepare: the pod is created when the first process is about to start",
     expect(t.kube.streams).toHaveLength(2);
   });
 
-  it("gives an ops agent the scoped paseo from Daemon Ops, once per pod, and tunnels the endpoint's port", async () => {
+  it("gives an ops agent the scoped paseo from Scoped Daemon Access, once per pod, and tunnels the endpoint's port", async () => {
     const asked: string[] = [];
     const t = setup({}, { fetch: async (url: string, init: { headers: Record<string, string> }) => (asked.push(`${url} ${init.headers.authorization}`), new Response("#!/usr/bin/env node\n")) });
-    const env = { PASEO_AGENT_ID: "a1", PASEO_DAEMON_OPS_URL: "http://127.0.0.1:47851", PASEO_DAEMON_OPS_CAPABILITY: "cap1" };
+    const env = { PASEO_AGENT_ID: "a1", PASEO_SCOPED_DAEMON_ACCESS_URL: "http://127.0.0.1:47851", PASEO_SCOPED_DAEMON_ACCESS_CAPABILITY: "cap1" };
     await t.prepare({ env });
     expect(asked).toEqual(["http://127.0.0.1:47851/shim Bearer cap1"]);
     expect(t.kube.inputs.some((i) => i.argv.join(" ").includes("bin/paseo") || i.argv.includes("bin/paseo"))).toBe(true);

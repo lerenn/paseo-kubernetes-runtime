@@ -58,21 +58,21 @@ describe("sandbox manifest", () => {
   });
 
   it("runs the pod as the ServiceAccount picked by the agent's labels, and as none otherwise", () => {
-    const c = ConfigSchema.parse({ serviceAccounts: [{ label: "paseo.ops=1", serviceAccount: "paseo-ops" }] });
-    const sa = serviceAccountFor(c, { "paseo.ops": "1" });
-    expect(sa).toBe("paseo-ops");
-    for (const labels of [undefined, {} as Record<string, string>, { "paseo.ops": "0" }]) expect(serviceAccountFor(c, labels)).toBeUndefined();
+    const c = ConfigSchema.parse({ serviceAccounts: [{ label: "paseo.scoped-daemon-access=1", serviceAccount: "paseo-scoped-daemon-access" }] });
+    const sa = serviceAccountFor(c, { "paseo.scoped-daemon-access": "1" });
+    expect(sa).toBe("paseo-scoped-daemon-access");
+    for (const labels of [undefined, {} as Record<string, string>, { "paseo.scoped-daemon-access": "0" }]) expect(serviceAccountFor(c, labels)).toBeUndefined();
     const spec = (sb: any) => sb.spec.podTemplate.spec;
     const withSa = buildSandbox({ name: "n", workspaceId: "wks_1", cwd: "/x/y", config: c, serviceAccount: sa }) as any;
-    expect(spec(withSa)).toMatchObject({ serviceAccountName: "paseo-ops", automountServiceAccountToken: true });
-    expect(withSa.spec.podTemplate.metadata.labels["paseo.sh/service-account"]).toBe("paseo-ops");
+    expect(spec(withSa)).toMatchObject({ serviceAccountName: "paseo-scoped-daemon-access", automountServiceAccountToken: true });
+    expect(withSa.spec.podTemplate.metadata.labels["paseo.sh/service-account"]).toBe("paseo-scoped-daemon-access");
     const without = buildSandbox({ name: "n", workspaceId: "wks_1", cwd: "/x/y", config: c }) as any;
     expect(spec(without).serviceAccountName).toBeUndefined();
     expect(spec(without).automountServiceAccountToken).toBe(false);
     // a warm pod waits for any workspace, so it never has one
     const warm = buildSandbox({ name: "n", config: c, warm: true, serviceAccount: sa }) as any;
     expect(spec(warm).serviceAccountName).toBeUndefined();
-    expect(resumePatch(c, undefined, sa).spec.podTemplate.spec).toMatchObject({ serviceAccountName: "paseo-ops" });
+    expect(resumePatch(c, undefined, sa).spec.podTemplate.spec).toMatchObject({ serviceAccountName: "paseo-scoped-daemon-access" });
     expect(resumePatch(c).spec.podTemplate.spec).toMatchObject({ serviceAccountName: null, automountServiceAccountToken: false });
   });
 
