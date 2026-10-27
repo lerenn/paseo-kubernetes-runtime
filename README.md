@@ -243,6 +243,23 @@ and list daemon directories to copy into the volume once:
 - A name that `profiles` does not define is ignored with a log line (the workspace runs without a profile), unlike an explicit unknown `profile`, which refuses the workspace.
 - The profile is read when a pod is created: a running pod keeps its image. Workspaces with a profile never take a warm pod.
 
+### Extra Secrets for a profile (a `codex` profile)
+
+`extraSecrets` lists Secret keys that become environment variables on the pods of that profile only (by reference: the daemon never
+reads the value; the Secret must be in the pods' namespace). Each entry is `{ "secret", "key", "env"?, "optional"? }`: `env` defaults
+to `key`, `optional` to `true` (a missing Secret or key leaves the variable unset instead of blocking the pod). The list is part of
+the spec hash, so a resumed pod picks up a change. Other profiles and the default pods are unchanged.
+
+```json
+"profiles": {
+  "codex": { "extraSecrets": [ { "secret": "paseo-codex-credentials", "key": "OPENAI_API_KEY" } ] }
+}
+```
+
+Pods of the `codex` profile then see `OPENAI_API_KEY` next to the Claude token, so the `codex` provider (`@openai/codex` is in the
+image) can start in them. Make the workspace with the runtime option `{ "profile": "codex" }`. The Secret is created and filled
+outside the plugin (for example `kubectl apply --server-side --field-manager=secret-entry` with a manifest read from stdin).
+
 ## Auto-archive (dry run by default)
 
 A workspace nobody has used for `idleDays` (default 2) is archived, after a warning, and the reaper then removes its pod and volume. The setting is `autoArchive` in the plugin settings:

@@ -33,7 +33,19 @@ export const SeedDirSchema = z.object({
     .default([]),
 });
 
+/** A key of a Secret handed to the pods of one profile only, by reference (the daemon never reads the value). */
+export const ExtraSecretSchema = z.object({
+  secret: z.string().regex(/^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$/, "A Kubernetes Secret name"),
+  key: z.string().regex(/^[A-Za-z0-9._-]{1,253}$/, "A Secret key"),
+  /** The environment variable in the pod; the key's name when absent. */
+  env: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "An environment variable name").optional(),
+  /** A missing Secret or key leaves the variable unset instead of keeping the pod from starting. */
+  optional: z.boolean().default(true),
+});
+
 export const ProfileSchema = z.object({
+  /** Secret keys exposed as environment variables on pods of this profile only (e.g. OPENAI_API_KEY for a codex profile). */
+  extraSecrets: z.array(ExtraSecretSchema).optional(),
   /** Copied into the volume the first time the workspace starts; a marker on the volume keeps it from being copied again. */
   seed: z.array(SeedDirSchema).default([]),
   image: z.string().min(1).optional(),
@@ -114,6 +126,8 @@ export const ConfigSchema = z.object({
    * matches through the project its repository belongs to. A name that `profiles` does not define is ignored, with a log line.
    */
   projectProfiles: z.record(z.string().startsWith("/"), z.string().regex(/^[a-z][a-z0-9-]{0,31}$/)).default({}),
+  /** Not a setting: filled by `applyProfile` from the profile's `extraSecrets`, so the pod spec and its hash see them. */
+  extraSecrets: z.array(ExtraSecretSchema).default([]),
   /** Pod placement (e.g. {"lab.anyshift.io/pool": "burst"}). */
   nodeSelector: z.record(z.string(), z.string()).default({}),
   /** Taint keys every pod tolerates (operator Exists). */
@@ -254,6 +268,7 @@ export function applyProfile(config: KubernetesRuntimeConfig, profile: string | 
   return {
     ...config,
     ...(p.image ? { image: p.image } : {}),
+    ...(p.extraSecrets ? { extraSecrets: p.extraSecrets } : {}),
     ...(p.nodeSelector ? { nodeSelector: { ...config.nodeSelector, ...p.nodeSelector } } : {}),
     ...(p.resources ? { resources: { ...config.resources, ...p.resources } } : {}),
     storage: { ...config.storage, ...(p.storage?.size ? { size: p.storage.size } : {}), ...(p.storage?.storageClassName ? { storageClassName: p.storage.storageClassName } : {}) },
