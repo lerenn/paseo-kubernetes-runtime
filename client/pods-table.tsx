@@ -168,6 +168,11 @@ export function PodsTable({ theme, layout, navigation }: Pick<PluginScreenProps,
                       {`OOM ×${row.oom.count} · ${ago(row.oom.lastAt)}${row.oom.limit ? ` · limit ${row.oom.limit}` : ""}${row.oom.peakMi ? ` · peak ${row.oom.peakMi}Mi` : ""}`}
                     </Text>
                   ) : null}
+                  {row.docker ? (
+                    <Text style={{ color: row.docker.state === "error" ? colors.statusDanger : colors.foregroundMuted, fontSize: 12 }} accessibilityLabel="Docker sandbox">
+                      {`Docker ${row.docker.state}${row.docker.since ? ` · ${ago(row.docker.since)}` : ""}${row.docker.oom ? ` · OOM ×${row.docker.oom.count}` : ""}`}
+                    </Text>
+                  ) : null}
                 </View>
                 <Text style={{ ...muted, flex: wide ? 3 : undefined }} numberOfLines={wide ? 2 : undefined}>
                   {row.agents.length ? row.agents.map((a) => `${a.title}${a.status === "running" ? " (running)" : ""}`).join(", ") : "no agents"}
@@ -177,6 +182,7 @@ export function PodsTable({ theme, layout, navigation }: Pick<PluginScreenProps,
                 </Text>
               </View>
               {row.problem ? <Text style={{ color: colors.statusDanger, fontSize: 12 }}>{row.problem}</Text> : null}
+              {row.docker?.problem ? <Text style={{ color: colors.statusDanger, fontSize: 12 }}>{`Docker sandbox: ${row.docker.problem}`}</Text> : null}
               {confirm ? (
                 <View style={{ gap: 8, paddingVertical: 4 }}>
                   <Text style={{ color: confirm.busy ? colors.statusWarning : colors.foreground, fontSize: 13 }}>

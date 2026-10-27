@@ -3,7 +3,7 @@
 FROM node:22-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git openssh-client curl ca-certificates jq ripgrep python3 python3-pip build-essential \
+      git openssh-client curl ca-certificates jq ripgrep python3 python3-pip build-essential rsync \
     && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI
@@ -17,6 +17,13 @@ RUN arch="$(dpkg --print-architecture)" \
  && curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl" \
  && echo "$(curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl.sha256")  /usr/local/bin/kubectl" | sha256sum -c - \
  && chmod 0755 /usr/local/bin/kubectl
+
+# Docker CLI and compose plugin, for workspaces with a Docker sandbox: they talk to the engine in another pod through DOCKER_HOST.
+# No daemon here. docker-sync copies a directory to the sandbox so compose bind mounts resolve there.
+RUN curl -fsSL https://download.docker.com/linux/debian/gpg -o /usr/share/keyrings/docker.asc \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list \
+ && apt-get update && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin && rm -rf /var/lib/apt/lists/*
+COPY docker-sync /usr/local/bin/docker-sync
 
 # The provider CLIs the runtime starts with `kubectl exec` (it installs them on first use only if they are missing).
 RUN npm install -g @anthropic-ai/claude-code @openai/codex

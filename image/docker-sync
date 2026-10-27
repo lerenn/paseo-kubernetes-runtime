@@ -1,0 +1,28 @@
+#!/bin/sh
+# docker-sync <dir>...: copies directories to the Docker sandbox so that bind mounts resolve there.
+#
+# The engine runs in another pod (DOCKER_HOST), so a compose bind mount such as `./src:/app` is looked up on the
+# ENGINE's filesystem, not here. The sandbox runs an rsync daemon exporting /work, and /work/<path> is the engine's <path>:
+# syncing <dir> to the same absolute path makes `docker run -v <dir>:/x` and compose bind mounts see the same files.
+# Run it before `docker compose up` and again after changing files. Files that only exist in the engine are removed
+# (rsync --delete); pass --keep to not remove anything.
+set -eu
+
+delete=--delete
+if [ "${1:-}" = "--keep" ]; then delete=; shift; fi
+if [ "$#" -eq 0 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  echo "usage: docker-sync [--keep] <dir>..." >&2
+  exit 2
+fi
+
+case "${DOCKER_HOST:-}" in
+  tcp://*) host="${DOCKER_HOST#tcp://}"; host="${host%%:*}" ;;
+  *) echo "docker-sync: DOCKER_HOST is not a tcp:// address; this workspace has no Docker sandbox (profile docker: true)" >&2; exit 1 ;;
+esac
+
+for dir in "$@"; do
+  abs="$(cd "$dir" && pwd -P)"
+  echo "docker-sync: $abs -> rsync://$host/work$abs"
+  # shellcheck disable=SC2086
+  rsync -a $delete --mkpath "$abs/" "rsync://$host:873/work$abs/"
+done

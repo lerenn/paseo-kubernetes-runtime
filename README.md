@@ -177,10 +177,50 @@ start (originals backed up under `~/.paseo/backups/`, never overwritten, never d
 
 ## Pod image
 
-The default image is built from `image/Dockerfile` (node 22, git, gh, jq, ripgrep, claude, codex) by the `image` workflow and
+The default image is built from `image/Dockerfile` (node 22, git, gh, jq, ripgrep, rsync, the docker CLI and compose plugin, `docker-sync`, claude, codex) by the `image` workflow and
 published to `ghcr.io/lerenn/paseo-kubernetes-runtime-default`; `DEFAULT_IMAGE` in `shared/settings.ts` pins it by digest
 (the workflow prints the new digest in its summary). A custom image needs node and git; claude, codex and a verified jq are
 installed on first use when missing.
+
+## Docker sandbox (opt-in per profile)
+
+Agents that need `docker` (build images, run `docker compose`) get a per-workspace engine in its own pod, never inside the agent
+pod. The engine is a privileged `docker:dind` pod on a dedicated, tainted, on-demand node pool (one sandbox per node; the node
+comes up in about 1-2 minutes). Turn it on for a profile:
+
+```json
+"profiles": { "docker": { "docker": true, "resources": { "requests": { "cpu": "1", "memory": "4Gi" } } } },
+"docker": {
+  "namespace": "paseo-docker", "image": "<sandbox image>", "idleMinutes": 15, "maxHours": 8,
+  "nodeSelector": { "paseo.sh/pool": "docker" },
+  "tolerations": [ { "key": "paseo.sh/docker", "operator": "Exists", "effect": "NoSchedule" } ],
+  "resources": { "requests": { "cpu": "3", "memory": "26Gi" }, "limits": { "memory": "28Gi" } }
+}
+```
+
+For a workspace whose profile has `docker: true` (also through `projectProfiles`) the runtime creates, in `docker.namespace` and named
+`docker-<sandbox>` (`<sandbox>` is the agent pod's Sandbox name):
+
+- a **Pod**: privileged, `docker.image`, an emptyDir for `/var/lib/docker`, `DOCKER_TLS_CERTDIR=""` (dockerd on tcp 2375), no ServiceAccount token, anti-affinity so each node holds one sandbox, labels `paseo.sh/docker-sandbox=<sandbox>` and `paseo.sh/workspace=<workspace id>`;
+- a **Service** on 2375 (engine) and 873 (rsync);
+- a **NetworkPolicy**: ingress to that pod only from pods of the agents' namespace labelled `paseo.sh/sandbox=<sandbox>`, on 2375/873.
+
+The **agent pod** gets `DOCKER_HOST=tcp://docker-<sandbox>.<docker.namespace>.svc.cluster.local:2375` and the labels `paseo.sh/docker=1` and
+`paseo.sh/sandbox=<sandbox>` (environment and labels are set whenever the profile has `docker: true`, at creation and on every resume;
+a pod that already runs when the profile gains `docker` gets them at its next resume). The cluster must let the daemon's kubectl manage
+pods, Services and NetworkPolicies in the docker namespace and `exec` into its pods, and must have the egress rule for `paseo.sh/docker=1`.
+
+Lifecycle:
+
+- **Start** (phase 1): when the workspace pod starts or resumes, and when a new agent process launches after the sandbox idled out. The runtime does not wait for the engine (the node takes a minute or two); a `docker` command in that window fails to connect, so retry it. A lazy start on the first `docker` command through a `docker` shim is phase 2 and not built.
+- **Delete the pod** (the Service and NetworkPolicy stay): on workspace suspend; after `idleMinutes` with no running container (`docker ps -q` inside the sandbox, checked every 30 s; an engine that cannot answer counts as busy); and `maxHours` after it started, whatever it runs. `0` turns the idle or age limit off.
+- **Delete everything**: when the workspace is archived or its pod deleted from the Pods table, and by the orphan reaper (and `reconcile`) for sandboxes whose workspace pod is gone.
+- The Pods table shows `Docker starting|running|stopped|error`. Sandbox out-of-memory kills are counted separately (role `docker`, in the log and next to the state) from the agent pod's.
+
+**Bind mounts.** A compose bind mount (`./src:/app`) or `docker run -v` is resolved on the engine's filesystem, which is not the agent's. The
+agent image has `docker-sync <dir>`, which rsyncs the directory to `rsync://docker-<sandbox>:873/work/<same absolute path>` (the sandbox's rsync
+daemon exports `/work`, mapped to `/` of the engine), so the same path then exists there. **Compose projects must be synced first**: run
+`docker-sync .` before `docker compose up`, and again after editing files (`--keep` does not remove files that only exist in the sandbox). Named volumes and images need no sync.
 
 ## Node reclaims (Spot)
 

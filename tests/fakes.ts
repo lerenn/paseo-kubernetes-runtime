@@ -1,6 +1,6 @@
 import { PassThrough } from "node:stream";
 import type { AcpStreamMessage } from "@getpaseo/plugin/server/acp";
-import type { ClaimInfo, ExecResult, Kube, PodInfo, PodProcess, SandboxInfo } from "../server/kube.js";
+import type { ClaimInfo, ExecResult, Kube, ListableKind, ObjectInfo, PodInfo, PodProcess, SandboxInfo } from "../server/kube.js";
 
 export class FakeKube implements Kube {
   calls: string[] = [];
@@ -16,7 +16,11 @@ export class FakeKube implements Kube {
     this.calls.push("apply");
     this.applied.push(manifest);
     const meta = (manifest as any).metadata ?? {};
-    if (meta.name) {
+    const kind = String((manifest as any).kind ?? "").toLowerCase();
+    if (kind === "pod" || kind === "service" || kind === "networkpolicy") {
+      // the Docker sandbox's objects: a pod is ready as soon as it is applied
+      this.objects[kind] = [...this.objects[kind]!.filter((o) => o.name !== meta.name), { name: meta.name, labels: meta.labels ?? {}, createdAt: new Date(this.clock()).toISOString(), ...(kind === "pod" ? { pod: { uid: `uid-${meta.name}`, ready: true, terminating: false, phase: "Running" } } : {}) }];
+    } else if (meta.name) {
       this.sandboxes.push({
         name: meta.name,
         labels: meta.labels ?? {},
@@ -29,8 +33,11 @@ export class FakeKube implements Kube {
   }
   /** Scripted pod states, consumed in order; the last one repeats. */
   pods: (PodInfo | null)[] = [{ uid: "uid-1", ready: true, terminating: false }];
+  /** The time the Docker sandbox's objects are stamped with. */
+  clock = () => 0;
   async podInfo(name: string) {
     this.calls.push(`pod:${name}`);
+    if (name.startsWith("docker-")) return this.objects.pod!.find((o) => o.name === name)?.pod ?? null;
     if (this.waitError) throw this.waitError;
     return this.pods.length > 1 ? this.pods.shift()! : this.pods[0]!;
   }
@@ -123,8 +130,15 @@ export class FakeKube implements Kube {
     if (this.patchError) throw this.patchError;
     this.patches.push({ key, manifest });
   }
+  /** Pods, Services and NetworkPolicies of the Docker sandbox, by kind. */
+  objects: Record<string, ObjectInfo[]> = { pod: [], service: [], networkpolicy: [] };
+  async listObjects(kind: ListableKind, selector: string) {
+    const terms = selector.split(",").map((t) => t.split("="));
+    return this.objects[kind]!.filter((o) => terms.every(([k, v]) => (v === undefined ? k! in o.labels : o.labels[k!] === v)));
+  }
   async delete(kind: string, name: string) {
     this.calls.push(`delete:${kind}/${name}`);
+    if (kind === "pod" || kind === "service" || kind === "networkpolicy") this.objects[kind] = this.objects[kind]!.filter((o) => o.name !== name);
     if (kind === "sandbox") this.sandboxes = this.sandboxes.filter((s) => s.name !== name);
   }
 }
