@@ -20,6 +20,16 @@ export const PodRowSchema = z.object({
   /** Out-of-memory kills of this workspace's pod processes. */
   oom: z.object({ count: z.number(), lastAt: z.string(), limit: z.string().optional(), peakMi: z.number().optional() }).optional(),
   agents: z.array(z.object({ id: z.string(), title: z.string(), status: z.string() })),
+  /** The workspace's Docker sandbox, for a workspace whose profile has one. `stopped`: no pod (suspended, idle or past its maximum age). */
+  docker: z
+    .object({
+      state: z.enum(["starting", "running", "stopped", "error"]),
+      problem: z.string().optional(),
+      since: z.string().optional(),
+      /** Out-of-memory kills of the sandbox, counted apart from the agent's (role docker). */
+      oom: z.object({ count: z.number(), lastAt: z.string(), limit: z.string().optional() }).optional(),
+    })
+    .optional(),
   /** Where the workspace is in the auto-archive sequence, when it is in it (shown as a badge). */
   autoArchive: z.enum(["scheduled", "blocked", "kept"]).optional(),
   autoArchiveText: z.string().optional(),

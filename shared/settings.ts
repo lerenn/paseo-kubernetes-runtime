@@ -34,6 +34,8 @@ export const SeedDirSchema = z.object({
 });
 
 export const ProfileSchema = z.object({
+  /** The workspace gets a per-workspace Docker sandbox (see `docker` in the settings): a privileged dind pod on its own node. */
+  docker: z.boolean().optional(),
   /** Copied into the volume the first time the workspace starts; a marker on the volume keeps it from being copied again. */
   seed: z.array(SeedDirSchema).default([]),
   image: z.string().min(1).optional(),
@@ -52,6 +54,35 @@ export const ProfileSchema = z.object({
       limits: z.record(z.string(), z.string()).optional(),
     })
     .optional(),
+});
+
+/** The per-workspace Docker sandbox: a privileged `docker:dind` pod on a dedicated node, for workspaces whose profile has `docker: true`. */
+export const DockerSchema = z.object({
+  /** Namespace of the sandbox pods, Services and NetworkPolicies (not the agents' namespace). */
+  namespace: z.string().default("paseo-docker"),
+  /** The sandbox image: dockerd on tcp 2375 plus an rsync daemon on 873 exporting /work. */
+  image: z.string().default("docker:dind"),
+  /** The sandbox is deleted after this many minutes without a running container. 0 = never. */
+  idleMinutes: z.number().int().min(0).default(15),
+  /** The sandbox is deleted this long after it started, whatever it runs. 0 = never. */
+  maxHours: z.number().min(0).default(8),
+  nodeSelector: z.record(z.string(), z.string()).default({ "paseo.sh/pool": "docker" }),
+  tolerations: z
+    .array(
+      z.object({
+        key: z.string().min(1),
+        operator: z.enum(["Exists", "Equal"]).default("Exists"),
+        value: z.string().optional(),
+        effect: z.enum(["NoSchedule", "PreferNoSchedule", "NoExecute"]).optional(),
+      }),
+    )
+    .default([{ key: "paseo.sh/docker", operator: "Exists", effect: "NoSchedule" }]),
+  resources: z
+    .object({
+      requests: z.record(z.string(), z.string()).optional(),
+      limits: z.record(z.string(), z.string()).optional(),
+    })
+    .default({ requests: { cpu: "3", memory: "26Gi" }, limits: { memory: "28Gi" } }),
 });
 
 const LabelRule = z.string().regex(/^[^=\s]+(=[^=\s]*)?$/, "Use key=value");
@@ -154,6 +185,8 @@ export const ConfigSchema = z.object({
     )
     .default([]),
   storage: StorageSchema.default({ mode: "persistent", size: "10Gi" }),
+  /** Settings of the Docker sandbox that profiles with `docker: true` get. */
+  docker: DockerSchema.default(() => DockerSchema.parse({})),
   /**
    * Also delete this plugin's sandboxes that carry no daemon label (made before labelling existed) and match no
    * agent of this daemon, after 15 minutes. Turn off where several daemons share one namespace.
@@ -228,6 +261,7 @@ export const ConfigSchema = z.object({
 });
 
 export type KubernetesRuntimeConfig = z.infer<typeof ConfigSchema>;
+export type DockerConfig = z.infer<typeof DockerSchema>;
 export type AutoArchiveConfig = z.infer<typeof AutoArchiveSchema>;
 
 /** The profile `projectProfiles` gives a directory: an exact path or the longest listed ancestor directory. */
@@ -244,6 +278,11 @@ export function projectProfileFor(projectProfiles: Record<string, string>, dir: 
     }
   }
   return best;
+}
+
+/** Whether a workspace's profile asks for a Docker sandbox. */
+export function dockerEnabled(config: KubernetesRuntimeConfig, profile: string | undefined): boolean {
+  return Boolean(profile && config.profiles[profile]?.docker);
 }
 
 /** The configuration a workspace runs with: the settings, with its profile's image, storage and resources applied. */

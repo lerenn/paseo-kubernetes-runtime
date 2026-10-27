@@ -123,7 +123,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(kubeStatus, async () => {
     const config = await getConfig();
     const [titles, agents] = await Promise.all([paseoWorkspaces(), paseoAgents()]);
-    const pods = await readPodRows(kubeFor(config), daemonId, registry.list(), titles, agents, runtime.oomStats());
+    const pods = await readPodRows(kubeFor(config), daemonId, registry.list(), titles, agents, runtime.oomStats(), await runtime.dockerStatuses(config));
     return {
       reaper: reaper.current(),
       pods: pods.map((row) => ({ ...row, ...runtime.autoArchiveBadge(row.workspaceId) })),

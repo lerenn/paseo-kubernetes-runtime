@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { KubernetesRuntimeConfig } from "./config.js";
 import type { Kube } from "./kube.js";
+import { sweepDockerOrphans } from "./docker-sandbox.js";
 import { AGENT_LABEL, DAEMON_LABEL, MANAGED_BY, MANAGED_BY_LABEL, WORKSPACE_ID_LABEL, WORKSPACE_LABEL, workspaceClaimName } from "./sandbox.js";
 
 const execFileAsync = promisify(execFile);
@@ -227,6 +228,12 @@ export class OrphanReaper {
           await kube.delete("pvc", claim.name);
           removed++;
         }
+      }
+      // Docker sandboxes (another namespace) whose workspace pod is gone. Not having that namespace, or the rights to it, is no error.
+      try {
+        removed += await sweepDockerOrphans(this.deps.kubeFor({ ...config, namespace: config.docker.namespace }), daemonId, live, now(), grace, log);
+      } catch {
+        // none to sweep
       }
       const unlabelled = left.sort();
       const unseen = unlabelled.filter((n) => !this.status.unlabelled.includes(n));

@@ -98,6 +98,26 @@ export function parseSandboxList(json: any): SandboxInfo[] {
   }));
 }
 
+/** A pod, Service or NetworkPolicy listed by label (the Docker sandbox's objects live in a namespace of their own). */
+export interface ObjectInfo {
+  name: string;
+  labels: Record<string, string>;
+  createdAt?: string;
+  /** Facts of a pod; absent for other kinds. */
+  pod?: PodInfo;
+}
+
+export type ListableKind = "pod" | "service" | "networkpolicy";
+
+export function parseObjectList(json: any, kind: ListableKind): ObjectInfo[] {
+  return (json?.items ?? []).map((item: any) => ({
+    name: item.metadata.name,
+    labels: item.metadata.labels ?? {},
+    createdAt: item.metadata.creationTimestamp,
+    ...(kind === "pod" ? { pod: parsePodInfo(item) } : {}),
+  }));
+}
+
 export interface ExecResult {
   code: number;
   stdout: string;
@@ -118,6 +138,8 @@ export interface Kube {
   annotatePod(name: string, set: Record<string, string>, remove?: string[]): Promise<void>;
   /** Sandboxes matching a label selector. */
   listSandboxes(selector: string): Promise<SandboxInfo[]>;
+  /** Pods, Services or NetworkPolicies matching a label selector. */
+  listObjects(kind: ListableKind, selector: string): Promise<ObjectInfo[]>;
   /** Volume claims matching a label selector (all claims in the namespace when omitted). */
   listClaims(selector?: string): Promise<ClaimInfo[]>;
   /** Runs a command in the pod with `input` on its stdin (used to copy files in over the Kubernetes API). */
@@ -310,6 +332,11 @@ export class Kubectl implements Kube {
   async listSandboxes(selector: string): Promise<SandboxInfo[]> {
     const result = await this.ok(["get", "sandbox", "-l", selector, "-o", "json"]);
     return parseSandboxList(JSON.parse(result.stdout));
+  }
+
+  async listObjects(kind: ListableKind, selector: string): Promise<ObjectInfo[]> {
+    const result = await this.ok(["get", kind, "-l", selector, "-o", "json"]);
+    return parseObjectList(JSON.parse(result.stdout), kind);
   }
 
   async listClaims(selector?: string): Promise<ClaimInfo[]> {

@@ -46,6 +46,9 @@ export class LocalPodKube implements Kube {
   async patchSandbox() {}
   async label() {}
   async annotatePod() {}
+  async listObjects() {
+    return [];
+  }
   async listClaims() {
     return [];
   }

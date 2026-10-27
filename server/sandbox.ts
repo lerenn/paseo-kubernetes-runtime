@@ -13,6 +13,10 @@ export const AGENT_LABEL = "paseo.sh/agent";
 export const REPO_LABEL = "paseo.sh/repo";
 /** On pods that run as a ServiceAccount, so a NetworkPolicy can select them. */
 export const SERVICE_ACCOUNT_LABEL = "paseo.sh/service-account";
+/** On an agent pod with a Docker sandbox, so a NetworkPolicy can let it reach the sandbox (value `1`). */
+export const DOCKER_LABEL = "paseo.sh/docker";
+/** On an agent pod: the name of its Sandbox, which the Docker sandbox's NetworkPolicy selects by. */
+export const SANDBOX_LABEL = "paseo.sh/sandbox";
 export const STATE_LABEL = "paseo.sh/state";
 export const WORKSPACE_NAME_ANNOTATION = "paseo.sh/workspace-name";
 export const REPO_URL_ANNOTATION = "paseo.sh/repo-url";
@@ -102,7 +106,7 @@ export function serviceAccountFor(config: KubernetesRuntimeConfig, labels: Recor
   })?.serviceAccount;
 }
 
-export function specHash(config: KubernetesRuntimeConfig, cwd: string, serviceAccount?: string | null): string {
+export function specHash(config: KubernetesRuntimeConfig, cwd: string, serviceAccount?: string | null, docker?: boolean): string {
   const shape = {
     image: config.image,
     resources: config.resources ?? null,
@@ -114,6 +118,8 @@ export function specHash(config: KubernetesRuntimeConfig, cwd: string, serviceAc
     credentialsSecret: config.credentialsSecret,
     apiVersion: config.sandboxApiVersion,
     cwd,
+    // only when on, so the hash of a pod without a Docker sandbox is what it always was
+    ...(docker ? { docker: config.docker } : {}),
   };
   return createHash("sha1").update(JSON.stringify(shape)).digest("hex").slice(0, 12);
 }
@@ -133,7 +139,19 @@ export interface SandboxSpecInput {
   warm?: boolean;
   /** The pod runs as this ServiceAccount (see `serviceAccounts`); none for a warm pod. */
   serviceAccount?: string;
+  /** The workspace's profile has a Docker sandbox: the pod gets `DOCKER_HOST` and the labels its NetworkPolicy goes by. */
+  docker?: boolean;
 }
+
+/** `docker-<sandbox>`: the name of a workspace's Docker sandbox pod, Service and NetworkPolicy. */
+export const dockerName = (sandbox: string) => `docker-${sandbox}`;
+
+/** The engine address an agent pod gets as `DOCKER_HOST`. */
+export const dockerHost = (config: KubernetesRuntimeConfig, sandbox: string) => `tcp://${dockerName(sandbox)}.${config.docker.namespace}.svc.cluster.local:2375`;
+
+/** Labels of an agent pod with a Docker sandbox. */
+const dockerPodLabels = (sandbox: string, docker: boolean | undefined) =>
+  docker ? { [DOCKER_LABEL]: "1", [SANDBOX_LABEL]: sandbox } : {};
 
 /** `pka-<random>`: a neutral name for a pod that is started before its workspace is known (names cannot change). */
 export function warmSandboxName(): string {
@@ -151,6 +169,7 @@ export function claimPatch(workspaceId: string, cwd: string, meta: PodMeta, conf
 /** A `Sandbox` (agents.x-k8s.io) whose single container idles; provider processes are started in it by `kubectl exec`. */
 export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
   const { name, workspaceId, config, daemonId, meta, warm } = input;
+  const docker = !warm && input.docker === true;
   const serviceAccount = warm ? undefined : input.serviceAccount;
   const layout = input.layout ?? (warm ? "mapped" : "legacy");
   const cwd = layout === "mapped" ? undefined : (input.cwd ?? "");
@@ -158,6 +177,7 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
   const podLabels = {
     [MANAGED_BY_LABEL]: MANAGED_BY,
     ...(serviceAccount ? { [SERVICE_ACCOUNT_LABEL]: serviceAccount } : {}),
+    ...dockerPodLabels(name, docker),
     ...(warm ? { [STATE_LABEL]: WARM_STATE } : shown),
   };
   const owner = {
@@ -173,7 +193,7 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
       namespace: config.namespace,
       labels: { ...podLabels, ...owner },
       annotations: {
-        [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT, serviceAccount),
+        [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT, serviceAccount, docker),
         ...(cwd ? { [CWD_ANNOTATION]: cwd } : { [LAYOUT_ANNOTATION]: "mapped" }),
         ...(input.cwd && layout === "mapped" ? { [CWD_ANNOTATION]: input.cwd } : {}),
         ...(meta ? metaAnnotations(meta) : {}),
@@ -198,7 +218,7 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
           // The checkout is a subPath of the volume, and kubelet creates a subPath directory owned by root,
           // after fsGroup has been applied. A root init container makes the volume ours before the agent runs.
           initContainers: [volumeInit(config)],
-          containers: [workspaceContainer(config, cwd)],
+          containers: [workspaceContainer(config, cwd, docker ? dockerHost(config, name) : undefined)],
           // Persistent storage comes from volumeClaimTemplates; the controller adds the volume.
           ...(config.storage.mode === "ephemeral" ? { volumes: [{ name: WORKSPACE_VOLUME, emptyDir: {} }] } : {}),
         },
@@ -230,7 +250,7 @@ function volumeInit(config: KubernetesRuntimeConfig) {
 }
 
 /** The pod's single container: idles; provider processes are started in it by `kubectl exec`. */
-export function workspaceContainer(config: KubernetesRuntimeConfig, cwd?: string) {
+export function workspaceContainer(config: KubernetesRuntimeConfig, cwd?: string, dockerEngine?: string) {
   return {
     name: "agent",
     image: config.image,
@@ -239,6 +259,7 @@ export function workspaceContainer(config: KubernetesRuntimeConfig, cwd?: string
     // Only the Claude token reaches the pod, by reference. GitHub goes through the daemon.
     env: [
       { name: "HOME", value: HOME_DIR },
+      ...(dockerEngine ? [{ name: "DOCKER_HOST", value: dockerEngine }] : []),
       {
         name: "CLAUDE_CODE_OAUTH_TOKEN",
         valueFrom: { secretKeyRef: { name: config.credentialsSecret, key: "CLAUDE_CODE_OAUTH_TOKEN", optional: true } },
@@ -260,22 +281,30 @@ export function suspendPatch() {
 }
 
 /** Recreates the pod on the same volume, with the current image and settings. */
-export function resumePatch(config: KubernetesRuntimeConfig, cwd?: string, serviceAccount?: string) {
+export function resumePatch(config: KubernetesRuntimeConfig, cwd?: string, serviceAccount?: string, docker?: { sandbox: string }) {
   return {
-    metadata: { annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT, serviceAccount) } },
+    metadata: {
+      annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT, serviceAccount, Boolean(docker)) },
+      labels: { [DOCKER_LABEL]: docker ? "1" : null, [SANDBOX_LABEL]: docker ? docker.sandbox : null },
+    },
     spec: {
       operatingMode: "Running",
       // placement and annotations too: a resumed pod follows the settings of today (a node pool that changed, the autoscaler's hint)
       podTemplate: {
         metadata: {
           // null removes the label from a template that had it
-          labels: { [SERVICE_ACCOUNT_LABEL]: serviceAccount ?? null },
+          labels: {
+            [SERVICE_ACCOUNT_LABEL]: serviceAccount ?? null,
+            // the profile may have gained or lost the sandbox since the pod was made
+            [DOCKER_LABEL]: docker ? "1" : null,
+            [SANDBOX_LABEL]: docker ? docker.sandbox : null,
+          },
           ...(Object.keys(config.podAnnotations).length ? { annotations: config.podAnnotations } : {}),
         },
         spec: {
           ...(serviceAccount ? { serviceAccountName: serviceAccount, automountServiceAccountToken: true } : { serviceAccountName: null, automountServiceAccountToken: false }),
           ...placement(config), initContainers: [volumeInit(config)],
-          containers: [workspaceContainer(config, cwd)],
+          containers: [workspaceContainer(config, cwd, docker ? dockerHost(config, docker.sandbox) : undefined)],
         },
       },
     },

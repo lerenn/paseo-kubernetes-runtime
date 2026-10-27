@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
-import { applyProfile, projectProfileFor } from "../shared/settings.js";
+import { applyProfile, dockerEnabled, projectProfileFor } from "../shared/settings.js";
+import { DockerSandboxes, type DockerStatus } from "./docker-sandbox.js";
 import { OomLedger, oomResumePrompt, parsePeak } from "./oom.js";
 import { checkpointPrompt, classifyStop, ResumeGuard, resumePrompt } from "./interruption.js";
 import { parseRuntimeOptions, type RuntimeOptions } from "../shared/runtime-options.js";
@@ -56,6 +57,7 @@ import type {
 import {
   CWD_ANNOTATION,
   DAEMON_LABEL,
+  DOCKER_LABEL,
   LAYOUT_ANNOTATION,
   MAPPED_CHECKOUT,
   STATE_LABEL,
@@ -177,6 +179,8 @@ interface WorkspaceState {
   labelFailedAt?: number;
   /** The image the pod was started with, for the sidebar badge; known once the Sandbox has been read or created. */
   image?: string;
+  /** The workspace's pod has a Docker sandbox (its profile has `docker: true`). */
+  docker?: boolean;
   /** The submodule checkout running in the background, if any. */
   submodulesJob?: Promise<void>;
   /** Consecutive reconnects of the bridge channel, for backoff. */
@@ -239,6 +243,7 @@ export class KubernetesRuntime {
   private legacyProbing = false;
   private archiveSummary: Pick<AutoArchiveStatus, "scheduled" | "blocked"> & { kept: Map<string, string> } = { scheduled: [], blocked: [], kept: new Map() };
   private readonly oom: OomLedger;
+  private readonly docker: DockerSandboxes;
   private stopInterruptTicker: () => void = () => undefined;
 
   constructor(private readonly deps: RuntimeDeps) {
@@ -248,6 +253,19 @@ export class KubernetesRuntime {
     this.now = deps.now ?? Date.now;
     this.lastDemand = this.now();
     this.oom = new OomLedger(deps.oomStateFile ?? null, this.now());
+    this.docker = new DockerSandboxes({
+      getConfig: () => deps.getConfig(),
+      kubeFor: (c) => deps.kubeFor(c),
+      daemonId: deps.daemonId,
+      now: () => this.now(),
+      sleep: deps.sleep,
+      log: (line) => this.log(line),
+      // counted apart from the agents' own kills, under the role `docker`
+      onOom: (workspaceId, sandbox, facts) => {
+        this.oom.record(`docker:${workspaceId}`, [], this.now(), facts);
+        this.log(`[kubernetes-runtime] OOM: role=docker ${workspaceId} sandbox ${sandbox} limit ${facts.limit ?? "unknown"}`);
+      },
+    });
   }
 
   private log(line: string): void {
@@ -258,6 +276,7 @@ export class KubernetesRuntime {
   async start(): Promise<void> {
     const tick = () => {
       void this.checkIdle().catch(() => undefined);
+      void this.checkDocker().catch(() => undefined);
       void this.maintainPool().catch(() => undefined);
     };
     this.stopTicker = (this.deps.ticker ?? ((fn, ms) => {
@@ -312,6 +331,7 @@ export class KubernetesRuntime {
       ws.sandbox = sandbox.name;
       ws.image = sandbox.image;
       ws.layout = sandbox.annotations[LAYOUT_ANNOTATION] === "mapped" ? "mapped" : "legacy";
+      ws.docker = sandbox.labels[DOCKER_LABEL] === "1";
       ws.cwdFixed = true;
       this.syncFromSandbox(ws, sandbox);
       this.setPhase(ws, sandbox.operatingMode === "Suspended" ? "suspended" : "running");
@@ -593,6 +613,8 @@ export class KubernetesRuntime {
     const profile = await this.profileName(settings, ws);
     const config = applyProfile(settings, profile);
     const kube = this.deps.kubeFor(config);
+    const dockerOn = dockerEnabled(settings, profile);
+    ws.docker = dockerOn;
     const { cwd } = ws.options;
     const ops = opsEnv(need.env);
     for (const port of loopbackPorts((need.mcpServers ?? {}) as Record<string, { type: string; url?: string }>, [ops?.url])) ws.wantPorts.add(port);
@@ -606,6 +628,7 @@ export class KubernetesRuntime {
       const info = await kube.podInfo(ws.sandbox).catch(() => null);
       if (info?.ready && !info.terminating && info.uid === ws.readyUid) {
         await this.syncLabels(kube, ws, "running"); // another agent may have started in this workspace
+        if (dockerOn && this.docker.wantsRestart(ws.sandbox)) await this.startDocker(ws, config, ctx); // its sandbox idled out; a new process wants it
         return;
       }
     }
@@ -631,7 +654,7 @@ export class KubernetesRuntime {
       } else {
         ctx.notice("Starting the pod...");
         const name = sandboxName(ws.id, repoName(repo.url), ws.options.slug);
-        await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, layout, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running"), serviceAccount }));
+        await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, layout, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running"), serviceAccount, docker: dockerOn }));
         ws.labelled = this.metaKey(this.meta(ws, "running"));
         ws.sandbox = name;
         ws.image = config.image;
@@ -644,7 +667,7 @@ export class KubernetesRuntime {
       if (sandbox.operatingMode === "Suspended") {
         ctx.notice("Resuming the pod...");
         this.setPhase(ws, "resuming");
-        await kube.patchSandbox(sandbox.name, resumePatch(config, ws.layout === "mapped" ? undefined : cwd, this.resumeServiceAccount(config, ws, sandbox)));
+        await kube.patchSandbox(sandbox.name, resumePatch(config, ws.layout === "mapped" ? undefined : cwd, this.resumeServiceAccount(config, ws, sandbox), dockerOn ? { sandbox: sandbox.name } : undefined));
         // the check taken at suspend is about a pod that is no longer asleep
         ws.probe = undefined;
         if (sandbox.annotations[PROBE_ANNOTATION]) await kube.patchSandbox(sandbox.name, { metadata: { annotations: { [PROBE_ANNOTATION]: null } } }).catch(() => undefined);
@@ -681,6 +704,7 @@ export class KubernetesRuntime {
       this.setPhase(ws, "running");
       ws.lastActivity = this.now();
       await this.syncLabels(kube, ws, "running");
+      if (dockerOn) await this.startDocker(ws, config, ctx);
     } catch (error) {
       ws.readyUid = undefined;
       // Left suspended-looking so the next input retries from a clean state; the volume and the sandbox stay.
@@ -693,6 +717,31 @@ export class KubernetesRuntime {
       ctx.notice(`Could not start the pod: ${message}`, "error");
       throw new Error(`kube: could not start the pod: ${message}`);
     }
+  }
+
+  /**
+   * Starts the workspace's Docker sandbox (phase 1: with the workspace's pod, not on the first `docker` command). It does not
+   * wait for the engine, which needs a node: a failure is a warning, never a reason to stop the workspace.
+   */
+  private async startDocker(ws: WorkspaceState, config: KubernetesRuntimeConfig, ctx: WorkspaceRuntimeContext): Promise<void> {
+    if (!ws.sandbox) return;
+    try {
+      ctx.notice("Starting the docker sandbox (a node of its own, about 1-2 minutes)...");
+      await this.docker.ensure(ws.id, ws.sandbox, config);
+    } catch (error) {
+      ctx.notice(`Could not start the docker sandbox: ${(error as Error).message}`, "warning");
+    }
+  }
+
+  /** Deletes the sandboxes that idled out or reached their maximum age, and counts the ones killed for memory. */
+  async checkDocker(): Promise<void> {
+    if (![...this.states.values()].some((w) => w.docker)) return;
+    await this.docker.check();
+  }
+
+  /** The state of each workspace's Docker sandbox pod by agent Sandbox name, for the Runtime screen. */
+  async dockerStatuses(config: KubernetesRuntimeConfig): Promise<Map<string, DockerStatus>> {
+    return this.docker.statuses(config).catch(() => new Map());
   }
 
   /** The workspace's files, served from the pod. Only while the pod runs: polling must not keep it awake or wake it. */
@@ -802,6 +851,7 @@ export class KubernetesRuntime {
     }
     await Promise.race([Promise.allSettled(mine.map((e) => e.exited)), new Promise((r) => setTimeout(r, 5_000).unref?.())]);
     await this.syncLabels(kube, ws, "suspended");
+    if (ws.docker) await this.docker.stop(ws.sandbox, config).catch((e: Error) => this.log(`[kubernetes-runtime] could not stop the docker sandbox of ${ws.sandbox}: ${e.message}`));
     ws.probe = probe;
     await kube.patchSandbox(ws.sandbox, {
       metadata: {
@@ -1329,6 +1379,7 @@ export class KubernetesRuntime {
         `Pod ${ws.sandbox}`,
         ...(name ? [`Image name: ${name}`] : []),
         `State: ${state}`,
+        ...(ws.docker ? ["Docker sandbox: on (see the Runtime screen)"] : []),
         ...(ws.image ? [`Image: ${ws.image}`] : []),
         ...(ws.repo ? [`Repository: ${ws.repo}`] : []),
         ...(archives ? [archives] : []),
@@ -1622,6 +1673,7 @@ export class KubernetesRuntime {
       const kube = this.deps.kubeFor(config);
       ws.bridge?.close();
       for (const sandbox of await kube.listSandboxes(`${WORKSPACE_ID_LABEL}=${ws.id}`)) {
+        if (ws.docker || sandbox.labels[DOCKER_LABEL] === "1") await this.docker.destroy(sandbox.name, config);
         await kube.delete("sandbox", sandbox.name);
         await kube.delete("pvc", workspaceClaimName(sandbox.name)).catch(() => undefined);
       }
@@ -1665,6 +1717,7 @@ export class KubernetesRuntime {
       ws?.bridge?.close();
       this.states.delete(id);
       this.deps.registry?.delete(id);
+      if (sandbox.labels[DOCKER_LABEL] === "1") await this.docker.destroy(sandbox.name, config).catch(() => undefined);
       await kube.delete("sandbox", sandbox.name).catch(() => undefined);
       await kube.delete("pvc", workspaceClaimName(sandbox.name)).catch(() => undefined);
     }
