@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
-import { applyProfile } from "../shared/settings.js";
+import { applyProfile, projectProfileFor } from "../shared/settings.js";
 import { OomLedger, oomResumePrompt, parsePeak } from "./oom.js";
 import { checkpointPrompt, classifyStop, ResumeGuard, resumePrompt } from "./interruption.js";
 import { parseRuntimeOptions, type RuntimeOptions } from "../shared/runtime-options.js";
@@ -136,6 +136,9 @@ interface AgentActivity {
 interface WorkspaceState {
   id: string;
   options: RuntimeOptions;
+  /** The project's main checkout when `cwd` is a worktree ("" if not found), for `projectProfiles`. */
+  projectDir?: string;
+  unknownProfileLogged?: string;
   sandbox?: string;
   phase: PodState | "none";
   bridge?: RunningBridge;
@@ -442,7 +445,9 @@ export class KubernetesRuntime {
 
   /** The directories a workspace's profile has copied into its volume, once (a marker on the volume). A failure is a warning: the agent can start and the copy is tried again at the next start. */
   private async seedProfileDirs(kube: Kube, ws: WorkspaceState, pod: string, ctx: WorkspaceRuntimeContext): Promise<void> {
-    const profile = ws.options.profile ? (await this.deps.getConfig()).profiles[ws.options.profile] : undefined;
+    const config = await this.deps.getConfig();
+    const name = await this.profileName(config, ws);
+    const profile = name ? config.profiles[name] : undefined;
     for (const seed of profile?.seed ?? []) {
       try {
         if (await seedDirectory(kube, pod, seed, () => ctx.notice(`Copying ${seed.from} into the pod as /workspace/${seed.to} (once)...`))) ctx.notice(`${seed.to} is in the pod.`);
@@ -580,7 +585,9 @@ export class KubernetesRuntime {
     ctx: WorkspaceRuntimeContext,
     need: { command?: string; mcpServers?: Record<string, unknown>; env?: Record<string, string> } = {},
   ): Promise<void> {
-    const config = applyProfile(await this.deps.getConfig(), ws.options.profile);
+    const settings = await this.deps.getConfig();
+    const profile = await this.profileName(settings, ws);
+    const config = applyProfile(settings, profile);
     const kube = this.deps.kubeFor(config);
     const { cwd } = ws.options;
     const ops = opsEnv(need.env);
@@ -610,7 +617,7 @@ export class KubernetesRuntime {
       ws.repoUrl = repo.url;
       const serviceAccount = serviceAccountFor(config, this.agentLabels(ws));
       // a running pod cannot change ServiceAccount, so only a pod without one is taken from the warm pool
-      const warm = layout === "mapped" && !serviceAccount && !ws.options.profile ? await this.claimWarm(kube, config, ws) : undefined;
+      const warm = layout === "mapped" && !serviceAccount && !profile ? await this.claimWarm(kube, config, ws) : undefined;
       if (warm) {
         ctx.notice("Using a pod that was already running...");
         ws.sandbox = warm.name;
@@ -1043,8 +1050,38 @@ export class KubernetesRuntime {
     return ws.options.title ?? ws.options.slug ?? ws.id;
   }
 
-  private hasSeedProfile(config: KubernetesRuntimeConfig, ws: WorkspaceState): boolean {
-    return !!ws.options.profile && (config.profiles[ws.options.profile]?.seed.length ?? 1) > 0; // a profile the settings dropped counts as seeded
+  private async hasSeedProfile(config: KubernetesRuntimeConfig, ws: WorkspaceState): Promise<boolean> {
+    const name = await this.profileName(config, ws);
+    return !!name && (config.profiles[name]?.seed.length ?? 1) > 0; // a profile the settings dropped counts as seeded
+  }
+
+  /**
+   * The pod profile of a workspace: its explicit `profile` option, else the one `projectProfiles` gives its project (a
+   * Paseo worktree has the project's repository behind it, found with git). A listed project whose profile is not defined
+   * runs without one.
+   */
+  private async profileName(config: KubernetesRuntimeConfig, ws: WorkspaceState): Promise<string | undefined> {
+    if (ws.options.profile) return ws.options.profile;
+    const map = config.projectProfiles;
+    if (Object.keys(map).length === 0) return undefined;
+    let name = projectProfileFor(map, ws.options.cwd);
+    if (!name) {
+      ws.projectDir ??= await this.projectDirOf(ws.options.cwd);
+      if (ws.projectDir && ws.projectDir !== ws.options.cwd) name = projectProfileFor(map, ws.projectDir);
+    }
+    if (name && !config.profiles[name]) {
+      if (ws.unknownProfileLogged !== name) this.log(`[kubernetes-runtime] projectProfiles gives ${ws.options.cwd} the profile "${name}", which the settings do not define; running without a profile`);
+      ws.unknownProfileLogged = name;
+      return undefined;
+    }
+    return name;
+  }
+
+  /** The project a checkout belongs to: for a git worktree, the directory holding the main .git. "" when it cannot be told. */
+  private async projectDirOf(cwd: string): Promise<string> {
+    const r = await this.git(["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd }).catch(() => null);
+    const common = r && r.code === 0 ? r.stdout.trim() : "";
+    return common.endsWith("/.git") ? common.slice(0, -"/.git".length) : "";
   }
 
   /** An agent works in the workspace: a turn or permission this plugin saw, Paseo's answer, background work in the pod. Null: unknown. */
@@ -1064,7 +1101,7 @@ export class KubernetesRuntime {
       ...(ws.activityAt !== undefined ? { lastActivity: ws.activityAt } : {}),
       ...(ws.warnedAt !== undefined ? { warnedAt: ws.warnedAt } : {}),
       pinned: !!ws.keep,
-      seed: this.hasSeedProfile(config, ws),
+      seed: await this.hasSeedProfile(config, ws),
       labels,
       busy: await this.archiveBusy(ws),
     };

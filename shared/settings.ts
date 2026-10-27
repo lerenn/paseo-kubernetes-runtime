@@ -108,6 +108,12 @@ export const ConfigSchema = z.object({
    * profile never take a warm pod.
    */
   profiles: z.record(z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), ProfileSchema).default({}),
+  /**
+   * Project directory (exact path, or a prefix: it matches everything below it; the longest wins) to profile name. Applied to
+   * a workspace that has no explicit `profile` runtime option; an explicit one always wins. A Paseo worktree of the project
+   * matches through the project its repository belongs to. A name that `profiles` does not define is ignored, with a log line.
+   */
+  projectProfiles: z.record(z.string().startsWith("/"), z.string().regex(/^[a-z][a-z0-9-]{0,31}$/)).default({}),
   /** Pod placement (e.g. {"lab.anyshift.io/pool": "burst"}). */
   nodeSelector: z.record(z.string(), z.string()).default({}),
   /** Taint keys every pod tolerates (operator Exists). */
@@ -223,6 +229,22 @@ export const ConfigSchema = z.object({
 
 export type KubernetesRuntimeConfig = z.infer<typeof ConfigSchema>;
 export type AutoArchiveConfig = z.infer<typeof AutoArchiveSchema>;
+
+/** The profile `projectProfiles` gives a directory: an exact path or the longest listed ancestor directory. */
+export function projectProfileFor(projectProfiles: Record<string, string>, dir: string): string | undefined {
+  const norm = (p: string) => (p.length > 1 ? p.replace(/\/+$/, "") : p);
+  const target = norm(dir);
+  let best: string | undefined;
+  let bestLen = -1;
+  for (const [prefix, profile] of Object.entries(projectProfiles)) {
+    const key = norm(prefix);
+    if ((target === key || target.startsWith(key + "/")) && key.length > bestLen) {
+      best = profile;
+      bestLen = key.length;
+    }
+  }
+  return best;
+}
 
 /** The configuration a workspace runs with: the settings, with its profile's image, storage and resources applied. */
 export function applyProfile(config: KubernetesRuntimeConfig, profile: string | undefined): KubernetesRuntimeConfig {

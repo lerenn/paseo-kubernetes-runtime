@@ -226,6 +226,23 @@ and list daemon directories to copy into the volume once:
 - Making such a workspace: create a Pod workspace on the project that holds the code (for prbr-picky, a dedicated clone of anyshift-io/pr-blast-reviewer; set `PRBR_SUBMODULE` to its path in the pod, not the daemon's shared monorepo submodule) with the
   runtime options `{ "cwd": "<the daemon's checkout>", "profile": "prbr-picky" }`; the data appears next to the checkout at `/workspace/prbr-picky`.
 
+### Profile by project (`projectProfiles`)
+
+`projectProfiles` maps a project directory to a profile name, so every workspace of that project gets the profile without picking it:
+
+```json
+"projectProfiles": {
+  "/home/paseo/src/github.com/anyshift-io/anyshift-monorepo": "builder",
+  "/home/paseo/src/github.com/lerenn/paseo": "builder"
+}
+```
+
+- It applies only to a workspace with no `profile` in its runtime options; an explicit `profile` always wins.
+- A key is an exact path or a directory prefix (everything below it matches; the longest key wins).
+- A Paseo worktree (`/home/paseo/.paseo/worktrees/<id>/<slug>`) is matched by its repository: the runtime asks git for the main checkout behind the worktree (`git rev-parse --git-common-dir`) and matches that. Limit: this needs the worktree to exist on the daemon and be a git worktree of the project; if git cannot say, the workspace gets no profile.
+- A name that `profiles` does not define is ignored with a log line (the workspace runs without a profile), unlike an explicit unknown `profile`, which refuses the workspace.
+- The profile is read when a pod is created: a running pod keeps its image. Workspaces with a profile never take a warm pod.
+
 ## Auto-archive (dry run by default)
 
 A workspace nobody has used for `idleDays` (default 2) is archived, after a warning, and the reaper then removes its pod and volume. The setting is `autoArchive` in the plugin settings:
