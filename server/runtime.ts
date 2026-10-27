@@ -183,8 +183,13 @@ interface WorkspaceState {
   docker?: boolean;
   /** The submodule checkout running in the background, if any. */
   submodulesJob?: Promise<void>;
-  /** Consecutive reconnects of the bridge channel, for backoff. */
-  bridgeRetries: number;
+  /** When the bridge was last probed in the pod, and whether a probe is in flight. */
+  lastProbe?: number;
+  probing?: boolean;
+  /** A bridge reconnect loop is running for this workspace. */
+  reviving?: boolean;
+  /** The bridge stayed down after its retries (a notice was shown); the liveness check keeps trying. */
+  bridgeDown?: boolean;
   /** The pod the pod-side setup was last verified for; a replacement pod has another uid and is set up again. */
   readyUid?: string;
   commands: Set<string>;
@@ -297,7 +302,10 @@ export class KubernetesRuntime {
       const timer = setInterval(fn, ms) as unknown as NodeJS.Timeout;
       timer.unref?.();
       return () => clearInterval(timer);
-    }))(() => void this.checkAutoArchive().catch((e: Error) => this.log(`[kubernetes-runtime] auto-archive check failed: ${e.message}`)), 60_000);
+    }))(() => {
+      void this.checkAutoArchive().catch((e: Error) => this.log(`[kubernetes-runtime] auto-archive check failed: ${e.message}`));
+      this.checkBridges();
+    }, 60_000);
     await this.adopt().catch(() => undefined);
     void this.maintainPool().catch(() => undefined);
   }
@@ -337,7 +345,7 @@ export class KubernetesRuntime {
       this.setPhase(ws, sandbox.operatingMode === "Suspended" ? "suspended" : "running");
       // A pod that runs when the plugin starts had its bridge (and with it the loopback tunnels its agents' MCP
       // servers use) die with the previous plugin process: bring it back without waiting for the next launch.
-      if (sandbox.operatingMode !== "Suspended") void this.restoreBridge(kube, ws).catch(() => undefined);
+      if (sandbox.operatingMode !== "Suspended") void this.reviveBridge(kube, ws, "the plugin started", true);
     }
   }
 
@@ -351,18 +359,96 @@ export class KubernetesRuntime {
     return r.code === 0 ? r.stdout.split("\n").map((l) => Number(l.trim())).filter((n) => Number.isInteger(n) && n > 0 && n < 65536) : [];
   }
 
-  private async restoreBridge(kube: Kube, ws: WorkspaceState): Promise<void> {
+  /** Starts the bridge again. Resolves false when there is nothing to do yet (no pod, not ready); throws when the start failed. */
+  private async restoreBridge(kube: Kube, ws: WorkspaceState): Promise<boolean> {
     const pod = ws.sandbox;
-    if (!pod || ws.bridge) return;
+    if (!pod || ws.phase !== "running") return false;
+    if (ws.bridge) return true;
     const info = await kube.podInfo(pod).catch(() => null);
-    if (!info?.ready || info.terminating) return;
+    if (!info?.ready || info.terminating) return false;
+    let started = false;
     await this.serial(ws, async () => {
-      if (ws.bridge || ws.phase !== "running") return;
+      if (ws.bridge) return void (started = true);
+      if (ws.phase !== "running") return;
+      // a replaced pod (new uid) can leave the old socket file on the volume: remove it before `serve` binds a new one
+      if (ws.readyUid !== info.uid) {
+        await kube.exec(pod, ["sh", "-c", 'rm -f "$HOME/bridge.sock"']).catch(() => undefined);
+        this.log(`[kubernetes-runtime] bridge ${ws.id}: new pod ${info.uid}${ws.readyUid ? ` (was ${ws.readyUid})` : ""}, stale bridge.sock removed`);
+      }
       for (const port of await this.tunnelPortsInUse(kube, pod)) ws.wantPorts.add(port);
       ws.readyUid = info.uid;
       this.startBridge(kube, ws, new Set([...ws.ports, ...ws.wantPorts]));
+      started = true;
       await this.refreshTargets(kube, ws, pod).catch(() => undefined);
     });
+    return started;
+  }
+
+  /** Brings a lost bridge back while the pod runs: up to 5 attempts, 2 s to 60 s apart, each failure logged; a notice when it stays down. */
+  private async reviveBridge(kube: Kube, ws: WorkspaceState, reason: string, immediate = false): Promise<void> {
+    if (ws.reviving || ws.bridge) return;
+    ws.reviving = true;
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    const attempts = 5;
+    try {
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        if (attempt > 0 || !immediate) await sleep(Math.min(60_000, 2_000 * 2 ** attempt));
+        if (this.stopped || ws.bridge || ws.phase !== "running") return;
+        try {
+          if (await this.restoreBridge(kube, ws)) {
+            this.log(`[kubernetes-runtime] bridge ${ws.id} (${ws.sandbox}) restored after ${reason}, attempt ${attempt + 1}`);
+            if (ws.bridgeDown) ws.notice?.("The pod's bridge is back.");
+            ws.bridgeDown = false;
+            return;
+          }
+          this.log(`[kubernetes-runtime] bridge ${ws.id} (${ws.sandbox}) restore attempt ${attempt + 1}/${attempts} after ${reason}: the pod is not ready`);
+        } catch (e) {
+          this.log(`[kubernetes-runtime] bridge ${ws.id} (${ws.sandbox}) restore attempt ${attempt + 1}/${attempts} after ${reason} failed: ${(e as Error).message}`);
+        }
+      }
+      this.log(`[kubernetes-runtime] bridge ${ws.id} (${ws.sandbox}) is still down after ${attempts} attempts`);
+      if (!ws.bridgeDown) ws.notice?.("The pod's bridge is down (git push, MCP tunnels and mail will fail); still retrying every minute. Restart the workspace if it does not come back.", "warning");
+      ws.bridgeDown = true;
+    } finally {
+      ws.reviving = false;
+    }
+  }
+
+  /** Whether `bridge.mjs serve` answers on its socket in the pod; null when the probe itself could not run (an exec error says nothing about the bridge). */
+  private async probeBridge(kube: Kube, pod: string): Promise<boolean | null> {
+    const script = 'const s=require("net").connect(process.env.HOME+"/bridge.sock");const t=setTimeout(()=>process.exit(8),2000);s.on("connect",()=>{clearTimeout(t);s.end();process.exit(0)});s.on("error",()=>process.exit(7))';
+    const r = await kube.exec(pod, ["node", "-e", script]).catch(() => null);
+    if (!r) return null;
+    if (r.code === 0) return true;
+    return r.code === 7 || r.code === 8 ? false : null;
+  }
+
+  /** Liveness: a running workspace gets its bridge restored when the channel is gone, or when it looks open but the bridge in the pod does not answer (probed at most once a minute). */
+  checkBridges(): void {
+    if (this.stopped) return;
+    for (const ws of this.states.values()) {
+      if (ws.phase !== "running" || !ws.sandbox || ws.reviving || ws.probing) continue;
+      const pod = ws.sandbox;
+      void (async () => {
+        const kube = this.deps.kubeFor(await this.deps.getConfig());
+        if (!ws.bridge) return this.reviveBridge(kube, ws, "a liveness check found it down");
+        const t = this.now();
+        if (ws.lastProbe !== undefined && t - ws.lastProbe < 50_000) return;
+        ws.lastProbe = t;
+        ws.probing = true;
+        let alive: boolean | null;
+        try {
+          alive = await this.probeBridge(kube, pod);
+        } finally {
+          ws.probing = false;
+        }
+        if (alive !== false || !ws.bridge || ws.phase !== "running" || ws.sandbox !== pod) return;
+        this.log(`[kubernetes-runtime] bridge ${ws.id} (${pod}) channel looks open but the bridge in the pod does not answer: restarting it`);
+        ws.bridge.close();
+        ws.bridge = undefined;
+        await this.reviveBridge(kube, ws, "the liveness probe failed");
+      })().catch((e: Error) => this.log(`[kubernetes-runtime] bridge liveness check failed for ${ws.id}: ${e.message}`));
+    }
   }
 
   private newState(id: string, options: RuntimeOptions): WorkspaceState {
@@ -372,7 +458,6 @@ export class KubernetesRuntime {
       phase: "none",
       ports: new Set(),
       wantPorts: new Set(),
-      bridgeRetries: 0,
       targets: [],
       commands: new Set(),
       agents: new Map(),
@@ -589,14 +674,11 @@ export class KubernetesRuntime {
         mapPort: this.deps.mapTunnelPort,
         onEnd: () => {
           // the channel to the pod's bridge ended (a network blip, a restarted API server): bring it back while the pod runs
-          if (ws.bridge !== bridge || ws.phase !== "running" || this.stopped) return;
+          if (ws.bridge !== bridge || this.stopped) return;
           ws.bridge = undefined;
-          // one that lived a while was healthy: start the backoff over
-          if (this.now() - startedAt > 60_000) ws.bridgeRetries = 0;
-          const attempt = ws.bridgeRetries++;
-          const delay = Math.min(30_000, 2_000 * 2 ** attempt);
-          const timer = setTimeout(() => void this.restoreBridge(kube, ws).catch(() => undefined), delay);
-          (timer as { unref?: () => void }).unref?.();
+          const lived = Math.round((this.now() - startedAt) / 1000);
+          this.log(`[kubernetes-runtime] bridge ${ws.id} (${ws.sandbox}) channel ended after ~${lived}s (workspace is ${ws.phase})`);
+          if (ws.phase === "running") void this.reviveBridge(kube, ws, "its channel ended");
         },
       },
     );

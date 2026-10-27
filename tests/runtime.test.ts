@@ -740,6 +740,101 @@ describe("the tunnels survive a plugin restart", () => {
   });
 });
 
+describe("the bridge is kept alive", () => {
+  const SANDBOX = { name: "pka-running", labels: { "paseo.sh/daemon": "srv_ME", "paseo.sh/workspace-id": "wks_1" }, annotations: { "paseo.sh/cwd": CWD }, operatingMode: "Running" as const, createdAt: new Date(0).toISOString() };
+  const settle = () => new Promise((r) => setTimeout(r, 30));
+  async function started(extra: object = {}) {
+    const logs: string[] = [];
+    const t = setup({}, { log: (l: string) => void logs.push(l), ...extra });
+    t.kube.sandboxes = [{ ...SANDBOX }];
+    await t.runtime.start();
+    await settle();
+    expect(t.kube.streams).toHaveLength(1);
+    return { t, logs };
+  }
+
+  it("logs the end of the channel and restores the bridge", async () => {
+    const { t, logs } = await started();
+    t.kube.streams[0]!.end();
+    await settle();
+    expect(t.kube.streams).toHaveLength(2);
+    expect(logs.some((l) => l.includes("channel ended"))).toBe(true);
+    expect(logs.some((l) => l.includes("restored after its channel ended"))).toBe(true);
+  });
+
+  it("retries a failed restore 5 times with backoff, logs each failure and surfaces a notice", async () => {
+    const sleeps: number[] = [];
+    const { t, logs } = await started({ sleep: async (ms: number) => void sleeps.push(ms) });
+    const notices: string[] = [];
+    (t.runtime as any).states.get("wks_1").notice = (m: string) => void notices.push(m);
+    t.kube.podInfo = async () => {
+      throw new Error("boom");
+    };
+    t.kube.pods = [{ uid: "uid-1", ready: false, terminating: false }];
+    t.kube.streams[0]!.end();
+    await settle();
+    expect(sleeps).toEqual([2_000, 4_000, 8_000, 16_000, 32_000]);
+    expect(logs.filter((l) => l.includes("restore attempt"))).toHaveLength(5);
+    expect(notices.some((m) => m.includes("bridge is down"))).toBe(true);
+    expect(t.kube.streams).toHaveLength(1);
+  });
+
+  it("restores a dead bridge on a liveness tick", async () => {
+    const { t } = await started();
+    const ws = (t.runtime as any).states.get("wks_1");
+    ws.bridge = undefined; // the channel is gone and nothing is retrying
+    t.runtime.checkBridges();
+    await settle();
+    expect(t.kube.streams).toHaveLength(2);
+  });
+
+  it("removes the stale socket when the pod was replaced", async () => {
+    const { t } = await started();
+    t.kube.pods = [{ uid: "uid-2", ready: true, terminating: false }];
+    t.kube.streams[0]!.end();
+    await settle();
+    expect(t.kube.streams).toHaveLength(2);
+    expect(t.kube.execs.some((e) => e.argv.join(" ").includes("rm -f") && e.argv.join(" ").includes("bridge.sock"))).toBe(true);
+  });
+
+  it("probes an open channel and restores the bridge when it does not answer", async () => {
+    const { t, logs } = await started();
+    const probes = () => t.kube.execs.filter((e) => e.argv[0] === "node" && e.argv[1] === "-e").length;
+    t.runtime.checkBridges();
+    await settle();
+    expect(probes()).toBe(1);
+    expect(t.kube.streams).toHaveLength(1); // answers (exit 0): left alone
+    t.runtime.checkBridges();
+    await settle();
+    expect(probes()).toBe(1); // rate limited
+    t.advance(60_000);
+    t.kube.execResult = { code: 7, stdout: "", stderr: "" }; // connection refused: serve is gone
+    t.runtime.checkBridges();
+    await settle();
+    expect(probes()).toBe(2);
+    expect(t.kube.streams).toHaveLength(2);
+    expect(logs.some((l) => l.includes("does not answer"))).toBe(true);
+  });
+
+  it("leaves the bridge alone when the probe itself cannot run", async () => {
+    const { t } = await started();
+    t.kube.execResult = { code: 1, stdout: "", stderr: "exec failed" };
+    t.runtime.checkBridges();
+    await settle();
+    expect(t.kube.streams).toHaveLength(1);
+  });
+
+  it("does not restore for a suspended workspace", async () => {
+    const { t } = await started();
+    const ws = (t.runtime as any).states.get("wks_1");
+    ws.bridge = undefined;
+    ws.phase = "suspended";
+    t.runtime.checkBridges();
+    await settle();
+    expect(t.kube.streams).toHaveLength(1);
+  });
+});
+
 describe("the 30 second limit on prepare", () => {
   it("returns from prepare when the window ends while the pod is still starting, and exec waits for the rest", async () => {
     const t = setup({}, { startWindowMs: 0 });
