@@ -20,6 +20,7 @@ import {
   LAST_ACTIVITY_ANNOTATION,
   PROBE_ANNOTATION,
   PROBE_SCRIPT,
+  probeWindowOpen,
   WARNED_ANNOTATION,
   decide,
   parseProbe,
@@ -127,6 +128,9 @@ export interface RuntimeDeps {
   fetch?: typeof fetch;
   log?: (line: string) => void;
 }
+
+/** A look at a running pod is reused this long (the final check before an archive never is). */
+const PROBE_REUSE_MS = 2 * 3_600_000;
 
 interface AgentActivity {
   turn: boolean;
@@ -1125,6 +1129,7 @@ export class KubernetesRuntime {
     kube: Kube,
     ws: WorkspaceState,
     mode: "look" | "final",
+    windowOpen = true,
   ): Promise<{ ok: true } | { ok: false; reason: string; seed?: boolean }> {
     const judge = (p: ProbeResult | undefined): { ok: true } | { ok: false; reason: string; seed?: boolean } => {
       if (!p) return { ok: false, reason: "not checked yet" };
@@ -1133,8 +1138,9 @@ export class KubernetesRuntime {
       return { ok: false, reason: p.reasons.join("; ") || "could not be checked" };
     };
     if (ws.phase === "running") {
-      const cached = mode === "look" && ws.probe && this.now() - ws.probe.at < 30 * 60_000 ? ws.probe : undefined;
+      const cached = mode === "look" && ws.probe && this.now() - ws.probe.at < PROBE_REUSE_MS ? ws.probe : undefined;
       if (cached) return judge(cached);
+      if (mode === "look" && !windowOpen) return { ok: false, reason: "not idle long enough to be checked yet" }; // the probe costs the pod CPU and disk
       const probe = mode === "final" ? await this.runProbe(kube, ws) : await this.serial(ws, () => this.runProbe(kube, ws));
       ws.probe = probe;
       return judge(probe);
@@ -1231,7 +1237,7 @@ export class KubernetesRuntime {
         ws.archiveAt = undefined;
         continue;
       }
-      const safety = await this.archiveSafety(config, kube, ws, "look").catch((e: Error): { ok: false; reason: string; seed?: boolean } => ({ ok: false, reason: e.message }));
+      const safety = await this.archiveSafety(config, kube, ws, "look", probeWindowOpen(facts, cfg)).catch((e: Error): { ok: false; reason: string; seed?: boolean } => ({ ok: false, reason: e.message }));
       if (!safety.ok) {
         if (safety.seed) next.kept.set(ws.id, "holds seed data: never archived");
         else blocked(safety.reason);

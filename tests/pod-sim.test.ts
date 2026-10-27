@@ -499,7 +499,9 @@ describe("loopback tunnel to the daemon's MCP servers", () => {
 });
 
 describe("the auto-archive probe (real git in the pod)", () => {
-  const probe = async (kube: LocalPodKube, podDir: string) => {
+  // a clone's own fetch leaves FETCH_HEAD fresh, which makes the probe skip its fetch: age it unless the test is about that
+  const probe = async (kube: LocalPodKube, podDir: string, options: { keepFetchHead?: boolean } = {}) => {
+    if (!options.keepFetchHead) execFileSync("find", [podDir, "-name", "FETCH_HEAD", "-exec", "touch", "-d", "1 hour ago", "{}", "+"]);
     const r = await kube.exec("pod", ["sh", "-c", PROBE_SCRIPT, "sh", podDir]);
     return parseProbe(r.code, r.stdout, 0);
   };
@@ -658,5 +660,13 @@ describe("the auto-archive probe (real git in the pod)", () => {
     sh(podDir, "remote", "set-url", "origin", join(origin, "nowhere"));
     const p = await probe(kube, podDir);
     expect(p.state).not.toBe("clean");
+  }, 60_000);
+
+  it("skips the fetch when FETCH_HEAD is younger than 10 minutes, and fetches again when it is older", async () => {
+    const { kube, podDir, origin } = await openSession();
+    expect((await probe(kube, podDir)).state).toBe("clean"); // fetches: FETCH_HEAD is now fresh
+    sh(podDir, "remote", "set-url", "origin", join(origin, "nowhere"));
+    expect((await probe(kube, podDir, { keepFetchHead: true })).state).toBe("clean"); // no fetch, so the broken remote is not noticed
+    expect((await probe(kube, podDir)).state).not.toBe("clean"); // aged: fetches, fails
   }, 60_000);
 });
