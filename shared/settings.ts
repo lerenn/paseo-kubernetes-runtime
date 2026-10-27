@@ -52,6 +52,37 @@ export const ProfileSchema = z.object({
     .optional(),
 });
 
+const LabelRule = z.string().regex(/^[^=\s]+(=[^=\s]*)?$/, "Use key=value");
+
+/**
+ * Archives workspaces that have been idle for days, after a warning. Every check that the pod holds nothing unpushed
+ * must pass first (see server/autoarchive.ts); a workspace that fails one is listed on the screen and never archived.
+ */
+export const AutoArchiveSchema = z.object({
+  enabled: z.boolean().default(true),
+  /** Warn and log what would be archived, but archive nothing. On by default: turn it off once the log looks right. */
+  dryRun: z.boolean().default(true),
+  /** Archive a workspace after this many days without activity. 0 = never. */
+  idleDays: z.number().min(0).default(2),
+  /** The warning (a notice in the workspace, "archives in Xh unless activity") comes this long before the archive. */
+  warnHours: z.number().min(0).default(12),
+  /** Workspaces with an agent carrying one of these labels (`key=value`) are never archived. */
+  exemptLabels: z.array(LabelRule).default(["paseo.keep=1"]),
+  /** At most this many workspaces are archived per run (every minute). */
+  maxPerRun: z.number().int().min(1).default(3),
+  /** Throwaway workspaces (an agent with this label) are archived sooner. */
+  ephemeral: z
+    .object({
+      label: LabelRule.default("paseo.ephemeral=1"),
+      idleHours: z.number().min(0).default(6),
+    })
+    .default({ label: "paseo.ephemeral=1", idleHours: 6 }),
+  /** A ceiling on a workspace's age, whatever its activity. Off (unset or 0) by default; dirty or unpushed workspaces are still skipped. */
+  maxAgeDays: z.number().min(0).optional(),
+  /** The namespace's pod quota, if any: a suspended workspace without a stored check is resumed for one only while fewer than quota - 2 pods exist. Unset: no quota check. */
+  podQuota: z.number().int().min(1).optional(),
+});
+
 export const ConfigSchema = z.object({
   /** kubectl context. Unset uses the current context of the daemon's kubeconfig. */
   context: z.string().optional(),
@@ -172,9 +203,18 @@ export const ConfigSchema = z.object({
     .default({ interruptedExit: false, autoResume: true, checkpointNudge: true }),
   /** A workspace whose agents have all been idle this long has its pod deleted (the volume stays); any input brings it back. 0 = never. */
   podIdleMinutes: z.number().int().min(0).default(30),
+  autoArchive: AutoArchiveSchema.default(() => AutoArchiveSchema.parse({})),
+}).superRefine((c, ctx) => {
+  const a = c.autoArchive;
+  // A workspace is archived from its idle time; it must be suspended well before, or the check would resume it.
+  if (a.enabled && c.podIdleMinutes > 0) {
+    if (a.idleDays > 0 && a.idleDays * 24 * 60 <= c.podIdleMinutes) ctx.addIssue({ code: "custom", path: ["autoArchive", "idleDays"], message: "idleDays must be longer than podIdleMinutes" });
+    if (a.ephemeral.idleHours > 0 && a.ephemeral.idleHours * 60 <= c.podIdleMinutes) ctx.addIssue({ code: "custom", path: ["autoArchive", "ephemeral", "idleHours"], message: "ephemeral.idleHours must be longer than podIdleMinutes" });
+  }
 });
 
 export type KubernetesRuntimeConfig = z.infer<typeof ConfigSchema>;
+export type AutoArchiveConfig = z.infer<typeof AutoArchiveSchema>;
 
 /** The configuration a workspace runs with: the settings, with its profile's image, storage and resources applied. */
 export function applyProfile(config: KubernetesRuntimeConfig, profile: string | undefined): KubernetesRuntimeConfig {
