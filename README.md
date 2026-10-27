@@ -145,8 +145,7 @@ A `builder` profile for heavy builds, on on-demand capacity and with more memory
 }
 ```
 
-(If the installed version has no `nodeSelector` in profiles, set it on the pod through the global setting for a dedicated plugin
-instance; profiles take `image`, `storage`, `resources` and `seed` as shown below.)
+A profile's `nodeSelector` is added to the global one (the profile wins on a shared key).
 
 ## Out-of-memory kills
 

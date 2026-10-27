@@ -37,6 +37,8 @@ export const ProfileSchema = z.object({
   /** Copied into the volume the first time the workspace starts; a marker on the volume keeps it from being copied again. */
   seed: z.array(SeedDirSchema).default([]),
   image: z.string().min(1).optional(),
+  /** Added to the global `nodeSelector` (this one wins on a shared key), e.g. karpenter.sh/capacity-type=on-demand. */
+  nodeSelector: z.record(z.string(), z.string()).optional(),
   /** Overrides the size and storage class of a new workspace volume. An existing volume keeps its claim. */
   storage: z
     .object({
@@ -230,6 +232,7 @@ export function applyProfile(config: KubernetesRuntimeConfig, profile: string | 
   return {
     ...config,
     ...(p.image ? { image: p.image } : {}),
+    ...(p.nodeSelector ? { nodeSelector: { ...config.nodeSelector, ...p.nodeSelector } } : {}),
     ...(p.resources ? { resources: { ...config.resources, ...p.resources } } : {}),
     storage: { ...config.storage, ...(p.storage?.size ? { size: p.storage.size } : {}), ...(p.storage?.storageClassName ? { storageClassName: p.storage.storageClassName } : {}) },
   };
