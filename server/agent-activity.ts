@@ -82,3 +82,19 @@ export async function sendUnlessBusy(
     return "sent";
   }
 }
+
+/**
+ * The labels of each live (not archived) agent of a workspace, from the agent list. Null when the list cannot be read, which
+ * callers treat as "unknown", never as "no labels".
+ */
+export async function labelsOfWorkspace(paseo: AgentListApi | null, workspaceId: string): Promise<Record<string, string>[] | null> {
+  if (!paseo) return null;
+  try {
+    const result = (await paseo.agents.list({})) as { entries?: { agent?: AgentLike & { labels?: Record<string, string> } }[] } | (AgentLike & { labels?: Record<string, string> })[];
+    const entries = Array.isArray(result) ? result : (result.entries ?? []);
+    const agents = entries.map((e) => ((e as { agent?: AgentLike }).agent ?? e) as AgentLike & { labels?: Record<string, string> });
+    return agents.filter((a) => a.workspaceId === workspaceId && !a.archivedAt).map((a) => a.labels ?? {});
+  } catch {
+    return null;
+  }
+}

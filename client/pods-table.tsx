@@ -3,8 +3,8 @@ import { useRpc } from "@getpaseo/plugin/client";
 import { SettingsCard, SettingsSection, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import { actionsFor, ago, reaperLine } from "../shared/pods-view.js";
-import { type PodRow, kubePodAction, kubeReconcile, kubeStatus } from "../shared/status.js";
+import { PINNED_TEXT, actionsFor, ago, reaperLine } from "../shared/pods-view.js";
+import { type PodRow, kubeKeep, kubePodAction, kubeReconcile, kubeStatus } from "../shared/status.js";
 
 type Colors = PluginScreenProps["theme"]["colors"];
 
@@ -15,6 +15,18 @@ function Badge({ state, colors }: { state: PodRow["state"]; colors: Colors }) {
   return (
     <View style={{ borderWidth: 1, borderColor: color, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 1 }}>
       <Text style={{ color, fontSize: 12 }}>{state}</Text>
+    </View>
+  );
+}
+
+function ArchiveBadge({ row, colors }: { row: PodRow; colors: Colors }) {
+  if (!row.autoArchive) return null;
+  const color = row.autoArchive === "blocked" ? colors.statusWarning : row.autoArchive === "scheduled" ? colors.statusDanger : colors.foregroundMuted;
+  return (
+    <View accessibilityLabel={`Auto-archive: ${row.autoArchiveText ?? row.autoArchive}`} style={{ borderWidth: 1, borderColor: color, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 1 }}>
+      <Text style={{ color, fontSize: 12 }} numberOfLines={1}>
+        {row.autoArchive === "scheduled" ? "archiving" : row.autoArchive === "blocked" ? "not archivable" : "kept"}
+      </Text>
     </View>
   );
 }
@@ -49,6 +61,7 @@ export function PodsTable({ theme, layout, navigation }: Pick<PluginScreenProps,
   const load = useRpc(kubeStatus);
   const act = useRpc(kubePodAction);
   const reconcile = useRpc(kubeReconcile);
+  const keep = useRpc(kubeKeep);
   const [status, setStatus] = useState<Awaited<ReturnType<typeof load>> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
@@ -148,6 +161,7 @@ export function PodsTable({ theme, layout, navigation }: Pick<PluginScreenProps,
                 </View>
                 <View style={{ flex: wide ? 2 : undefined, flexDirection: "row", alignItems: "center", gap: 8 }}>
                   <Badge state={row.state} colors={colors} />
+                  <ArchiveBadge row={row} colors={colors} />
                   <Text style={muted}>{row.since ? ago(row.since) : ""}</Text>
                 </View>
                 <Text style={{ ...muted, flex: wide ? 3 : undefined }} numberOfLines={wide ? 2 : undefined}>
@@ -182,6 +196,21 @@ export function PodsTable({ theme, layout, navigation }: Pick<PluginScreenProps,
                   {actionsFor(row.state, row.workspaceId).map((a) => (
                     <Button key={a} label={LABELS[a]} danger={a === "delete"} colors={colors} disabled={working === row.workspaceId} onPress={() => onAction(row, a)} />
                   ))}
+                  {!row.workspaceId.startsWith("warm:") ? (
+                    <Button
+                      label={row.autoArchiveText === PINNED_TEXT ? "Unkeep" : "Keep"}
+                      colors={colors}
+                      disabled={working === row.workspaceId}
+                      onPress={() => {
+                        setWorking(row.workspaceId);
+                        void keep({ workspaceId: row.workspaceId, keep: row.autoArchiveText !== PINNED_TEXT })
+                          .then((r) => setNotice(r.ok ? null : `Keep failed: ${r.message ?? "unknown error"}`))
+                          .catch((e: Error) => setNotice(`Keep failed: ${e.message}`))
+                          .then(refresh)
+                          .finally(() => setWorking(null));
+                      }}
+                    />
+                  ) : null}
                 </View>
               )}
             </View>

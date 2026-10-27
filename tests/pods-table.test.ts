@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { actionsFor, ago, reaperLine } from "../shared/pods-view.js";
+import { actionsFor, ago, reaperLine, until } from "../shared/pods-view.js";
 import { agentsIn, buildPodRows, shortImage } from "../server/status.js";
 
 const sandbox = (name: string, extra: object = {}) => ({
@@ -64,5 +64,12 @@ describe("the pods table rows", () => {
     expect(reaperLine({ removed: 0, unlabelled: [] })).toBe("Orphan cleanup: not run yet");
     expect(reaperLine({ removed: 2, unlabelled: ["a"], lastRunAt: new Date().toISOString() })).toBe("Last reconcile: 2 orphans removed (just now); 1 unlabelled left alone");
     expect(ago(new Date(Date.now() - 3 * 3600_000).toISOString())).toBe("3 h ago");
+  });
+
+  it("words a time ahead for the auto-archive countdown", () => {
+    const now = Date.parse("2026-10-27T00:00:00Z");
+    expect(until("2026-10-27T00:20:00Z", now)).toBe("in 20 min");
+    expect(until("2026-10-27T05:00:00Z", now)).toBe("in 5 h");
+    expect(until("2026-10-26T23:00:00Z", now)).toBe("now");
   });
 });

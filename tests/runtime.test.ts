@@ -793,7 +793,7 @@ describe("labels for people", () => {
     const t = setup({ podIdleMinutes: 30 });
     await t.prepare({ env: { PASEO_AGENT_ID: "0c0f7a18-aaaa-bbbb" } });
     expect((t.kube.applied[0] as any).metadata.labels).toMatchObject({ "paseo.sh/agent": "0c0f7a18", "paseo.sh/state": "running" });
-    const last = () => t.kube.patches2.filter((p) => p.patch.metadata).at(-1)!.patch.metadata.labels;
+    const last = () => t.kube.patches2.filter((p) => p.patch.metadata?.labels).at(-1)!.patch.metadata.labels;
 
     // another agent starts in the same workspace: the labels follow it
     await t.prepare({ env: { PASEO_AGENT_ID: "99999999-aaaa" } });
