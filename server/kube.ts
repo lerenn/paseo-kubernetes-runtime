@@ -21,6 +21,10 @@ export interface PodInfo {
   disrupted?: string;
   /** A container was killed for memory. */
   oomKilled?: boolean;
+  /** When the OOM-killed container ended (ISO), to tell one kill from the next. */
+  oomAt?: string;
+  /** The workspace container's memory limit as the pod spec says (e.g. 3Gi). */
+  memoryLimit?: string;
   /** Why the pod is not running yet, in a form fit to show a user (scheduling, volume, image pull). */
   problem?: string;
 }
@@ -38,7 +42,11 @@ export function parsePodInfo(pod: any): PodInfo {
       ? `Container waiting: ${waiting.reason}${waiting.message ? ` (${waiting.message})` : ""}`
       : undefined;
   const disruption = cond("DisruptionTarget")?.status === "True" ? cond("DisruptionTarget") : undefined;
-  const oom = (pod?.status?.containerStatuses ?? []).some((c: any) => c.state?.terminated?.reason === "OOMKilled" || c.lastState?.terminated?.reason === "OOMKilled");
+  const killed = (pod?.status?.containerStatuses ?? [])
+    .map((c: any) => [c.state?.terminated, c.lastState?.terminated].find((t) => t?.reason === "OOMKilled"))
+    .find(Boolean);
+  const oom = Boolean(killed);
+  const memoryLimit = pod?.spec?.containers?.[0]?.resources?.limits?.memory;
   return {
     uid: pod?.metadata?.uid ?? "",
     ready: cond("Ready")?.status === "True",
@@ -46,6 +54,8 @@ export function parsePodInfo(pod: any): PodInfo {
     phase: pod?.status?.phase,
     ...(disruption ? { disrupted: disruption.reason ?? "Disrupted" } : {}),
     ...(oom ? { oomKilled: true } : {}),
+    ...(killed?.finishedAt ? { oomAt: killed.finishedAt } : {}),
+    ...(memoryLimit ? { memoryLimit } : {}),
     ...(problem ? { problem } : {}),
   };
 }
@@ -104,6 +114,8 @@ export interface Kube {
   patchSandbox(name: string, patch: Record<string, unknown>): Promise<void>;
   /** Sets labels and annotations on a pod or volume claim (`kubectl label/annotate --overwrite`). */
   label(kind: "pod" | "pvc", name: string, labels: Record<string, string>, annotations?: Record<string, string>): Promise<void>;
+  /** Sets and removes annotations on a pod (`kubectl annotate --overwrite`, `key-`); removing a missing one is fine. */
+  annotatePod(name: string, set: Record<string, string>, remove?: string[]): Promise<void>;
   /** Sandboxes matching a label selector. */
   listSandboxes(selector: string): Promise<SandboxInfo[]>;
   /** Volume claims matching a label selector (all claims in the namespace when omitted). */
@@ -288,6 +300,11 @@ export class Kubectl implements Kube {
     if (Object.keys(annotations).length) {
       await this.ok(["annotate", kind, name, "--overwrite", ...Object.entries(annotations).map(([k, v]) => `${k}=${v}`)]);
     }
+  }
+
+  async annotatePod(name: string, set: Record<string, string>, remove: string[] = []): Promise<void> {
+    const args = [...Object.entries(set).map(([k, v]) => `${k}=${v}`), ...remove.map((k) => `${k}-`)];
+    if (args.length) await this.ok(["annotate", "pod", name, "--overwrite", ...args]);
   }
 
   async listSandboxes(selector: string): Promise<SandboxInfo[]> {

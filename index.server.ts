@@ -47,6 +47,7 @@ export default function contribute(server: PluginServerContext) {
     recoveryStateFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "interruptions.json"),
     autoArchiveLogFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "auto-archive.json"),
     workspaceLabels: (workspaceId) => labelsOfWorkspace(paseoApi, workspaceId),
+    oomStateFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "oom.json"),
     // `skip` is the fork's (not in the published SDK's types); a host without it is handled in sendUnlessBusy
     messenger: {
       async send(agentId, text, behavior) {
@@ -122,7 +123,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(kubeStatus, async () => {
     const config = await getConfig();
     const [titles, agents] = await Promise.all([paseoWorkspaces(), paseoAgents()]);
-    const pods = await readPodRows(kubeFor(config), daemonId, registry.list(), titles, agents);
+    const pods = await readPodRows(kubeFor(config), daemonId, registry.list(), titles, agents, runtime.oomStats());
     return {
       reaper: reaper.current(),
       pods: pods.map((row) => ({ ...row, ...runtime.autoArchiveBadge(row.workspaceId) })),

@@ -163,6 +163,11 @@ export function PodsTable({ theme, layout, navigation }: Pick<PluginScreenProps,
                   <Badge state={row.state} colors={colors} />
                   <ArchiveBadge row={row} colors={colors} />
                   <Text style={muted}>{row.since ? ago(row.since) : ""}</Text>
+                  {row.oom ? (
+                    <Text style={{ color: colors.statusDanger, fontSize: 12 }} accessibilityLabel="Out-of-memory kills">
+                      {`OOM ×${row.oom.count} · ${ago(row.oom.lastAt)}${row.oom.limit ? ` · limit ${row.oom.limit}` : ""}${row.oom.peakMi ? ` · peak ${row.oom.peakMi}Mi` : ""}`}
+                    </Text>
+                  ) : null}
                 </View>
                 <Text style={{ ...muted, flex: wide ? 3 : undefined }} numberOfLines={wide ? 2 : undefined}>
                   {row.agents.length ? row.agents.map((a) => `${a.title}${a.status === "running" ? " (running)" : ""}`).join(", ") : "no agents"}

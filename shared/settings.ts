@@ -127,6 +127,12 @@ export const ConfigSchema = z.object({
    */
   podAnnotations: z.record(z.string(), z.string()).default({}),
   /**
+   * Annotations on a workspace's pod only while an agent has a turn open: put on when a turn opens, taken off 30 s after the
+   * last one ends (and reconciled after a plugin restart). The default keeps Karpenter from consolidating a node under a working
+   * agent but lets it reclaim an idle one. `podAnnotations` should no longer carry `karpenter.sh/do-not-disrupt`.
+   */
+  turnAnnotations: z.record(z.string(), z.string()).default({ "karpenter.sh/do-not-disrupt": "true" }),
+  /**
    * ServiceAccount by agent label. The first rule whose `label` (`key=value`) is among the labels of the first agent
    * of a workspace names the pod's ServiceAccount, and its token is mounted. No match: the pod has no token.
    * Chosen when the pod is created, so a warm pod (which waits for any workspace) is never used for one.
