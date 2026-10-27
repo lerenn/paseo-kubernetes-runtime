@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ConfigSchema } from "../shared/settings.js";
 import { KubernetesRuntime } from "../server/runtime.js";
 import { runGit } from "../server/git.js";
+import { PROBE_SCRIPT, parseProbe } from "../server/autoarchive.js";
 import { LocalPodKube } from "./local-pod.js";
 
 const ID = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
@@ -495,4 +496,100 @@ describe("loopback tunnel to the daemon's MCP servers", () => {
     // nothing listens inside the pod on that port, and the daemon's server is not reachable through the bridge
     expect([0, 3]).toContain(r.code);
   });
+});
+
+describe("the auto-archive probe (real git in the pod)", () => {
+  const probe = async (kube: LocalPodKube, podDir: string) => {
+    const r = await kube.exec("pod", ["sh", "-c", PROBE_SCRIPT, "sh", podDir]);
+    return parseProbe(r.code, r.stdout, 0);
+  };
+
+  it("finds a freshly seeded workspace clean", async () => {
+    const { kube, podDir } = await openSession();
+    const p = await probe(kube, podDir);
+    expect(p, JSON.stringify(p)).toMatchObject({ state: "clean", reasons: [] });
+    expect(p.head).toBe(sh(podDir, "rev-parse", "HEAD"));
+  }, 60_000);
+
+  it("blocks on uncommitted changes, untracked files and stash entries", async () => {
+    const { kube, podDir } = await openSession();
+    writeFileSync(join(podDir, "a.txt"), "changed\n");
+    expect((await probe(kube, podDir)).reasons.join()).toMatch(/uncommitted or untracked/);
+    sh(podDir, "stash");
+    const stashed = await probe(kube, podDir);
+    expect(stashed.state).toBe("blocked");
+    expect(stashed.reasons.join()).toMatch(/stash entries/);
+    sh(podDir, "stash", "drop");
+    expect((await probe(kube, podDir)).state).toBe("clean");
+    writeFileSync(join(podDir, "new.txt"), "untracked\n");
+    const untracked = await probe(kube, podDir);
+    expect(untracked.state).toBe("blocked");
+    expect(untracked.reasons.join()).toMatch(/uncommitted or untracked/);
+  }, 60_000);
+
+  it("blocks on a commit or a branch that is on no remote, and is clean once it was pushed", async () => {
+    const { kube, podDir } = await openSession();
+    writeFileSync(join(podDir, "work.txt"), "work\n");
+    sh(podDir, "add", ".");
+    sh(podDir, "commit", "-qm", "unpushed on main");
+    const head = await probe(kube, podDir);
+    expect(head.state).toBe("blocked");
+    expect(head.reasons.join()).toMatch(/HEAD has commits/);
+    sh(podDir, "switch", "-q", "-c", "side");
+    sh(podDir, "switch", "-q", "main");
+    sh(podDir, "reset", "-q", "--hard", "origin/main");
+    const branch = await probe(kube, podDir);
+    expect(branch.reasons.join()).toMatch(/local branch has commits/); // "side" still holds the commit
+    const pushed = await kube.as(["git", "push", "origin", "side"], { cwd: podDir });
+    expect(pushed.code, pushed.stderr).toBe(0);
+    const after = await probe(kube, podDir);
+    expect(after, JSON.stringify(after)).toMatchObject({ state: "clean" });
+  }, 60_000);
+
+  it("blocks on a rebase in progress", async () => {
+    const { kube, podDir } = await openSession();
+    sh(podDir, "switch", "-q", "-c", "side");
+    writeFileSync(join(podDir, "a.txt"), "side\n");
+    sh(podDir, "commit", "-qam", "side change");
+    sh(podDir, "switch", "-q", "main");
+    writeFileSync(join(podDir, "a.txt"), "main\n");
+    sh(podDir, "commit", "-qam", "main change");
+    sh(podDir, "switch", "-q", "side");
+    try {
+      sh(podDir, "rebase", "main");
+    } catch {
+      // the conflict is what is wanted
+    }
+    const p = await probe(kube, podDir);
+    expect(p.state).toBe("blocked");
+    expect(p.reasons.join()).toMatch(/rebase-(merge|apply) is in progress/);
+  }, 60_000);
+
+  it("looks into the submodules: an unpushed submodule commit blocks", async () => {
+    const { kube, podDir, notices } = await openSession("sh", {}, undefined, {}, true);
+    await wait(() => notices.some((n) => /Submodules are ready/.test(n)));
+    expect((await probe(kube, podDir)).state, "clean with its submodule").toBe("clean");
+    const lib = join(podDir, "vendor/lib");
+    writeFileSync(join(lib, "pod.txt"), "from the pod\n");
+    sh(lib, "switch", "-q", "-c", "pod-branch");
+    sh(lib, "add", ".");
+    sh(lib, "commit", "-qm", "pod change");
+    const p = await probe(kube, podDir);
+    expect(p.state).toBe("blocked");
+    expect(p.reasons.join("\n")).toMatch(/submodule vendor\/lib: .*(commits that are on no remote)/);
+  }, 90_000);
+
+  it("never archives a volume that holds seed data", async () => {
+    const { kube, podDir } = await openSession();
+    mkdirSync(join(kube.workspace, ".seeded"), { recursive: true });
+    writeFileSync(join(kube.workspace, ".seeded", "abc"), "");
+    expect((await probe(kube, podDir)).state).toBe("seed");
+  }, 60_000);
+
+  it("cannot be fooled by a fetch that fails: it says unknown", async () => {
+    const { kube, podDir, origin } = await openSession();
+    sh(podDir, "remote", "set-url", "origin", join(origin, "nowhere"));
+    const p = await probe(kube, podDir);
+    expect(p.state).not.toBe("clean");
+  }, 60_000);
 });
