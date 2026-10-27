@@ -11,7 +11,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
  && echo "deb [signed-by=/usr/share/keyrings/gh.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/gh.list \
  && apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
 
-# kubectl, for agents with a ServiceAccount (the paseo-ops one reads the cluster). Verified against the published checksum.
+# kubectl, for agents with a ServiceAccount (the paseo-scoped-daemon-access one reads the cluster). Verified against the published checksum.
 ARG KUBECTL_VERSION=v1.33.5
 RUN arch="$(dpkg --print-architecture)" \
  && curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl" \

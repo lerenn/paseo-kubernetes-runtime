@@ -119,7 +119,7 @@ export class Tunnels {
 /** Loopback ports an MCP server config points at (`http://127.0.0.1:<port>/...`), for the tunnel. */
 export function loopbackPorts(
   mcpServers: Readonly<Record<string, { type: string; url?: string }>>,
-  /** Other loopback URLs the process is told about through its environment (e.g. Daemon Ops). */
+  /** Other loopback URLs the process is told about through its environment (e.g. Scoped Daemon Access). */
   extraUrls: readonly (string | undefined)[] = [],
 ): number[] {
   const urls = [...Object.values(mcpServers).map((s) => s.url), ...extraUrls];

@@ -134,7 +134,7 @@ export const ConfigSchema = z.object({
   serviceAccounts: z
     .array(
       z.object({
-        label: z.string().regex(/^[^=\s]+=[^=\s]*$/, "Use key=value, e.g. paseo.ops=1"),
+        label: z.string().regex(/^[^=\s]+=[^=\s]*$/, "Use key=value, e.g. paseo.scoped-daemon-access=1"),
         serviceAccount: z.string().min(1),
       }),
     )

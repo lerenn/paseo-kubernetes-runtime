@@ -21,8 +21,8 @@ describe("workspaceAgentsBusy", () => {
 
 describe("labelsOfAgent", () => {
   it("reads the labels of one agent from the list's entries, and nothing when it is missing or unreadable", async () => {
-    const list = api([agent({ id: "a1", labels: { "paseo.ops": "1" } }), agent({ id: "a2", labels: { x: "y" } })]);
-    expect(await labelsOfAgent(list, "a1")).toEqual({ "paseo.ops": "1" });
+    const list = api([agent({ id: "a1", labels: { "paseo.scoped-daemon-access": "1" } }), agent({ id: "a2", labels: { x: "y" } })]);
+    expect(await labelsOfAgent(list, "a1")).toEqual({ "paseo.scoped-daemon-access": "1" });
     expect(await labelsOfAgent(list, "nope")).toBeUndefined();
     expect(await labelsOfAgent(null, "a1")).toBeUndefined();
     expect(await labelsOfAgent(api(new Error("gone")), "a1")).toBeUndefined();

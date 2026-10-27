@@ -120,7 +120,7 @@ export interface RuntimeDeps {
   /** How long `prepare` and `beforeInput` wait for the pod before returning and letting `exec` wait (Paseo gives them 15 minutes). */
   startWindowMs?: number;
   now?: () => number;
-  /** Fetches the Daemon Ops shim (injected for tests). */
+  /** Fetches the Scoped Daemon Access shim (injected for tests). */
   fetch?: typeof fetch;
   log?: (line: string) => void;
 }
@@ -188,8 +188,8 @@ interface WorkspaceState {
   chain: Promise<unknown>;
 }
 
-/** Stands in `commands` for the Daemon Ops shim having been installed in the current pod. */
-const OPS_SHIM = "paseo (daemon ops)";
+/** Stands in `commands` for the Scoped Daemon Access shim having been installed in the current pod. */
+const OPS_SHIM = "paseo (scoped daemon access)";
 
 /** The single indicator of a pod row in the sidebar. */
 const HOST_ICON = "ship-wheel";
