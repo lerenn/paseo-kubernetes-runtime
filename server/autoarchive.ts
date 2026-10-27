@@ -23,6 +23,17 @@ const DAY = 24 * HOUR;
  */
 export const PROBE_SCRIPT = String.raw`
 to() { if command -v timeout >/dev/null 2>&1; then timeout "$@"; else shift; "$@"; fi; }
+LANDED='
+# the branch changes are already in a remote default branch (squash-merged): merging it there changes nothing. A conflict, an old git without --write-tree or anything unclear says no.
+landed() {
+  defaults=$(for h in $(git for-each-ref --format="%(refname)" "refs/remotes/*/HEAD" "refs/remotes/*/main" "refs/remotes/*/master" 2>/dev/null); do git rev-parse --verify -q "$h^{commit}" >/dev/null 2>&1 && echo "$h"; done)
+  for d in $defaults; do
+    t=$(git merge-tree --write-tree "$d" "$1" 2>/dev/null) || continue
+    [ "$(printf "%s" "$t" | head -n 1)" = "$(git rev-parse "$d^{tree}" 2>/dev/null)" ] && return 0
+  done
+  return 1
+}
+'
 CHECK='
 p="$1"
 fail() { printf "BLOCK %s%s\n" "$p" "$1"; }
@@ -39,10 +50,20 @@ else
 fi
 [ -n "$(git status --porcelain=v2 --untracked-files=all 2>/dev/null | head -n 1)" ] && fail "uncommitted or untracked files"
 [ -n "$(git stash list 2>/dev/null | head -n 1)" ] && fail "stash entries"
-[ -n "$(git rev-list -n 1 --branches --not --remotes 2>/dev/null)" ] && fail "a local branch has commits that are on no remote"
-[ -n "$(git rev-list -n 1 HEAD --not --remotes 2>/dev/null)" ] && fail "HEAD has commits that are on no remote"
+# commits on no remote; a branch whose upstream is gone (deleted after its PR) is fine once it has landed in the default branch
+blocking() {
+  [ -z "$(git rev-list -n 1 "$1" --not --remotes 2>/dev/null)" ] && return 1
+  case "$(git for-each-ref --format="%(upstream:track)" "$1" 2>/dev/null)" in *gone*) landed "$1" && return 1 ;; esac
+  return 0
+}
+for b in $(git for-each-ref --format="%(refname)" refs/heads 2>/dev/null); do
+  blocking "$b" && { fail "a local branch has commits that are on no remote"; break; }
+done
+blocking "$(git symbolic-ref -q HEAD 2>/dev/null || echo HEAD)" && fail "HEAD has commits that are on no remote"
 exit 0
 '
+CHECK="$LANDED$CHECK"
+eval "$LANDED"
 export CHECK
 root="$1"
 cd "$root" 2>/dev/null || { echo "UNKNOWN no checkout at $root"; echo "PROBE DONE"; exit 0; }
@@ -59,6 +80,8 @@ confirm() {
       if git -C "$r" cat-file -e "$sha^{commit}" 2>/dev/null; then
         seen=1
         if [ -z "$(git -C "$r" rev-list -n 1 "$sha" --not --remotes 2>/dev/null)" ]; then ok=1; break; fi
+        # a branch whose PR was squash-merged and deleted: its work is in the default branch there
+        case "$ref" in refs/heads/*) if (cd "$r" && landed "$sha"); then ok=1; break; fi ;; esac
       fi
     done
     if [ "$seen" = 1 ] && [ "$ok" = 0 ]; then echo "BLOCK $2$ref is on no remote"; fi
