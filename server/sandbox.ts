@@ -116,6 +116,7 @@ export function specHash(config: KubernetesRuntimeConfig, cwd: string, serviceAc
     podAnnotations: config.podAnnotations,
     storage: config.storage,
     credentialsSecret: config.credentialsSecret,
+    extraSecrets: config.extraSecrets,
     apiVersion: config.sandboxApiVersion,
     cwd,
     // only when on, so the hash of a pod without a Docker sandbox is what it always was
@@ -264,6 +265,11 @@ export function workspaceContainer(config: KubernetesRuntimeConfig, cwd?: string
         name: "CLAUDE_CODE_OAUTH_TOKEN",
         valueFrom: { secretKeyRef: { name: config.credentialsSecret, key: "CLAUDE_CODE_OAUTH_TOKEN", optional: true } },
       },
+      // Per-profile Secrets (e.g. OPENAI_API_KEY for a codex profile), by reference, on this profile's pods only.
+      ...config.extraSecrets.map((s) => ({
+        name: s.env ?? s.key,
+        valueFrom: { secretKeyRef: { name: s.secret, key: s.key, optional: s.optional } },
+      })),
     ],
     ...(config.resources ? { resources: config.resources } : {}),
     volumeMounts: [

@@ -63,9 +63,11 @@ env vars in every workspace pod:
 
 | key | use |
 | --- | --- |
-| `CLAUDE_CODE_OAUTH_TOKEN` | claude (from `claude setup-token`); the only key pods read, by reference |
+| `CLAUDE_CODE_OAUTH_TOKEN` | claude (from `claude setup-token`); the only key every pod reads, by reference |
 
 The Secret is `optional` in the pod spec so the pod still starts without it.
+
+A profile can add more keys (`profiles.<name>.extraSecrets`, see the README), from other Secrets and on that profile's pods only, for example `OPENAI_API_KEY` from `paseo-codex-credentials` for a `codex` profile. The Secret needs no RBAC for the pod: the kubelet reads it.
 
 ## 5. NetworkPolicy (default-deny, then allow)
 
