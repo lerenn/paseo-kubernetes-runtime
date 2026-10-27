@@ -22,8 +22,12 @@ const DAY = 24 * HOUR;
  * look says UNKNOWN, which blocks the archive just like a finding does.
  */
 export const PROBE_SCRIPT = String.raw`
+# lowest CPU and disk priority for the whole probe (children inherit), and never take git's optional locks (a probe must not block an agent's own git)
+command -v renice >/dev/null 2>&1 && renice -n 19 -p $$ >/dev/null 2>&1
+command -v ionice >/dev/null 2>&1 && ionice -c3 -p $$ >/dev/null 2>&1
 to() { if command -v timeout >/dev/null 2>&1; then timeout "$@"; else shift; "$@"; fi; }
 LANDED='
+git() { command git --no-optional-locks "$@"; }
 # the branch changes are already in a remote default branch (squash-merged): merging it there changes nothing. A conflict, an old git without --write-tree or anything unclear says no.
 landed() {
   defaults=$(for h in $(git for-each-ref --format="%(refname)" "refs/remotes/*/HEAD" "refs/remotes/*/main" "refs/remotes/*/master" 2>/dev/null); do git rev-parse --verify -q "$h^{commit}" >/dev/null 2>&1 && echo "$h"; done)
@@ -43,12 +47,15 @@ for f in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISEC
   [ -e "$gd/$f" ] && fail "a $f is in progress"
 done
 if [ -n "$(git remote 2>/dev/null)" ]; then
-  if command -v timeout >/dev/null 2>&1; then timeout 120 git fetch --prune -q >/dev/null 2>&1 || unk "git fetch failed, so the remote cannot be compared"
+  # a fetch in the last 10 minutes (by the probe or by an agent) is as good as a new one
+  fh=$(git rev-parse --git-path FETCH_HEAD 2>/dev/null)
+  if [ -n "$fh" ] && [ -n "$(find "$fh" -mmin -10 2>/dev/null)" ]; then :
+  elif command -v timeout >/dev/null 2>&1; then timeout 120 git fetch --prune -q >/dev/null 2>&1 || unk "git fetch failed, so the remote cannot be compared"
   else git fetch --prune -q >/dev/null 2>&1 || unk "git fetch failed, so the remote cannot be compared"; fi
 else
   unk "no remote"
 fi
-[ -n "$(git status --porcelain=v2 --untracked-files=all 2>/dev/null | head -n 1)" ] && fail "uncommitted or untracked files"
+[ -n "$(git -c core.untrackedCache=true status --porcelain=v2 --untracked-files=all --ignore-submodules=all 2>/dev/null | head -n 1)" ] && fail "uncommitted or untracked files"
 [ -n "$(git stash list 2>/dev/null | head -n 1)" ] && fail "stash entries"
 # commits on no remote; a branch whose upstream is gone (deleted after its PR) is fine once it has landed in the default branch
 blocking() {
@@ -134,6 +141,20 @@ export function readStoredProbe(annotation: string | undefined): ProbeResult | u
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether a running workspace is close enough to its archive to be looked into: idle for at least the limit minus the
+ * warning time (the ephemeral limit for an ephemeral workspace), or older than `maxAgeDays`. Outside it the pod is left
+ * alone: nothing could be archived yet. Pure.
+ */
+export function probeWindowOpen(f: Pick<Facts, "now" | "createdAt" | "lastActivity" | "labels">, cfg: AutoArchiveConfig): boolean {
+  const ephemeral = (f.labels ?? []).some((l) => ruleMatches(cfg.ephemeral.label, l));
+  const limit = ephemeral && cfg.ephemeral.idleHours > 0 ? cfg.ephemeral.idleHours * HOUR : cfg.idleDays > 0 ? cfg.idleDays * DAY : 0;
+  const maxAge = (cfg.maxAgeDays ?? 0) * DAY;
+  if (maxAge > 0 && f.createdAt !== undefined && f.now - f.createdAt >= maxAge - cfg.warnHours * HOUR) return true;
+  if (limit === 0 || f.lastActivity === undefined) return false;
+  return f.now - f.lastActivity >= limit - cfg.warnHours * HOUR;
 }
 
 export const readTime = (annotation: string | undefined): number | undefined => {

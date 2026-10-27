@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { AutoArchiveLog, decide, parseProbe, readStoredProbe, stringifyProbe, type Facts } from "../server/autoarchive.js";
+import { AutoArchiveLog, decide, probeWindowOpen, parseProbe, readStoredProbe, stringifyProbe, type Facts } from "../server/autoarchive.js";
 import { parseArchiveHelp } from "../server/runtime.js";
 import { AutoArchiveSchema, ConfigSchema } from "../shared/settings.js";
 
@@ -126,5 +126,23 @@ describe("the log and the CLI feature detection", () => {
   it("detects --reason and --if-idle in the archive help", () => {
     expect(parseArchiveHelp("Usage: paseo workspace archive [options] <workspace-id>\n  --json\n")).toEqual({ reason: false, ifIdle: false });
     expect(parseArchiveHelp("  --reason <text>  Why\n  --if-idle  Refuse")).toEqual({ reason: true, ifIdle: true });
+  });
+});
+
+describe("the probe window", () => {
+  const c = cfg({ idleDays: 2, warnHours: 12, ephemeral: { label: "throwaway", idleHours: 6 } });
+  const at = (idle: number, over: Partial<Facts> = {}) => ({ now: NOW, lastActivity: NOW - idle, labels: [{}] as Record<string, string>[] | null, ...over });
+  it("opens at idleDays minus warnHours and not before", () => {
+    expect(probeWindowOpen(at(36 * H - 1), c)).toBe(false);
+    expect(probeWindowOpen(at(36 * H), c)).toBe(true);
+  });
+  it("uses the ephemeral limit for a throwaway workspace", () => {
+    const eph = { labels: [{ throwaway: "true" }] };
+    expect(probeWindowOpen(at(1 * H, eph), cfg({ ephemeral: { label: "throwaway", idleHours: 24 }, warnHours: 12 }))).toBe(false);
+    expect(probeWindowOpen(at(12 * H, eph), cfg({ ephemeral: { label: "throwaway", idleHours: 24 }, warnHours: 12 }))).toBe(true);
+  });
+  it("is closed when the last activity is unknown, and open for an aged workspace", () => {
+    expect(probeWindowOpen(at(0, { lastActivity: undefined }), c)).toBe(false);
+    expect(probeWindowOpen(at(0, { createdAt: NOW - 10 * D }), cfg({ maxAgeDays: 7 }))).toBe(true);
   });
 });

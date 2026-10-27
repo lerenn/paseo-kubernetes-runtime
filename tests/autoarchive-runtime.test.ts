@@ -159,6 +159,28 @@ describe("auto-archive: warn, then archive", () => {
     expect(t.archived).toEqual([]);
   });
 
+  it("does not probe a running pod before the workspace is idle, and looks again no more than every 2 hours after", async () => {
+    const t = setup({ idleDays: 2, warnHours: 12 });
+    const seen = scriptProbe(t.kube, DIRTY);
+    await t.prepare();
+    for (let i = 0; i < 4; i++) {
+      t.advance(10 * H); // 40 h: inside nothing yet
+      await t.check();
+    }
+    expect(seen.probes).toBe(0);
+    t.advance(10 * H); // 50 h idle: past idleDays
+    await t.check();
+    expect(seen.probes).toBe(1);
+    for (let i = 0; i < 3; i++) {
+      t.advance(30 * MIN);
+      await t.check();
+    }
+    expect(seen.probes).toBe(1); // blocked, but not looked at again within the 2 hours
+    t.advance(2 * H);
+    await t.check();
+    expect(seen.probes).toBe(2);
+  });
+
   it("does not archive when the probe cannot run (unknown)", async () => {
     const t = setup();
     scriptProbe(t.kube, "");
