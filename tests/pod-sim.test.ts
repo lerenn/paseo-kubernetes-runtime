@@ -546,6 +546,73 @@ describe("the auto-archive probe (real git in the pod)", () => {
     expect(after, JSON.stringify(after)).toMatchObject({ state: "clean" });
   }, 60_000);
 
+  // the PR was squash-merged on the remote and its branch deleted there: the pod's branch is gone upstream
+  const landOnRemote = (origin: string, branch: string, squash: boolean, extra?: { file: string; text: string }) => {
+    const tmp = mkdtempSync(join(tmpdir(), "remote-"));
+    sh(tmp, "clone", "-q", origin, "w");
+    const w = join(tmp, "w");
+    if (squash) {
+      sh(w, "merge", "--squash", `origin/${branch}`);
+      sh(w, "commit", "-qm", `Squash of ${branch} (#1)`);
+    }
+    if (extra) {
+      writeFileSync(join(w, extra.file), extra.text);
+      sh(w, "add", ".");
+      sh(w, "commit", "-qm", "later work on main");
+    }
+    sh(w, "push", "-q", "origin", "HEAD:main");
+    sh(w, "push", "-q", "origin", "--delete", branch);
+  };
+
+  it("treats a branch as pushed once its PR was squash-merged and its remote branch deleted", async () => {
+    const { origin, kube, podDir } = await openSession();
+    sh(podDir, "switch", "-q", "-c", "feat");
+    writeFileSync(join(podDir, "feat.txt"), "feature\n");
+    sh(podDir, "add", ".");
+    sh(podDir, "commit", "-qm", "feature");
+    expect((await kube.as(["git", "push", "-q", "-u", "origin", "feat"], { cwd: podDir })).code).toBe(0);
+    sh(podDir, "switch", "-q", "main");
+    expect((await probe(kube, podDir)).state).toBe("clean"); // pushed
+    landOnRemote(origin, "feat", true, { file: "other.txt", text: "main moved on\n" });
+    const p = await probe(kube, podDir);
+    expect(p, JSON.stringify(p)).toMatchObject({ state: "clean", reasons: [] });
+    // and the same while the branch is the checked-out one
+    sh(podDir, "switch", "-q", "feat");
+    const onBranch = await probe(kube, podDir);
+    expect(onBranch, JSON.stringify(onBranch)).toMatchObject({ state: "clean", reasons: [] });
+  }, 60_000);
+
+  it("stays blocked for a branch with a gone upstream whose work never reached the default branch", async () => {
+    const { origin, kube, podDir } = await openSession();
+    sh(podDir, "switch", "-q", "-c", "feat");
+    writeFileSync(join(podDir, "feat.txt"), "feature\n");
+    sh(podDir, "add", ".");
+    sh(podDir, "commit", "-qm", "feature");
+    expect((await kube.as(["git", "push", "-q", "-u", "origin", "feat"], { cwd: podDir })).code).toBe(0);
+    writeFileSync(join(podDir, "unmerged.txt"), "never pushed\n");
+    sh(podDir, "add", ".");
+    sh(podDir, "commit", "-qm", "local only, after the push");
+    sh(podDir, "switch", "-q", "main");
+    landOnRemote(origin, "feat", true); // the squash holds feat.txt only
+    const p = await probe(kube, podDir);
+    expect(p.state).toBe("blocked");
+    expect(p.reasons.join()).toMatch(/local branch has commits that are on no remote/);
+  }, 60_000);
+
+  it("stays blocked for a gone upstream branch that was deleted without being merged", async () => {
+    const { origin, kube, podDir } = await openSession();
+    sh(podDir, "switch", "-q", "-c", "feat");
+    writeFileSync(join(podDir, "feat.txt"), "feature\n");
+    sh(podDir, "add", ".");
+    sh(podDir, "commit", "-qm", "feature");
+    expect((await kube.as(["git", "push", "-q", "-u", "origin", "feat"], { cwd: podDir })).code).toBe(0);
+    sh(podDir, "switch", "-q", "main");
+    landOnRemote(origin, "feat", false, { file: "other.txt", text: "unrelated\n" });
+    const p = await probe(kube, podDir);
+    expect(p.state).toBe("blocked");
+    expect(p.reasons.join()).toMatch(/local branch has commits that are on no remote/);
+  }, 60_000);
+
   it("blocks on a rebase in progress", async () => {
     const { kube, podDir } = await openSession();
     sh(podDir, "switch", "-q", "-c", "side");
