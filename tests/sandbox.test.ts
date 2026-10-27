@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ConfigSchema } from "../server/config.js";
 import { applyProfile } from "../shared/settings.js";
-import { buildSandbox, resumePatch, sandboxName, serviceAccountFor } from "../server/sandbox.js";
+import { buildSandbox, resumePatch, specHash, sandboxName, serviceAccountFor } from "../server/sandbox.js";
 import { toHttpsRemote } from "../server/workspace.js";
 
 describe("pod profiles", () => {
@@ -27,6 +27,36 @@ describe("pod profiles", () => {
       expect(ConfigSchema.safeParse({ profiles: { p: { seed: [{ from: "/data", to }] } } }).success, to).toBe(false);
     }
     expect(ConfigSchema.safeParse({ profiles: { p: { seed: [{ from: "/data", to: "prbr-picky" }] } } }).success).toBe(true);
+  });
+});
+
+describe("profile extraSecrets", () => {
+  const codex = { secret: "paseo-codex-credentials", key: "OPENAI_API_KEY" };
+  const base = ConfigSchema.parse({ profiles: { codex: { extraSecrets: [codex] } } });
+  const envOf = (config: typeof base, warm = false) =>
+    (buildSandbox({ name: "n", workspaceId: warm ? undefined : "wks_1", cwd: "/x", config, warm }) as any).spec.podTemplate.spec.containers[0].env;
+
+  it("mounts the key by reference, optional, on pods of that profile only", () => {
+    expect(envOf(applyProfile(base, "codex"))).toContainEqual({
+      name: "OPENAI_API_KEY",
+      valueFrom: { secretKeyRef: { name: "paseo-codex-credentials", key: "OPENAI_API_KEY", optional: true } },
+    });
+    expect(envOf(base).map((e: any) => e.name)).toEqual(["HOME", "CLAUDE_CODE_OAUTH_TOKEN"]);
+    expect(envOf(applyProfile(base, "codex")).map((e: any) => e.name)).toContain("CLAUDE_CODE_OAUTH_TOKEN");
+  });
+
+  it("renames the variable with env and carries it into the resumed pod", () => {
+    const c = applyProfile(ConfigSchema.parse({ profiles: { p: { extraSecrets: [{ ...codex, env: "OPENAI_KEY", optional: false }] } } }), "p");
+    expect(envOf(c)).toContainEqual({ name: "OPENAI_KEY", valueFrom: { secretKeyRef: { name: codex.secret, key: codex.key, optional: false } } });
+    const names = resumePatch(c, "/x").spec.podTemplate.spec.containers[0].env.map((e: any) => e.name);
+    expect(names).toContain("OPENAI_KEY");
+  });
+
+  it("is part of the spec hash and validated", () => {
+    expect(specHash(applyProfile(base, "codex"), "/x")).not.toBe(specHash(base, "/x"));
+    for (const bad of [{ secret: "Bad_Name", key: "K" }, { secret: "s", key: "a b" }, { secret: "s", key: "K", env: "1X" }]) {
+      expect(ConfigSchema.safeParse({ profiles: { p: { extraSecrets: [bad] } } }).success).toBe(false);
+    }
   });
 });
 
