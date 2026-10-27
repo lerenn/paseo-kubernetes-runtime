@@ -61,3 +61,12 @@ describe("migrating v1 settings (templates) to the flat configuration", () => {
     expect(migrateSettings(doc, 2)).toBe(doc);
   });
 });
+
+describe("profile nodeSelector", () => {
+  it("is merged over the global nodeSelector", async () => {
+    const { applyProfile } = await import("../shared/settings.js");
+    const config = ConfigSchema.parse({ nodeSelector: { pool: "agents", "karpenter.sh/capacity-type": "spot" }, profiles: { builder: { nodeSelector: { "karpenter.sh/capacity-type": "on-demand" } } } });
+    expect(applyProfile(config, "builder").nodeSelector).toEqual({ pool: "agents", "karpenter.sh/capacity-type": "on-demand" });
+    expect(applyProfile(config, undefined).nodeSelector["karpenter.sh/capacity-type"]).toBe("spot");
+  });
+});
