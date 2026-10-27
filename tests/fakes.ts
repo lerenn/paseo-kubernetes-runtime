@@ -8,7 +8,7 @@ export class FakeKube implements Kube {
   execs: { pod: string; argv: string[] }[] = [];
   execResult: ExecResult = { code: 0, stdout: "", stderr: "" };
   waitError?: Error;
-  streams: { pod: string; argv: string[] }[] = [];
+  streams: { pod: string; argv: string[]; end(): void }[] = [];
   /** A killed process ends (as a real one does); turn off to test a process that will not die. */
   killEnds = true;
 
@@ -81,9 +81,11 @@ export class FakeKube implements Kube {
     };
   }
   execStream(pod: string, argv: string[]) {
-    this.streams.push({ pod, argv });
+    let end = () => {};
+    const readable = new ReadableStream<AcpStreamMessage>({ start: (c) => void (end = () => c.close()) });
+    this.streams.push({ pod, argv, end: () => end() });
     return {
-      readable: new ReadableStream<AcpStreamMessage>(),
+      readable,
       writable: new WritableStream<AcpStreamMessage>(),
     };
   }
