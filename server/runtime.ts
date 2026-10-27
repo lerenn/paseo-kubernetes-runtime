@@ -12,6 +12,24 @@ import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
 import { ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, clearSubmoduleFailure, recordSubmoduleFailure, submoduleWait, seedDirectory, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
 import { paseoWorkspaceBusy } from "./orphans.js";
+import {
+  ACTIVITY_PERSIST_MS,
+  AutoArchiveLog,
+  KEEP_ANNOTATION,
+  LAST_ACTIVITY_ANNOTATION,
+  PROBE_ANNOTATION,
+  PROBE_SCRIPT,
+  WARNED_ANNOTATION,
+  decide,
+  parseProbe,
+  readStoredProbe,
+  readTime,
+  stringifyProbe,
+  type Facts,
+  type ProbeResult,
+  type Verdict,
+} from "./autoarchive.js";
+import type { AutoArchiveStatus } from "../shared/status.js";
 import { WARM_PREFIX, shortImage } from "./status.js";
 import { PodRegistry, type PodState } from "./registry.js";
 import type {
@@ -92,8 +110,12 @@ export interface RuntimeDeps {
   recoveryStateFile?: string;
   /** Whether an agent of this workspace (by id) has a turn open, from Paseo's agent list; null when it cannot say. */
   agentsBusy?: (workspaceId: string) => Promise<boolean | null>;
-  /** Archives a workspace in Paseo (the delete action's option); injected for tests. */
-  archiveWorkspace?: (workspaceId: string) => Promise<void>;
+  /** Archives a workspace in Paseo (the delete action's option, and auto-archive, which adds a reason and `ifIdle`); injected for tests. */
+  archiveWorkspace?: (workspaceId: string, options?: { reason?: string; ifIdle?: boolean }) => Promise<void>;
+  /** Labels of each (not archived) agent of a workspace, from Paseo's agent list; null when it cannot say (injected for tests). */
+  workspaceLabels?: (workspaceId: string) => Promise<Record<string, string>[] | null>;
+  /** Where the last auto-archive decisions are kept. */
+  autoArchiveLogFile?: string;
   /** How long `prepare` and `beforeInput` wait for the pod before returning and letting `exec` wait (Paseo gives them 15 minutes). */
   startWindowMs?: number;
   now?: () => number;
@@ -146,6 +168,21 @@ interface WorkspaceState {
   commands: Set<string>;
   agents: Map<string, AgentActivity>;
   lastActivity: number;
+  /** The idle clock of auto-archive: the last real activity (input, a turn, an agent at work). Mirrored to the Sandbox. */
+  activityAt?: number;
+  /** What the Sandbox says `activityAt` was, to write it at most every ACTIVITY_PERSIST_MS. */
+  activityPersisted?: number;
+  /** When the archive warning was given, and when the workspace is archived unless it is used. */
+  warnedAt?: number;
+  archiveAt?: number;
+  archiveDry?: boolean;
+  /** The dry run already logged that it would archive this workspace. */
+  dryRunLogged?: boolean;
+  /** Pinned with the Keep action. */
+  keep?: boolean;
+  createdAt?: number;
+  /** The safety probe taken when the pod was suspended (still valid: a resume clears it), or the latest one of a running pod. */
+  probe?: ProbeResult;
   /** Everything that changes the pod (create, resume, suspend, destroy, prepare) runs one at a time. */
   chain: Promise<unknown>;
 }
@@ -174,10 +211,17 @@ export class KubernetesRuntime {
   private readonly now: () => number;
 
   private readonly guard: ResumeGuard;
+  private readonly archiveLog: AutoArchiveLog;
+  private stopArchiveTicker: () => void = () => undefined;
+  private archiveRunning = false;
+  /** Only one suspended workspace without a stored check is resumed at a time. */
+  private legacyProbing = false;
+  private archiveSummary: Pick<AutoArchiveStatus, "scheduled" | "blocked"> & { kept: Map<string, string> } = { scheduled: [], blocked: [], kept: new Map() };
   private stopInterruptTicker: () => void = () => undefined;
 
   constructor(private readonly deps: RuntimeDeps) {
     this.guard = new ResumeGuard(deps.recoveryStateFile ?? null);
+    this.archiveLog = new AutoArchiveLog(deps.autoArchiveLogFile ?? null);
     this.git = deps.git ?? runGit;
     this.now = deps.now ?? Date.now;
     this.lastDemand = this.now();
@@ -203,6 +247,11 @@ export class KubernetesRuntime {
       timer.unref?.();
       return () => clearInterval(timer);
     }))(() => void this.checkInterruptions().catch(() => undefined), 10_000);
+    this.stopArchiveTicker = (this.deps.ticker ?? ((fn, ms) => {
+      const timer = setInterval(fn, ms) as unknown as NodeJS.Timeout;
+      timer.unref?.();
+      return () => clearInterval(timer);
+    }))(() => void this.checkAutoArchive().catch((e: Error) => this.log(`[kubernetes-runtime] auto-archive check failed: ${e.message}`)), 60_000);
     await this.adopt().catch(() => undefined);
     void this.maintainPool().catch(() => undefined);
   }
@@ -216,6 +265,7 @@ export class KubernetesRuntime {
     this.stopped = true;
     this.stopTicker();
     this.stopInterruptTicker();
+    this.stopArchiveTicker();
     const running = [...this.execs];
     for (const e of running) e.proc.kill("SIGTERM");
     await Promise.race([Promise.allSettled(running.map((e) => e.exited)), new Promise((r) => setTimeout(r, 3_000).unref?.())]);
@@ -236,6 +286,7 @@ export class KubernetesRuntime {
       ws.image = sandbox.image;
       ws.layout = sandbox.annotations[LAYOUT_ANNOTATION] === "mapped" ? "mapped" : "legacy";
       ws.cwdFixed = true;
+      this.syncFromSandbox(ws, sandbox);
       this.setPhase(ws, sandbox.operatingMode === "Suspended" ? "suspended" : "running");
       // A pod that runs when the plugin starts had its bridge (and with it the loopback tunnels its agents' MCP
       // servers use) die with the previous plugin process: bring it back without waiting for the next launch.
@@ -314,6 +365,45 @@ export class KubernetesRuntime {
     // Paseo asks `describeWorkspace` again after a notice for the workspace: this keeps the badge's state current
     if (before !== "none" && before !== phase && (phase === "running" || phase === "suspended")) this.stateChanged(ws, `The pod is ${phase}.`);
     if (ws.sandbox) this.deps.registry?.set(ws.id, ws.sandbox, phase, this.now());
+  }
+
+  /** Real activity in a workspace: restarts the idle timers and clears an archive warning. */
+  private markActive(ws: WorkspaceState): void {
+    const t = this.now();
+    ws.lastActivity = t;
+    ws.activityAt = t;
+    ws.dryRunLogged = false;
+    if (ws.warnedAt !== undefined || ws.archiveAt !== undefined) {
+      ws.warnedAt = undefined;
+      ws.archiveAt = undefined;
+      this.annotate(ws, { [WARNED_ANNOTATION]: null });
+    }
+  }
+
+  /** Merge-patches annotations on the workspace's Sandbox (null removes one), without waiting. */
+  private annotate(ws: WorkspaceState, annotations: Record<string, string | null>): void {
+    const sandbox = ws.sandbox;
+    if (!sandbox) return;
+    void this.deps
+      .getConfig()
+      .then((config) => this.deps.kubeFor(config).patchSandbox(sandbox, { metadata: { annotations } }))
+      .catch(() => undefined);
+  }
+
+  /** Takes in what the Sandbox remembers: the idle clock, a warning, the Keep pin, the suspend-time check. */
+  private syncFromSandbox(ws: WorkspaceState, sandbox: SandboxInfo): void {
+    const a = sandbox.annotations;
+    const activity = readTime(a[LAST_ACTIVITY_ANNOTATION]);
+    if (activity !== undefined) {
+      ws.activityPersisted = activity;
+      ws.activityAt = Math.max(ws.activityAt ?? 0, activity);
+    }
+    const warned = readTime(a[WARNED_ANNOTATION]);
+    if (warned !== undefined && ws.warnedAt === undefined && warned >= (ws.activityAt ?? 0)) ws.warnedAt = warned;
+    ws.keep = a[KEEP_ANNOTATION] === "true";
+    ws.probe = readStoredProbe(a[PROBE_ANNOTATION]) ?? (sandbox.operatingMode === "Suspended" ? undefined : ws.probe);
+    const created = sandbox.createdAt ? Date.parse(sandbox.createdAt) : NaN;
+    if (Number.isFinite(created)) ws.createdAt = created;
   }
 
   private serial<T>(ws: WorkspaceState, fn: () => Promise<T>): Promise<T> {
@@ -524,6 +614,9 @@ export class KubernetesRuntime {
         ctx.notice("Resuming the pod...");
         this.setPhase(ws, "resuming");
         await kube.patchSandbox(sandbox.name, resumePatch(config, ws.layout === "mapped" ? undefined : cwd, this.resumeServiceAccount(config, ws, sandbox)));
+        // the check taken at suspend is about a pod that is no longer asleep
+        ws.probe = undefined;
+        if (sandbox.annotations[PROBE_ANNOTATION]) await kube.patchSandbox(sandbox.name, { metadata: { annotations: { [PROBE_ANNOTATION]: null } } }).catch(() => undefined);
         ws.image = config.image; // a resumed pod starts with the current image
       }
     }
@@ -661,6 +754,8 @@ export class KubernetesRuntime {
     const config = await this.deps.getConfig();
     const kube = this.deps.kubeFor(config);
     this.log(`[kubernetes-runtime] suspending idle pod ${ws.sandbox} (workspace ${ws.id})`);
+    // Look for unpushed work while the pod and its fetch bridge are still up: auto-archive judges a suspended workspace by this.
+    const probe = config.autoArchive.enabled ? await this.runProbe(kube, ws).catch(() => undefined) : undefined;
     ws.bridge?.close();
     ws.bridge = undefined;
     ws.readyUid = undefined;
@@ -676,7 +771,31 @@ export class KubernetesRuntime {
     }
     await Promise.race([Promise.allSettled(mine.map((e) => e.exited)), new Promise((r) => setTimeout(r, 5_000).unref?.())]);
     await this.syncLabels(kube, ws, "suspended");
+    ws.probe = probe;
+    await kube.patchSandbox(ws.sandbox, {
+      metadata: {
+        annotations: {
+          [PROBE_ANNOTATION]: probe ? stringifyProbe(probe) : null,
+          ...(ws.activityAt !== undefined ? { [LAST_ACTIVITY_ANNOTATION]: new Date(ws.activityAt).toISOString() } : {}),
+        },
+      },
+    }).catch(() => undefined);
+    if (ws.activityAt !== undefined) ws.activityPersisted = ws.activityAt;
     await kube.patchSandbox(ws.sandbox, suspendPatch());
+  }
+
+  /** Runs the probe script in the pod; anything it cannot settle is an unknown. */
+  private async runProbe(kube: Kube, ws: WorkspaceState): Promise<ProbeResult> {
+    const pod = ws.sandbox!;
+    const timeout = new Promise<ProbeResult>((resolve) => {
+      const timer = setTimeout(() => resolve({ state: "unknown", reasons: ["the probe took more than 5 minutes"], at: this.now() }), 5 * 60_000);
+      (timer as { unref?: () => void }).unref?.();
+    });
+    const run = kube.exec(pod, ["sh", "-c", PROBE_SCRIPT, "sh", this.podRoot(ws)]).then(
+      (r) => parseProbe(r.code, r.stdout, this.now()),
+      (e: Error) => ({ state: "unknown", reasons: [`the probe could not run: ${e.message}`], at: this.now() }) as ProbeResult,
+    );
+    return Promise.race([run, timeout]);
   }
 
   /**
@@ -768,7 +887,8 @@ export class KubernetesRuntime {
         // (it shows as idle); suspending would kill that work. Live children of a claude/codex process mean busy.
         const background = running === false ? await this.hasBackgroundWork(ws).catch(() => true) : false;
         if (running !== false || background) {
-          ws.lastActivity = this.now();
+          if (running === true || background) this.markActive(ws);
+          else ws.lastActivity = this.now(); // Paseo could not say: keep the pod, but that is not activity
           continue;
         }
         await this.serial(ws, async () => {
@@ -777,6 +897,275 @@ export class KubernetesRuntime {
           await this.suspend(ws);
         }).catch(() => undefined);
       }
+    }
+  }
+
+  // ---- auto-archive -------------------------------------------------------------------------------------------
+
+  /** What auto-archive knows, for the screen. */
+  autoArchiveStatus(config: KubernetesRuntimeConfig): AutoArchiveStatus {
+    return {
+      enabled: config.autoArchive.enabled,
+      dryRun: config.autoArchive.dryRun,
+      scheduled: this.archiveSummary.scheduled,
+      blocked: this.archiveSummary.blocked,
+      recent: this.archiveLog.list().slice(0, 20),
+    };
+  }
+
+  /** The pods-table badge of a workspace. */
+  autoArchiveBadge(workspaceId: string): { autoArchive: "scheduled" | "blocked" | "kept"; autoArchiveText: string } | undefined {
+    const ws = this.states.get(workspaceId);
+    if (ws?.keep) return { autoArchive: "kept", autoArchiveText: "kept: never auto-archived" };
+    const scheduled = this.archiveSummary.scheduled.find((e) => e.workspaceId === workspaceId);
+    if (scheduled) return { autoArchive: "scheduled", autoArchiveText: `archive ${new Date(scheduled.archiveAt).toISOString().slice(0, 16).replace("T", " ")}Z` };
+    const blocked = this.archiveSummary.blocked.find((e) => e.workspaceId === workspaceId);
+    if (blocked) return { autoArchive: "blocked", autoArchiveText: blocked.reason };
+    const kept = this.archiveSummary.kept.get(workspaceId);
+    return kept ? { autoArchive: "kept", autoArchiveText: kept } : undefined;
+  }
+
+  /** The Keep action: pins a workspace so it is never auto-archived (or unpins it). */
+  async setKeep(workspaceId: string, keep: boolean): Promise<{ ok: boolean; message?: string }> {
+    if (!this.states.has(workspaceId)) await this.adopt().catch(() => undefined);
+    const ws = this.states.get(workspaceId);
+    if (!ws?.sandbox) return { ok: false, message: "This workspace has no pod." };
+    const config = await this.deps.getConfig();
+    await this.deps.kubeFor(config).patchSandbox(ws.sandbox, { metadata: { annotations: { [KEEP_ANNOTATION]: keep ? "true" : null } } });
+    ws.keep = keep;
+    if (keep) {
+      ws.warnedAt = undefined;
+      ws.archiveAt = undefined;
+      this.annotate(ws, { [WARNED_ANNOTATION]: null });
+    }
+    return { ok: true };
+  }
+
+  private title(ws: WorkspaceState): string {
+    return ws.options.title ?? ws.options.slug ?? ws.id;
+  }
+
+  private hasSeedProfile(config: KubernetesRuntimeConfig, ws: WorkspaceState): boolean {
+    return !!ws.options.profile && (config.profiles[ws.options.profile]?.seed.length ?? 1) > 0; // a profile the settings dropped counts as seeded
+  }
+
+  /** An agent works in the workspace: a turn or permission this plugin saw, Paseo's answer, background work in the pod. Null: unknown. */
+  private async archiveBusy(ws: WorkspaceState): Promise<boolean | null> {
+    if ([...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0)) return true;
+    const running = await this.workspaceRunning(ws);
+    if (running !== false) return running;
+    if (ws.phase === "running" && ws.sandbox) return (await this.hasBackgroundWork(ws).catch(() => true)) ? true : false;
+    return false;
+  }
+
+  private async archiveFacts(config: KubernetesRuntimeConfig, ws: WorkspaceState): Promise<Facts> {
+    const labels = this.deps.workspaceLabels ? await this.deps.workspaceLabels(ws.id).catch(() => null) : this.agentLabels(ws) ? [this.agentLabels(ws)!] : null;
+    return {
+      now: this.now(),
+      ...(ws.createdAt !== undefined ? { createdAt: ws.createdAt } : {}),
+      ...(ws.activityAt !== undefined ? { lastActivity: ws.activityAt } : {}),
+      ...(ws.warnedAt !== undefined ? { warnedAt: ws.warnedAt } : {}),
+      pinned: !!ws.keep,
+      seed: this.hasSeedProfile(config, ws),
+      labels,
+      busy: await this.archiveBusy(ws),
+    };
+  }
+
+  /** Writes the idle clock to the Sandbox, at most every ACTIVITY_PERSIST_MS, so a restarted plugin does not start the clock over. */
+  private async persistActivity(kube: Kube, ws: WorkspaceState): Promise<void> {
+    if (!ws.sandbox || ws.activityAt === undefined) return;
+    if (ws.activityPersisted !== undefined && ws.activityAt - ws.activityPersisted < ACTIVITY_PERSIST_MS) return;
+    await kube.patchSandbox(ws.sandbox, { metadata: { annotations: { [LAST_ACTIVITY_ANNOTATION]: new Date(ws.activityAt).toISOString() } } }).catch(() => undefined);
+    ws.activityPersisted = ws.activityAt;
+  }
+
+  /**
+   * Whether nothing is lost by archiving the workspace: a running pod is looked into now, a suspended one by the check
+   * made as it was suspended. A suspended workspace without one (suspended before this existed) is resumed briefly to take
+   * it, one at a time and not when the namespace is nearly out of pods. `final` skips every cache and every resume.
+   */
+  private async archiveSafety(
+    config: KubernetesRuntimeConfig,
+    kube: Kube,
+    ws: WorkspaceState,
+    mode: "look" | "final",
+  ): Promise<{ ok: true } | { ok: false; reason: string; seed?: boolean }> {
+    const judge = (p: ProbeResult | undefined): { ok: true } | { ok: false; reason: string; seed?: boolean } => {
+      if (!p) return { ok: false, reason: "not checked yet" };
+      if (p.state === "clean") return { ok: true };
+      if (p.state === "seed") return { ok: false, reason: "holds seed data", seed: true };
+      return { ok: false, reason: p.reasons.join("; ") || "could not be checked" };
+    };
+    if (ws.phase === "running") {
+      const cached = mode === "look" && ws.probe && this.now() - ws.probe.at < 30 * 60_000 ? ws.probe : undefined;
+      if (cached) return judge(cached);
+      const probe = mode === "final" ? await this.runProbe(kube, ws) : await this.serial(ws, () => this.runProbe(kube, ws));
+      ws.probe = probe;
+      return judge(probe);
+    }
+    if (ws.phase === "suspended") {
+      if (ws.probe) return judge(ws.probe);
+      if (mode === "final") return { ok: false, reason: "no stored check of the suspended pod" };
+      if (this.legacyProbing) return { ok: false, reason: "waiting to check it (one suspended workspace at a time)" };
+      const quota = config.autoArchive.podQuota;
+      if (quota !== undefined) {
+        const pods = (await kube.listSandboxes(`${DAEMON_LABEL}=${this.deps.daemonId}`)).filter((s) => s.operatingMode === "Running").length;
+        if (pods >= quota - 2) return { ok: false, reason: `waiting for pod quota (${pods}/${quota} pods)` };
+      }
+      this.legacyProbing = true;
+      try {
+        // resume, look (suspend does), suspend again: the check is stored on the Sandbox
+        await this.serial(ws, async () => {
+          if (ws.phase !== "suspended") return;
+          await this.ensureReady(ws, this.detached(ws, { notice: () => undefined }), {});
+          await this.suspend(ws);
+        });
+      } catch (error) {
+        return { ok: false, reason: `could not resume it to check: ${(error as Error).message}` };
+      } finally {
+        this.legacyProbing = false;
+      }
+      return judge(ws.probe);
+    }
+    return { ok: false, reason: "the pod is starting" };
+  }
+
+  /**
+   * Archives workspaces idle for `idleDays` (or older than `maxAgeDays`) once they have been warned for `warnHours`, and only
+   * when nothing is lost: see `archiveSafety`. In a dry run it warns and logs what it would do. At most `maxPerRun` a run.
+   */
+  async checkAutoArchive(): Promise<void> {
+    if (this.archiveRunning || this.stopped) return;
+    this.archiveRunning = true;
+    try {
+      await this.autoArchiveRun();
+    } finally {
+      this.archiveRunning = false;
+    }
+  }
+
+  private async autoArchiveRun(): Promise<void> {
+    const config = await this.deps.getConfig();
+    const cfg = config.autoArchive;
+    const next: typeof this.archiveSummary = { scheduled: [], blocked: [], kept: new Map() };
+    if (!cfg.enabled || !this.deps.daemonId) {
+      this.archiveSummary = next;
+      return;
+    }
+    const kube = this.deps.kubeFor(config);
+    const sandboxes = new Map((await kube.listSandboxes(`${DAEMON_LABEL}=${this.deps.daemonId}`)).map((s) => [s.name, s]));
+    const day = 86_400_000;
+    const limits = [cfg.idleDays * day, cfg.ephemeral.idleHours * 3_600_000].filter((n) => n > 0);
+    const shortest = limits.length ? Math.min(...limits) : Infinity;
+    const due: { ws: WorkspaceState; verdict: Extract<Verdict, { kind: "due" }>; decidedAt: number }[] = [];
+    for (const ws of [...this.states.values()]) {
+      const sandbox = ws.sandbox ? sandboxes.get(ws.sandbox) : undefined;
+      if (!sandbox) continue;
+      this.syncFromSandbox(ws, sandbox);
+      ws.activityAt ??= this.now(); // a workspace from before the clock was kept: it starts now
+      await this.persistActivity(kube, ws);
+      if (ws.keep) {
+        next.kept.set(ws.id, "kept: never auto-archived");
+        ws.archiveAt = undefined;
+        continue;
+      }
+      const aged = (cfg.maxAgeDays ?? 0) > 0 && ws.createdAt !== undefined && this.now() - ws.createdAt >= cfg.maxAgeDays! * day;
+      if (this.now() - ws.activityAt < shortest && !aged) {
+        ws.archiveAt = undefined;
+        continue; // used recently: nothing to ask Paseo or the pod
+      }
+      const facts = await this.archiveFacts(config, ws);
+      if (facts.busy === true) {
+        this.markActive(ws); // an agent is working: that is activity
+        continue;
+      }
+      const verdict = decide(facts, cfg);
+      const idleSince = new Date(ws.activityAt).toISOString();
+      const blocked = (reason: string) => next.blocked.push({ workspaceId: ws.id, title: this.title(ws), reason, idleSince });
+      if (verdict.kind === "exempt") {
+        next.kept.set(ws.id, verdict.why);
+        ws.archiveAt = undefined;
+        continue;
+      }
+      if (verdict.kind === "blocked") {
+        blocked(verdict.reason);
+        continue;
+      }
+      if (verdict.kind !== "warn" && verdict.kind !== "scheduled" && verdict.kind !== "due") {
+        ws.archiveAt = undefined;
+        continue;
+      }
+      const safety = await this.archiveSafety(config, kube, ws, "look").catch((e: Error): { ok: false; reason: string; seed?: boolean } => ({ ok: false, reason: e.message }));
+      if (!safety.ok) {
+        if (safety.seed) next.kept.set(ws.id, "holds seed data: never archived");
+        else blocked(safety.reason);
+        ws.archiveAt = undefined;
+        continue;
+      }
+      if (verdict.kind === "warn") {
+        ws.warnedAt = this.now();
+        ws.archiveAt = verdict.archiveAt;
+        ws.archiveDry = cfg.dryRun;
+        this.annotate(ws, { [WARNED_ANNOTATION]: new Date(ws.warnedAt).toISOString() });
+        const hours = Math.ceil((verdict.archiveAt - this.now()) / 3_600_000);
+        this.log(`[kubernetes-runtime] ${cfg.dryRun ? "(dry run) " : ""}workspace ${ws.id} (${this.title(ws)}) is idle: ${verdict.reason}; warned, archive in ${hours}h unless it is used`);
+        ws.notice?.(`This workspace has been idle for a while: it is archived in ${hours}h unless it is used${cfg.dryRun ? " (dry run: nothing is archived yet)" : ""}. Keep it with the Keep action in the Kubernetes Runtime screen.`, "warning");
+        next.scheduled.push({ workspaceId: ws.id, title: this.title(ws), archiveAt: new Date(verdict.archiveAt).toISOString() });
+      } else if (verdict.kind === "scheduled") {
+        ws.archiveAt = verdict.archiveAt;
+        ws.archiveDry = cfg.dryRun;
+        next.scheduled.push({ workspaceId: ws.id, title: this.title(ws), archiveAt: new Date(verdict.archiveAt).toISOString() });
+      } else {
+        ws.archiveAt = this.now();
+        ws.archiveDry = cfg.dryRun;
+        next.scheduled.push({ workspaceId: ws.id, title: this.title(ws), archiveAt: new Date(this.now()).toISOString() });
+        due.push({ ws, verdict, decidedAt: ws.activityAt });
+      }
+    }
+    this.archiveSummary = next;
+    due.sort((a, b) => a.decidedAt - b.decidedAt);
+    for (const { ws, verdict, decidedAt } of due.slice(0, cfg.maxPerRun)) await this.archiveOne(config, kube, ws, verdict.reason, decidedAt);
+  }
+
+  /** The final check under the workspace's queue, then the archive itself (outside the queue: destroy() runs on it). */
+  private async archiveOne(config: KubernetesRuntimeConfig, kube: Kube, ws: WorkspaceState, reason: string, decidedAt: number): Promise<void> {
+    const cfg = config.autoArchive;
+    const entry = (outcome: "archived" | "would-archive" | "failed", detail?: string) => {
+      this.archiveLog.add({ at: new Date(this.now()).toISOString(), workspaceId: ws.id, title: this.title(ws), reason, outcome, dryRun: cfg.dryRun, ...(detail ? { detail } : {}) });
+    };
+    let refused: string | undefined;
+    await this.serial(ws, async () => {
+      const sandbox = ws.sandbox ? (await kube.listSandboxes(`${WORKSPACE_ID_LABEL}=${ws.id}`))[0] : undefined;
+      if (!sandbox) return void (refused = "the Sandbox is gone");
+      this.syncFromSandbox(ws, sandbox);
+      if (ws.keep) return void (refused = "kept");
+      if (ws.activityAt !== decidedAt) return void (refused = "used since the decision");
+      const facts = await this.archiveFacts(config, ws);
+      if (facts.busy !== false) return void (refused = "an agent is working");
+      const verdict = decide(facts, cfg);
+      if (verdict.kind !== "due") return void (refused = `no longer due (${verdict.kind})`);
+      const safety = await this.archiveSafety(config, kube, ws, "final");
+      if (!safety.ok) refused = safety.reason;
+    }).catch((e: Error) => void (refused = e.message));
+    if (refused) {
+      this.log(`[kubernetes-runtime] not auto-archiving ${ws.id} (${this.title(ws)}): ${refused}`);
+      return;
+    }
+    if (cfg.dryRun) {
+      if (ws.dryRunLogged) return;
+      ws.dryRunLogged = true;
+      this.log(`[kubernetes-runtime] (dry run) would auto-archive workspace ${ws.id} (${this.title(ws)}): ${reason}`);
+      entry("would-archive");
+      return;
+    }
+    try {
+      this.log(`[kubernetes-runtime] auto-archiving workspace ${ws.id} (${this.title(ws)}): ${reason}`);
+      await (this.deps.archiveWorkspace ?? paseoArchiveWorkspace)(ws.id, { reason, ifIdle: true });
+      entry("archived");
+    } catch (error) {
+      this.log(`[kubernetes-runtime] auto-archive of ${ws.id} failed: ${(error as Error).message}`);
+      entry("failed", (error as Error).message);
     }
   }
 
@@ -790,6 +1179,8 @@ export class KubernetesRuntime {
     const short = shortImage(ws.image);
     const name = short?.split("@")[0]?.split(":")[0];
     const state = ws.phase === "resuming" ? "starting" : ws.phase === "none" ? "unknown" : ws.phase;
+    const hours = ws.archiveAt !== undefined && ws.archiveAt > this.now() ? Math.ceil((ws.archiveAt - this.now()) / 3_600_000) : undefined;
+    const archives = hours !== undefined ? `archives in ${hours}h unless activity${ws.archiveDry ? " (dry run: nothing is archived yet)" : ""}` : undefined;
     // no `label`: the sidebar shows the runtime icon alone (a label beside it truncated the host name)
     return {
       hostIcon: HOST_ICON,
@@ -799,8 +1190,9 @@ export class KubernetesRuntime {
         `State: ${state}`,
         ...(ws.image ? [`Image: ${ws.image}`] : []),
         ...(ws.repo ? [`Repository: ${ws.repo}`] : []),
+        ...(archives ? [archives] : []),
       ].join("\n"),
-      detail: [name ?? "pod", ws.sandbox, state].join(" · "),
+      detail: [name ?? "pod", ws.sandbox, state, ...(archives ? [archives] : [])].join(" · "),
     };
   }
 
@@ -943,6 +1335,7 @@ export class KubernetesRuntime {
 
   async prepare(request: WorkspaceRuntimePrepareRequest, ctx: WorkspaceRuntimeContext): Promise<void> {
     const ws = this.workspace(request);
+    this.markActive(ws);
     ws.agent = request.env.PASEO_AGENT_ID?.slice(0, 8) ?? ws.agent;
     await this.withinWindow(ws, ctx, () => this.ensureReady(ws, this.detached(ws, ctx), { command: request.argv[0], mcpServers: request.mcpServers, env: request.env }));
   }
@@ -977,7 +1370,7 @@ export class KubernetesRuntime {
 
   async beforeInput(request: WorkspaceRuntimeInputRequest, ctx: WorkspaceRuntimeContext): Promise<void> {
     const ws = this.workspace(request);
-    ws.lastActivity = this.now();
+    this.markActive(ws);
     await this.withinWindow(ws, ctx, async () => {
       if (ws.phase === "suspended" || ws.phase === "resuming") await this.ensureReady(ws, this.detached(ws, ctx), {});
     });
@@ -996,7 +1389,7 @@ export class KubernetesRuntime {
     if (event.activity === "permission_requested") agent.pendingPermissions++;
     if (event.activity === "permission_resolved") agent.pendingPermissions = Math.max(0, agent.pendingPermissions - 1);
     ws.agents.set(event.agentId, agent);
-    ws.lastActivity = this.now();
+    this.markActive(ws);
   }
 
   async inspect(request: WorkspaceRuntimeWorkspaceRequest): Promise<WorkspaceRuntimeStatus> {
@@ -1154,6 +1547,7 @@ export class KubernetesRuntime {
       throw new Error("The pod is not running; background refreshes do not wake it");
     }
     ws.notice = ctx.notice;
+    if (request.purpose !== "command") this.markActive(ws); // a provider process starting; Git polls are not activity
     await this.serial(ws, () => this.ensureReady(ws, this.detached(ws, ctx), { command: request.purpose === "command" ? undefined : request.argv[0], env: request.env }));
     const config = await this.deps.getConfig();
     const kube = this.deps.kubeFor(config);
@@ -1232,7 +1626,25 @@ export function liveProviderChildren(psOutput: string): boolean {
   });
 }
 
-async function paseoArchiveWorkspace(workspaceId: string): Promise<void> {
+/** Which options `paseo workspace archive` has: `--reason` and `--if-idle` come with the fork's change. Read from its help. */
+export function parseArchiveHelp(help: string): { reason: boolean; ifIdle: boolean } {
+  return { reason: /--reason\b/.test(help), ifIdle: /--if-idle\b/.test(help) };
+}
+
+let archiveSupport: Promise<{ reason: boolean; ifIdle: boolean }> | undefined;
+
+async function paseoArchiveWorkspace(workspaceId: string, options: { reason?: string; ifIdle?: boolean } = {}): Promise<void> {
   const { execFile } = await import("node:child_process");
-  await new Promise<void>((resolve, reject) => execFile("paseo", ["workspace", "archive", workspaceId], { timeout: 30_000 }, (e) => (e ? reject(e) : resolve())));
+  const run = (args: string[]) =>
+    new Promise<string>((resolve, reject) => execFile("paseo", args, { timeout: 30_000 }, (e, stdout, stderr) => (e ? reject(Object.assign(e, { stderr })) : resolve(stdout))));
+  archiveSupport ??= run(["workspace", "archive", "--help"]).then(parseArchiveHelp, () => ({ reason: false, ifIdle: false }));
+  const support = await archiveSupport;
+  const flags = [...(options.reason && support.reason ? ["--reason", options.reason] : []), ...(options.ifIdle && support.ifIdle ? ["--if-idle"] : [])];
+  try {
+    await run(["workspace", "archive", workspaceId, ...flags]);
+  } catch (error) {
+    // a CLI that knows the options against a daemon that does not: archive plainly (the checks were made here)
+    if (flags.length && /Update the Paseo host/i.test(String((error as { stderr?: string }).stderr ?? error))) return void (await run(["workspace", "archive", workspaceId]));
+    throw error;
+  }
 }

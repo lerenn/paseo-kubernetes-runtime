@@ -18,6 +18,9 @@ export const PodRowSchema = z.object({
   image: z.string().optional(),
   size: z.string().optional(),
   agents: z.array(z.object({ id: z.string(), title: z.string(), status: z.string() })),
+  /** Where the workspace is in the auto-archive sequence, when it is in it (shown as a badge). */
+  autoArchive: z.enum(["scheduled", "blocked", "kept"]).optional(),
+  autoArchiveText: z.string().optional(),
 });
 export type PodRow = z.infer<typeof PodRowSchema>;
 
@@ -29,11 +32,39 @@ const ReaperSchema = z.object({
   error: z.string().optional(),
 });
 
-/** What the Kubernetes Runtime screen shows: the pods this plugin runs and the last orphan cleanup. */
+const AutoArchiveSchema = z.object({
+  enabled: z.boolean(),
+  dryRun: z.boolean(),
+  /** Idle long enough and warned: archived at `archiveAt` (or, in a dry run, logged then). */
+  scheduled: z.array(z.object({ workspaceId: z.string(), title: z.string(), archiveAt: z.string() })),
+  /** Idle long enough but not archivable: why, and since when the workspace has been idle. */
+  blocked: z.array(z.object({ workspaceId: z.string(), title: z.string(), reason: z.string(), idleSince: z.string().optional() })),
+  recent: z.array(
+    z.object({
+      at: z.string(),
+      workspaceId: z.string(),
+      title: z.string(),
+      reason: z.string(),
+      outcome: z.enum(["archived", "would-archive", "failed"]),
+      dryRun: z.boolean(),
+      detail: z.string().optional(),
+    }),
+  ),
+});
+export type AutoArchiveStatus = z.infer<typeof AutoArchiveSchema>;
+
+/** What the Kubernetes Runtime screen shows: the pods this plugin runs, the last orphan cleanup and the auto-archive state. */
 export const kubeStatus = defineRpc({
   name: "kube.status",
   input: z.object({}),
-  output: z.object({ reaper: ReaperSchema, pods: z.array(PodRowSchema) }),
+  output: z.object({ reaper: ReaperSchema, pods: z.array(PodRowSchema), autoArchive: AutoArchiveSchema.optional() }),
+});
+
+/** Keep a workspace from being auto-archived (or let it be again). */
+export const kubeKeep = defineRpc({
+  name: "kube.keep",
+  input: z.object({ workspaceId: z.string(), keep: z.boolean() }),
+  output: z.object({ ok: z.boolean(), message: z.string().optional() }),
 });
 
 export const PodActionSchema = z.enum(["suspend", "resume", "restart", "delete"]);

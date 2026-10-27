@@ -3,7 +3,7 @@ import path from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { credentialsRemove, credentialsSet, credentialsStatus } from "./shared/credentials.js";
 import { ConfigSchema, kubeSettings } from "./shared/settings.js";
-import { kubePodAction, kubeReconcile, kubeStatus } from "./shared/status.js";
+import { kubeKeep, kubePodAction, kubeReconcile, kubeStatus } from "./shared/status.js";
 import { paseoWorkspaces } from "./server/orphans.js";
 import { paseoAgents, readPodRows } from "./server/status.js";
 import { readDaemonId } from "./server/daemon.js";
@@ -13,7 +13,7 @@ import { migrateLegacyData } from "./server/migrate.js";
 import { OrphanReaper } from "./server/orphans.js";
 import { podOnlyAgent, podOnlyWorkspace } from "./server/pod-only.js";
 import { LABELS_REF_ENV, LabelHandoff, withAgentLabels } from "./server/label-handoff.js";
-import { labelsOfAgent, sendUnlessBusy, workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
+import { labelsOfAgent, labelsOfWorkspace, sendUnlessBusy, workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
 import { PodRegistry } from "./server/registry.js";
 import { KubernetesRuntime } from "./server/runtime.js";
 import { RUNTIME_ID } from "./shared/runtime-options.js";
@@ -45,6 +45,8 @@ export default function contribute(server: PluginServerContext) {
   };
   const runtime = new KubernetesRuntime({ getConfig, kubeFor, daemonId, registry, agentsBusy: (workspaceId) => workspaceAgentsBusy(paseoApi, workspaceId),
     recoveryStateFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "interruptions.json"),
+    autoArchiveLogFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "auto-archive.json"),
+    workspaceLabels: (workspaceId) => labelsOfWorkspace(paseoApi, workspaceId),
     // `skip` is the fork's (not in the published SDK's types); a host without it is handled in sendUnlessBusy
     messenger: {
       async send(agentId, text, behavior) {
@@ -121,8 +123,13 @@ export default function contribute(server: PluginServerContext) {
     const config = await getConfig();
     const [titles, agents] = await Promise.all([paseoWorkspaces(), paseoAgents()]);
     const pods = await readPodRows(kubeFor(config), daemonId, registry.list(), titles, agents);
-    return { reaper: reaper.current(), pods };
+    return {
+      reaper: reaper.current(),
+      pods: pods.map((row) => ({ ...row, ...runtime.autoArchiveBadge(row.workspaceId) })),
+      autoArchive: runtime.autoArchiveStatus(config),
+    };
   });
+  server.handle(kubeKeep, ({ workspaceId, keep }) => runtime.setKeep(workspaceId, keep));
   server.handle(kubePodAction, ({ workspaceId, action, force, archive }) => runtime.podAction(workspaceId, action, { force, archive }));
   server.handle(kubeReconcile, async () => ({ reaper: await reaper.run() }));
 
