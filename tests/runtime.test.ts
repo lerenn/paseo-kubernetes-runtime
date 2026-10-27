@@ -1,4 +1,9 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { OomLedger, SUMMARY_EVERY_MS } from "../server/oom.js";
+import { buildPodRows } from "../server/status.js";
 import { KubernetesRuntime, liveProviderChildren } from "../server/runtime.js";
 import { PodRegistry } from "../server/registry.js";
 import type { WorkspaceRuntimeRegistration } from "../server/runtime-types.js";
@@ -310,7 +315,9 @@ describe("recovery from a node reclaim", () => {
     t.kube.procs[0]!.end(137);
     expect(await p.exit).toMatchObject({ reason: "exited", message: expect.stringContaining("out of memory") });
     await flush();
-    expect(messages).toHaveLength(0);
+    expect(messages).toHaveLength(1); // the agent mid-turn is resumed once, with the memory note
+    expect(messages[0]).toMatchObject({ agentId: "agent-1", behavior: "skip" });
+    expect(messages[0]!.text).toMatch(/ran out of memory.*Commit and push more often.*`builder`/);
   });
 
   it("does not resume the same agent again within ten minutes (no loop)", async () => {
@@ -941,5 +948,157 @@ describe("suspend, resume and destroy", () => {
     t.advance(31 * MIN);
     await t.tick();
     expect(await t.reg.inspect!(t.base, t.ctx)).toEqual({ state: "suspended" });
+  });
+});
+
+describe("turn-scoped annotations", () => {
+  const KEY = "karpenter.sh/do-not-disrupt";
+  const running = async (extra: object = {}, settings: object = {}) => {
+    const t = setup(settings, extra);
+    await t.prepare();
+    t.kube.annotated.length = 0;
+    return t;
+  };
+
+  it("puts them on when a turn opens, once, and takes them off 30 s after the last turn ended", async () => {
+    const t = await running();
+    t.activity("turn_started", "a1");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(t.kube.annotated).toEqual([{ name: expect.any(String), set: { [KEY]: "true" }, remove: [] }]);
+    t.activity("turn_started", "a2");
+    await t.runtime.checkTurnAnnotations();
+    expect(t.kube.annotated).toHaveLength(1); // idempotent
+    t.activity("turn_ended", "a1");
+    t.advance(60_000);
+    await t.runtime.checkTurnAnnotations();
+    expect(t.kube.annotated).toHaveLength(1); // a2 still has a turn open
+    t.activity("turn_ended", "a2");
+    t.advance(10_000);
+    await t.runtime.checkTurnAnnotations();
+    expect(t.kube.annotated).toHaveLength(1); // debounce
+    t.advance(25_000);
+    await t.runtime.checkTurnAnnotations();
+    expect(t.kube.annotated[1]).toMatchObject({ set: {}, remove: [KEY] });
+    await t.runtime.checkTurnAnnotations();
+    expect(t.kube.annotated).toHaveLength(2);
+  });
+
+  it("a turn that starts within the debounce keeps the annotation", async () => {
+    const t = await running();
+    t.activity("turn_started");
+    await new Promise((r) => setTimeout(r, 0));
+    t.activity("turn_ended");
+    t.advance(10_000);
+    t.activity("turn_started");
+    t.advance(60_000);
+    await t.runtime.checkTurnAnnotations();
+    expect(t.kube.annotated.filter((a) => a.remove.length)).toHaveLength(0);
+  });
+
+  it("puts them on a replaced pod again, and leaves a key that podAnnotations also sets", async () => {
+    const t = await running({}, { podAnnotations: { [KEY]: "true" } });
+    t.activity("turn_started");
+    await new Promise((r) => setTimeout(r, 0));
+    t.kube.pods = [{ uid: "uid-2", ready: true, terminating: false }];
+    await t.runtime.checkTurnAnnotations();
+    expect(t.kube.annotated).toHaveLength(2);
+    t.activity("turn_ended");
+    t.advance(31_000);
+    await t.runtime.checkTurnAnnotations();
+    expect(t.kube.annotated).toHaveLength(2); // nothing to remove: podAnnotations owns the key
+  });
+
+  it("after a plugin restart reconciles from the agent list: stays on for an open turn, comes off when none", async () => {
+    let busy: boolean | null = true;
+    const kube = new FakeKube();
+    const first = setup({}, {}, kube);
+    await first.prepare();
+    kube.annotated.length = 0;
+    // a new plugin process: no turn state, the pod is already running
+    const second = setup({}, { agentsBusy: async () => busy }, kube);
+    await (second.runtime as any).adopt();
+    await second.runtime.checkTurnAnnotations();
+    expect(kube.annotated).toEqual([{ name: expect.any(String), set: { [KEY]: "true" }, remove: [] }]);
+    busy = null;
+    const third = setup({}, { agentsBusy: async () => busy }, kube);
+    await (third.runtime as any).adopt();
+    kube.annotated.length = 0;
+    third.advance(60_000);
+    await third.runtime.checkTurnAnnotations();
+    expect(kube.annotated).toEqual([]); // cannot tell: untouched
+    busy = false;
+    await third.runtime.checkTurnAnnotations(); // starts the debounce
+    third.advance(31_000);
+    await third.runtime.checkTurnAnnotations();
+    expect(kube.annotated).toEqual([{ name: expect.any(String), set: {}, remove: [KEY] }]);
+  });
+
+  it("does nothing when turnAnnotations is empty", async () => {
+    const t = await running({}, { turnAnnotations: {} });
+    t.activity("turn_started");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(t.kube.annotated).toEqual([]);
+  });
+});
+
+describe("OOM counters", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "oom-"));
+  const sent: { agentId: string; text: string }[] = [];
+  const messenger = { send: async (agentId: string, text: string) => void sent.push({ agentId, text }) };
+  const flush = () => new Promise((r) => setTimeout(r, 5));
+  const oomPod = { uid: "uid-1", ready: true, terminating: false, oomKilled: true, oomAt: "2026-10-27T10:00:00Z", memoryLimit: "3Gi" };
+
+  it("counts per workspace and agent, logs, persists, shows in the status row, and resumes ONCE through the guard", async () => {
+    sent.length = 0;
+    const logs: string[] = [];
+    const file = path.join(dir, "oom.json");
+    const t = setup({}, { messenger, oomStateFile: file, recoveryStateFile: path.join(dir, "rec.json"), log: (l: string) => void logs.push(l) });
+    await t.reg.create!(t.base, t.ctx);
+    t.activity("turn_started", "agent-1");
+    await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.kube.pods = [oomPod];
+    t.kube.procs[0]!.end(137);
+    t.kube.procs[1]!.end(137);
+    await flush();
+    expect(logs).toContain("[kubernetes-runtime] OOM: wks_1 agent agent-1 limit 3Gi");
+    expect(logs.filter((l) => l.includes("OOM: wks_1"))).toHaveLength(1); // one kill, two reporting processes
+    expect(sent).toHaveLength(1);
+    expect(t.runtime.oomStats().get("wks_1")).toMatchObject({ count: 1, limit: "3Gi", agents: { "agent-1": { count: 1 } } });
+    // persisted: a new ledger on the same file has it
+    const again = new OomLedger(file, 0);
+    expect(again.get("wks_1")).toMatchObject({ count: 1, agents: { "agent-1": { count: 1 } } });
+    // a second kill soon after: counted, but the guard allows no second resume within ten minutes
+    t.activity("turn_started", "agent-1");
+    await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.kube.pods = [{ ...oomPod, oomAt: "2026-10-27T10:02:00Z" }];
+    t.kube.procs[2]!.end(137);
+    await flush();
+    expect(sent).toHaveLength(1);
+    expect(t.runtime.oomStats().get("wks_1")!.count).toBe(2);
+    const row = buildPodRows({ sandboxes: t.kube.sandboxes, claims: [], pods: new Map(), entries: [], titles: null, agents: [], oom: t.runtime.oomStats() })[0]!;
+    expect(row.oom).toMatchObject({ limit: "3Gi" });
+  });
+
+  it("does not resume when autoResume is off, and an idle agent is never resumed", async () => {
+    sent.length = 0;
+    const t = setup({ recovery: { autoResume: false } }, { messenger });
+    await t.reg.create!(t.base, t.ctx);
+    t.activity("turn_started", "agent-1");
+    await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.kube.pods = [oomPod];
+    t.kube.procs[0]!.end(137);
+    await flush();
+    expect(sent).toHaveLength(0);
+    expect(t.runtime.oomStats().get("wks_1")!.count).toBe(1);
+  });
+
+  it("summarizes once a day, only when there were kills", () => {
+    const l = new OomLedger(null, 0);
+    expect(l.dueSummary(SUMMARY_EVERY_MS)).toBeNull(); // nothing to say
+    l.record("wks_1", ["a"], SUMMARY_EVERY_MS + 1, { limit: "3Gi" });
+    expect(l.dueSummary(SUMMARY_EVERY_MS + 10)).toBeNull(); // not a day yet
+    expect(l.dueSummary(2 * SUMMARY_EVERY_MS + 1)).toContain("wks_1: 1 (limit 3Gi)");
+    expect(l.dueSummary(3 * SUMMARY_EVERY_MS + 2)).toBeNull();
   });
 });
