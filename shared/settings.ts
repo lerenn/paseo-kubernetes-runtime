@@ -37,6 +37,8 @@ export const ProfileSchema = z.object({
   /** Copied into the volume the first time the workspace starts; a marker on the volume keeps it from being copied again. */
   seed: z.array(SeedDirSchema).default([]),
   image: z.string().min(1).optional(),
+  /** Added to the global `nodeSelector` (this one wins on a shared key), e.g. karpenter.sh/capacity-type=on-demand. */
+  nodeSelector: z.record(z.string(), z.string()).optional(),
   /** Overrides the size and storage class of a new workspace volume. An existing volume keeps its claim. */
   storage: z
     .object({
@@ -126,6 +128,12 @@ export const ConfigSchema = z.object({
    * so the autoscaler leaves a node alone while an agent works on it. A suspended workspace has no pod, so they go with it.
    */
   podAnnotations: z.record(z.string(), z.string()).default({}),
+  /**
+   * Annotations on a workspace's pod only while an agent has a turn open: put on when a turn opens, taken off 30 s after the
+   * last one ends (and reconciled after a plugin restart). The default keeps Karpenter from consolidating a node under a working
+   * agent but lets it reclaim an idle one. `podAnnotations` should no longer carry `karpenter.sh/do-not-disrupt`.
+   */
+  turnAnnotations: z.record(z.string(), z.string()).default({ "karpenter.sh/do-not-disrupt": "true" }),
   /**
    * ServiceAccount by agent label. The first rule whose `label` (`key=value`) is among the labels of the first agent
    * of a workspace names the pod's ServiceAccount, and its token is mounted. No match: the pod has no token.
@@ -224,6 +232,7 @@ export function applyProfile(config: KubernetesRuntimeConfig, profile: string | 
   return {
     ...config,
     ...(p.image ? { image: p.image } : {}),
+    ...(p.nodeSelector ? { nodeSelector: { ...config.nodeSelector, ...p.nodeSelector } } : {}),
     ...(p.resources ? { resources: { ...config.resources, ...p.resources } } : {}),
     storage: { ...config.storage, ...(p.storage?.size ? { size: p.storage.size } : {}), ...(p.storage?.storageClassName ? { storageClassName: p.storage.storageClassName } : {}) },
   };

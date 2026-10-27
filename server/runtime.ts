@@ -1,13 +1,14 @@
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import { applyProfile } from "../shared/settings.js";
+import { OomLedger, oomResumePrompt, parsePeak } from "./oom.js";
 import { checkpointPrompt, classifyStop, ResumeGuard, resumePrompt } from "./interruption.js";
 import { parseRuntimeOptions, type RuntimeOptions } from "../shared/runtime-options.js";
 import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, serveFetchChunk, type FetchTarget } from "./mirrors.js";
 import { applyPush, loopbackPorts, startBridge, type RunningBridge } from "./bridge.js";
 import type { KubernetesRuntimeConfig } from "./config.js";
 import { type GitRunner, runGit, scrub } from "./git.js";
-import type { Kube, PodProcess, SandboxInfo } from "./kube.js";
+import type { Kube, PodInfo, PodProcess, SandboxInfo } from "./kube.js";
 import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
 import { ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, clearSubmoduleFailure, recordSubmoduleFailure, submoduleWait, seedDirectory, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
@@ -109,6 +110,8 @@ export interface RuntimeDeps {
   messenger?: { send(agentId: string, text: string, behavior: "steer" | "skip"): Promise<void> };
   /** Where the automatic-resume guard keeps its state, so a restarted plugin does not start over. */
   recoveryStateFile?: string;
+  /** Where the OOM counters are kept (survives a restart). */
+  oomStateFile?: string;
   /** Whether an agent of this workspace (by id) has a turn open, from Paseo's agent list; null when it cannot say. */
   agentsBusy?: (workspaceId: string) => Promise<boolean | null>;
   /** Archives a workspace in Paseo (the delete action's option, and auto-archive, which adds a reason and `ifIdle`); injected for tests. */
@@ -155,6 +158,13 @@ interface WorkspaceState {
   /** The pod uid the checkpoint nudge was sent for, and the pod uid whose loss was already handled. */
   nudgedUid?: string;
   interruptedUid?: string;
+  /** The pod uid the turn annotations were put on; null: known to be off; undefined: not known yet (after a plugin restart). */
+  turnAnnotatedUid?: string | null;
+  /** When the last open turn ended (the debounce of taking the annotations off). */
+  turnIdleSince?: number;
+  turnSyncing?: boolean;
+  /** The OOM kill (pod uid and time) already handled. */
+  oomKey?: string;
   lastInterruptedAt?: number;
   /** When labelling the pod or claim last failed (missing `patch` in the Role); retried after a while. */
   labelFailedAt?: number;
@@ -188,6 +198,9 @@ interface WorkspaceState {
   chain: Promise<unknown>;
 }
 
+/** How long after the last turn ended the turn annotations come off (turns follow one another closely). */
+const TURN_ANNOTATION_DEBOUNCE_MS = 30_000;
+
 /** Stands in `commands` for the Scoped Daemon Access shim having been installed in the current pod. */
 const OPS_SHIM = "paseo (scoped daemon access)";
 
@@ -218,6 +231,7 @@ export class KubernetesRuntime {
   /** Only one suspended workspace without a stored check is resumed at a time. */
   private legacyProbing = false;
   private archiveSummary: Pick<AutoArchiveStatus, "scheduled" | "blocked"> & { kept: Map<string, string> } = { scheduled: [], blocked: [], kept: new Map() };
+  private readonly oom: OomLedger;
   private stopInterruptTicker: () => void = () => undefined;
 
   constructor(private readonly deps: RuntimeDeps) {
@@ -226,6 +240,7 @@ export class KubernetesRuntime {
     this.git = deps.git ?? runGit;
     this.now = deps.now ?? Date.now;
     this.lastDemand = this.now();
+    this.oom = new OomLedger(deps.oomStateFile ?? null, this.now());
   }
 
   private log(line: string): void {
@@ -247,7 +262,11 @@ export class KubernetesRuntime {
       const timer = setInterval(fn, ms) as unknown as NodeJS.Timeout;
       timer.unref?.();
       return () => clearInterval(timer);
-    }))(() => void this.checkInterruptions().catch(() => undefined), 10_000);
+    }))(() => {
+      void this.checkInterruptions().catch(() => undefined);
+      void this.checkTurnAnnotations().catch(() => undefined);
+      this.oomSummary();
+    }, 10_000);
     this.stopArchiveTicker = (this.deps.ticker ?? ((fn, ms) => {
       const timer = setInterval(fn, ms) as unknown as NodeJS.Timeout;
       timer.unref?.();
@@ -813,18 +832,96 @@ export class KubernetesRuntime {
     for (const [, a] of ws.agents) a.turn = false; // its processes are gone: no turn is open any more
     this.log(`[kubernetes-runtime] pod ${pod} was interrupted (${why}); agents mid-turn: ${cut.map((id) => id.slice(0, 8)).join(", ") || "none"}`);
     const { recovery } = await this.deps.getConfig();
-    if (!recovery.autoResume || !this.deps.messenger) return;
-    for (const agentId of cut) {
+    if (!recovery.autoResume) return;
+    await this.resumeAgents(ws, cut, resumePrompt(at), "the interruption");
+  }
+
+  /** One resume prompt (with `skip`) to each agent, through the guard that keeps the automatic resume from looping. */
+  private async resumeAgents(ws: WorkspaceState, agentIds: readonly string[], prompt: string, after: string): Promise<void> {
+    if (!this.deps.messenger) return;
+    for (const agentId of agentIds) {
       const verdict = this.guard.allow(agentId, this.now());
       if (!verdict.ok) {
         this.log(`[kubernetes-runtime] not resuming agent ${agentId.slice(0, 8)}: ${verdict.reason}`);
-        ws.notice?.(`Not resuming the agent after the interruption: ${verdict.reason}`, "warning");
+        ws.notice?.(`Not resuming the agent after ${after}: ${verdict.reason}`, "warning");
         continue;
       }
       this.guard.sent(agentId, this.now());
       await (this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(5_000); // let Paseo take in the exit first
-      await this.deps.messenger.send(agentId, resumePrompt(at), "skip").catch((e: Error) => this.log(`[kubernetes-runtime] could not resume agent ${agentId.slice(0, 8)}: ${e.message}`));
+      await this.deps.messenger.send(agentId, prompt, "skip").catch((e: Error) => this.log(`[kubernetes-runtime] could not resume agent ${agentId.slice(0, 8)}: ${e.message}`));
     }
+  }
+
+  /**
+   * A process died of an out-of-memory kill in a healthy pod. Counted per workspace and agent (the agents with a turn open),
+   * logged, and those agents get ONE resume prompt through the same guard. Several processes report one kill: handled once.
+   */
+  private async onOom(ws: WorkspaceState, pod: string, info: PodInfo): Promise<void> {
+    const key = `${info.uid}:${info.oomAt ?? ""}`;
+    if (ws.oomKey === key) return;
+    ws.oomKey = key;
+    const cut = [...ws.agents].filter(([, a]) => a.turn).map(([id]) => id);
+    for (const [, a] of ws.agents) a.turn = false;
+    const kube = this.deps.kubeFor(await this.deps.getConfig());
+    const peak = await kube.exec(pod, ["sh", "-c", "cat /sys/fs/cgroup/memory.peak 2>/dev/null || cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes 2>/dev/null"]).then((r) => (r.code === 0 ? parsePeak(r.stdout) : undefined), () => undefined);
+    this.oom.record(ws.id, cut, this.now(), { limit: info.memoryLimit, peakBytes: peak });
+    for (const id of cut.length ? cut : ["-"]) this.log(`[kubernetes-runtime] OOM: ${ws.id} agent ${id} limit ${info.memoryLimit ?? "unknown"}${peak ? ` peak ${Math.round(peak / 2 ** 20)}Mi` : ""}`);
+    if (!(await this.deps.getConfig()).recovery.autoResume) return;
+    await this.resumeAgents(ws, cut, oomResumePrompt, "the out-of-memory kill");
+  }
+
+  /** The OOM counters by workspace id, for the Runtime screen. */
+  oomStats() {
+    return this.oom.all();
+  }
+
+  /** Once a day, and only when there were OOM kills. The plugin has no mail path to the assistant, so it is logged. */
+  private oomSummary(): void {
+    const line = this.oom.dueSummary(this.now());
+    if (line) this.log(`[kubernetes-runtime] OOM daily summary (not mailed to @assistant: the plugin has no mail path): ${line}`);
+  }
+
+  /**
+   * The pod carries `turnAnnotations` (do-not-disrupt) while an agent has a turn open: put on at once when one opens, taken
+   * off 30 s after the last one ended. Idempotent; a pod replaced meanwhile gets them again; after a plugin restart the state
+   * is unknown, so Paseo's agent list says whether a turn is open before anything is changed.
+   */
+  private async syncTurnAnnotations(ws: WorkspaceState): Promise<void> {
+    if (ws.turnSyncing || ws.phase !== "running" || !ws.sandbox) return;
+    const config = await this.deps.getConfig();
+    const keys = Object.keys(config.turnAnnotations);
+    if (!keys.length) return;
+    ws.turnSyncing = true;
+    try {
+      const kube = this.deps.kubeFor(config);
+      let open = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
+      if (!open && ws.turnAnnotatedUid === undefined) {
+        const byId = this.deps.agentsBusy ? await this.deps.agentsBusy(ws.id).catch(() => null) : false;
+        if (byId === null) return; // cannot tell: leave the pod as it is
+        open = byId;
+      }
+      if (open) {
+        ws.turnIdleSince = undefined;
+        const info = await kube.podInfo(ws.sandbox).catch(() => null);
+        if (!info?.uid || ws.turnAnnotatedUid === info.uid) return;
+        await kube.annotatePod(ws.sandbox, config.turnAnnotations);
+        ws.turnAnnotatedUid = info.uid;
+        return;
+      }
+      ws.turnIdleSince ??= this.now();
+      if (ws.turnAnnotatedUid === null || this.now() - ws.turnIdleSince < TURN_ANNOTATION_DEBOUNCE_MS) return;
+      const remove = keys.filter((k) => !(k in config.podAnnotations));
+      if (remove.length) await kube.annotatePod(ws.sandbox, {}, remove);
+      ws.turnAnnotatedUid = null;
+    } catch (error) {
+      this.log(`[kubernetes-runtime] could not update the turn annotations of ${ws.sandbox}: ${(error as Error).message}`);
+    } finally {
+      ws.turnSyncing = false;
+    }
+  }
+
+  async checkTurnAnnotations(): Promise<void> {
+    for (const ws of this.states.values()) await this.syncTurnAnnotations(ws);
   }
 
   /**
@@ -1391,6 +1488,8 @@ export class KubernetesRuntime {
     if (event.activity === "permission_resolved") agent.pendingPermissions = Math.max(0, agent.pendingPermissions - 1);
     ws.agents.set(event.agentId, agent);
     this.markActive(ws);
+    if (event.activity === "turn_ended" && ![...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0)) ws.turnIdleSince = this.now();
+    if (event.activity === "turn_started" || event.activity === "permission_requested") void this.syncTurnAnnotations(ws).catch(() => undefined);
   }
 
   async inspect(request: WorkspaceRuntimeWorkspaceRequest): Promise<WorkspaceRuntimeStatus> {
@@ -1583,7 +1682,10 @@ export class KubernetesRuntime {
           }
           return { code, signal, reason: "runtime-lost" as const, message: "The pod was lost; the next message brings it back" };
         }
-        if (code !== 0 && info?.oomKilled) return { code, signal, reason: "exited" as const, message: "The process ran out of memory (the pod's memory limit)" };
+        if (code !== 0 && info?.oomKilled) {
+          void this.onOom(ws, pod, info).catch(() => undefined);
+          return { code, signal, reason: "exited" as const, message: "The process ran out of memory (the pod's memory limit)" };
+        }
         return { code, signal, reason: "exited" as const };
     });
     tracked.exited = exit;

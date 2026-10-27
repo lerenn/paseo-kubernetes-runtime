@@ -122,6 +122,41 @@ suspended workspace has no pod, so the hint goes with it, and a claimed warm pod
 follows today's placement and annotations. `warmPool.idleMinutes` removes the warm pods that long after the last workspace
 or agent start (0 = never) and brings them back with the next one.
 
+`podAnnotations` are static, so a `karpenter.sh/do-not-disrupt` there pins the node for as long as the pod exists, idle or not,
+and the node is never consolidated. Use `turnAnnotations` for it instead (default `{"karpenter.sh/do-not-disrupt": "true"}`):
+the plugin puts them on the workspace's pod when any agent's turn opens and takes them off 30 s after no turn is open
+(idempotent; a replaced pod gets them again; after a plugin restart it reads Paseo's agent list before changing anything).
+`podAnnotations` should no longer carry do-not-disrupt (a key set in both is left on).
+
+Recommended default `resources`: requests `cpu: 150m`, `memory: 768Mi`; limits `memory: 3Gi`; no CPU limit:
+
+```json
+"resources": { "requests": { "cpu": "150m", "memory": "768Mi" }, "limits": { "memory": "3Gi" } }
+```
+
+A `builder` profile for heavy builds, on on-demand capacity and with more memory:
+
+```json
+"profiles": {
+  "builder": {
+    "nodeSelector": { "karpenter.sh/capacity-type": "on-demand" },
+    "resources": { "requests": { "cpu": "150m", "memory": "768Mi" }, "limits": { "memory": "4Gi" } }
+  }
+}
+```
+
+A profile's `nodeSelector` is added to the global one (the profile wins on a shared key).
+
+## Out-of-memory kills
+
+A process that dies of an OOM kill in a healthy pod is counted per workspace and per agent (the agents with a turn open), with the
+time, the container's memory limit and, when readable, its peak (`memory.peak` of the cgroup, since the container started).
+Each kill logs `[kubernetes-runtime] OOM: <workspace> agent <id> limit <x>`, shows as an `OOM ×n` badge on the workspace's row of
+the Pods table (and in `kube.status`), and is kept in `plugin-data/kubernetes-runtime/oom.json`. Those agents get ONE resume
+prompt through the same guard as an interruption (`recovery.autoResume`): the pod ran out of memory, commit and push more often, a
+bigger profile such as `builder` exists. Once a day, if there were kills, a summary is logged. The plugin has no mail or
+messenger path to the Agents Mail alias `@assistant` (it can only prompt an agent by id), so that summary is not mailed.
+
 ## The Pods table
 
 The Kubernetes Runtime screen lists the pods, one row per workspace: its title (opens the workspace), the pod name, the

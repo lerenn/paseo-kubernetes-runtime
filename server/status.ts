@@ -4,6 +4,7 @@ import type { PodRow } from "../shared/status.js";
 import type { ClaimInfo, Kube, PodInfo, SandboxInfo } from "./kube.js";
 import { CWD_ANNOTATION, DAEMON_LABEL, STATE_LABEL, WARM_STATE, WORKSPACE_ID_LABEL, WORKSPACE_LABEL, workspaceClaimName } from "./sandbox.js";
 import type { PodEntry } from "./registry.js";
+import type { OomEntry } from "./oom.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -58,6 +59,8 @@ export interface StatusInputs {
   /** Workspace titles by id, from Paseo. */
   titles: ReadonlyMap<string, string> | null;
   agents: readonly AgentSummary[] | null;
+  /** Out-of-memory kills by workspace id. */
+  oom?: ReadonlyMap<string, OomEntry>;
 }
 
 /** The pods table: one row per workspace this daemon has a Sandbox for. */
@@ -77,6 +80,7 @@ export function buildPodRows(input: StatusInputs): PodRow[] {
     else if (pod?.ready && !pod.terminating) state = "running";
     else state = "creating";
     const entry = entries.get(workspaceId);
+    const oom = input.oom?.get(workspaceId);
     rows.push({
       workspaceId,
       title: warm ? "Warm pod (waiting for a workspace)" : input.titles?.get(workspaceId) || sandbox.annotations["paseo.sh/workspace-name"] || sandbox.labels[WORKSPACE_LABEL] || workspaceId,
@@ -86,6 +90,7 @@ export function buildPodRows(input: StatusInputs): PodRow[] {
       ...(entry ? { since: new Date(entry.since).toISOString() } : {}),
       ...(shortImage(sandbox.image) ? { image: shortImage(sandbox.image) } : {}),
       ...(claims.get(workspaceClaimName(sandbox.name))?.size ? { size: claims.get(workspaceClaimName(sandbox.name))!.size } : {}),
+      ...(oom ? { oom: { count: oom.count, lastAt: new Date(oom.lastAt).toISOString(), ...(oom.limit ? { limit: oom.limit } : {}), ...(oom.peakBytes ? { peakMi: Math.round(oom.peakBytes / 2 ** 20) } : {}) } } : {}),
       agents: agentsIn(input.agents ?? [], sandbox.annotations[CWD_ANNOTATION]),
     });
   }
@@ -99,11 +104,12 @@ export async function readPodRows(
   entries: readonly PodEntry[],
   titles: ReadonlyMap<string, string> | null,
   agents: readonly AgentSummary[] | null,
+  oom?: ReadonlyMap<string, OomEntry>,
 ): Promise<PodRow[]> {
   if (!daemonId) return [];
   const sandboxes = await kube.listSandboxes(`${DAEMON_LABEL}=${daemonId}`);
   const claims = await kube.listClaims(`${DAEMON_LABEL}=${daemonId}`);
   const pods = new Map<string, PodInfo | null>();
   await Promise.all(sandboxes.map(async (s) => pods.set(s.name, await kube.podInfo(s.name).catch(() => null))));
-  return buildPodRows({ sandboxes, claims, pods, entries, titles, agents });
+  return buildPodRows({ sandboxes, claims, pods, entries, titles, agents, oom });
 }
