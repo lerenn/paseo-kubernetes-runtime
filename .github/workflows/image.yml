@@ -2,6 +2,8 @@ name: image
 # Builds the default pod image and publishes it to ghcr. Pin the digest it prints in the plugin's Image setting.
 # On main it also copies each image, by digest and with the same sha-<commit> tag, to the lab ECR when the
 # repository variable LAB_ECR_PUSH_ROLE_ARN is set (docs/ecr-push.md).
+# Runner: self-hosted ci-1 when the repository variable USE_SELF_HOSTED is 'true', GitHub-hosted otherwise
+# (the failover; also the default until a runner is registered for this repository).
 on:
   push:
     branches: [main]
@@ -18,7 +20,7 @@ env:
   ECR_REGION: eu-west-3
 jobs:
   image:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && fromJSON('["self-hosted","linux","x64","docker"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -69,7 +71,7 @@ jobs:
   image-go:
     # The default image plus Go 1.25 (profile prbr-picky). Built from the default image just published.
     needs: image
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && fromJSON('["self-hosted","linux","x64","docker"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3

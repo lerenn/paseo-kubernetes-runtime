@@ -5,7 +5,9 @@ on:
   pull_request:
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    # Self-hosted ci-1 runner when the repository variable USE_SELF_HOSTED is 'true', GitHub-hosted otherwise
+    # (the failover; also the default until a runner is registered for this repository).
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && fromJSON('["self-hosted","linux","x64","docker"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dagger/dagger-for-github@v7
