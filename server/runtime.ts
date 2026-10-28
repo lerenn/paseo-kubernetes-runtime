@@ -5,6 +5,7 @@ import { DockerSandboxes, type DockerStatus } from "./docker-sandbox.js";
 import { OomLedger, oomResumePrompt, parsePeak } from "./oom.js";
 import { checkpointPrompt, classifyStop, ResumeGuard, resumePrompt } from "./interruption.js";
 import { parseRuntimeOptions, type RuntimeOptions } from "../shared/runtime-options.js";
+import { gitMirrorStats, mirrorGate } from "./mirror-gate.js";
 import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, serveFetchChunk, type FetchTarget } from "./mirrors.js";
 import { applyPush, loopbackPorts, startBridge, type RunningBridge } from "./bridge.js";
 import type { KubernetesRuntimeConfig } from "./config.js";
@@ -468,10 +469,12 @@ export class KubernetesRuntime {
     this.log(`[kubernetes-runtime] bridge probes last minute: ${s.probes} (down ${s.down}, errors ${s.errors}), latency avg ${s.probes ? Math.round(s.totalMs / s.probes) : 0} ms max ${s.maxMs} ms, restores ${s.restores}, kube execs at once ${peak}/${BRIDGE_EXEC_LIMIT}`);
   }
 
-  /** One line a minute: how many kubectl processes the plugin started and how many reads the pod snapshot answered. Silent when nothing ran. */
+  /** One line a minute (and one for the git mirror work): how many kubectl processes the plugin started and how many reads the pod snapshot answered. Silent when nothing ran. */
   logKubeStats(): void {
     const line = kubeCallStats.take();
     if (line) this.log(line);
+    const mirrors = gitMirrorStats.take();
+    if (mirrors) this.log(mirrors);
   }
 
   /** Liveness: a running workspace gets its bridge restored when the channel is gone, or when it looks open but the bridge in the pod does not answer (probed at most once a minute). */
@@ -708,7 +711,8 @@ export class KubernetesRuntime {
       {
         handle: async (request) => {
           if (request.op === "fetch-chunk") return serveFetchChunk(request);
-          if (request.op === "push" && !request.mirror) return applyPush(this.git, ws.options.cwd, request);
+          // a push moves the remote's refs: listings read before it must not answer a fetch after it
+          if (request.op === "push" && !request.mirror) return applyPush(this.git, ws.options.cwd, request).finally(() => mirrorGate.invalidate());
           // a repository a pod asked for by name is checked against the "Other repositories" setting
           const mirror = request.mirror;
           let targets = ws.targets;
@@ -719,7 +723,7 @@ export class KubernetesRuntime {
           }
           return request.op === "fetch"
             ? applyFetch(this.git, ws.options.cwd, request, targets)
-            : pushToMirror(this.git, ws.options.cwd, request, targets);
+            : pushToMirror(this.git, ws.options.cwd, request, targets).finally(() => mirrorGate.invalidate());
         },
       },
       {

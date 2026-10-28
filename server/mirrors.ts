@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyPush, type BridgeReply, type PushRequest } from "./bridge.js";
 import { type GitRunner, scrub } from "./git.js";
+import { type MirrorGate, type RemoteListing, mirrorGate } from "./mirror-gate.js";
 import { toHttpsRemote } from "./workspace.js";
 
 /**
@@ -245,6 +246,18 @@ export async function cacheDir(git: GitRunner, cwd: string, target: FetchTarget)
   return dir;
 }
 
+/** Whether the mirror's branches and tags are exactly what the remote listed, so a fetch would change nothing. */
+async function mirrorMatches(git: GitRunner, dir: string, listing: RemoteListing): Promise<boolean> {
+  const local = await git(["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags"], { cwd: dir });
+  if (local.code !== 0) return false;
+  const lines = local.stdout.split("\n").filter(Boolean);
+  if (lines.length !== listing.refs.size) return false;
+  return lines.every((l) => {
+    const [sha, ref] = l.split(" ");
+    return listing.refs.get(ref!) === sha;
+  });
+}
+
 /**
  * Refreshes the target in the daemon's cache from the real remote (daemon credentials), then answers the pod
  * with every branch and tag plus a thin pack of what the pod does not have yet.
@@ -254,33 +267,50 @@ export async function applyFetch(
   cwd: string,
   request: FetchRequest,
   targets: readonly FetchTarget[],
+  gate: MirrorGate = mirrorGate,
 ): Promise<FetchReply> {
   const target = targets.find((t) => t.id === request.mirror);
   if (!target) return { ok: false, message: "kube-agents: this remote is not part of the project (only its origin and submodules can be fetched from a pod)" };
   if (!Array.isArray(request.haves) || !request.haves.every((h) => SHA.test(h))) return { ok: false, message: "kube-agents: malformed fetch request" };
-  const dir = await cacheDir(git, cwd, target);
+  // pods asking at once must not all try to create the same bare repository
+  const dir = await gate.serialized(`dir:${target.id}`, () => cacheDir(git, cwd, target));
 
   const candidates = [workingUrls.get(target.id), target.daemonUrl, ...(target.fallbackUrls ?? [])].filter((u, i, all): u is string => !!u && all.indexOf(u) === i);
-  let url = candidates[0]!;
-  let fetched = { code: 1, stdout: "", stderr: "" };
-  const failures: string[] = [];
-  for (const candidate of candidates) {
-    fetched = await git(
-      ["fetch", "--prune", "--force", "--no-tags", candidate, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"],
-      { cwd: dir },
-    );
-    if (fetched.code === 0) {
-      url = candidate;
-      workingUrls.set(target.id, candidate);
-      break;
+  gate.stats.fetches += 1;
+  // what the remote has now (shared with the other pods asking within a few seconds); a mirror that already has it is not fetched
+  const listing = await gate.list(target.id, candidates, git, dir);
+  const refreshed = await gate.serialized(target.id, async (): Promise<FetchReply | undefined> => {
+    if (listing && (await mirrorMatches(git, dir, listing))) {
+      gate.stats.skipped += 1;
+      return undefined;
     }
-    failures.push(`${scrub(candidate)}: ${scrub(fetched.stderr.trim())}`);
-  }
-  if (fetched.code !== 0) {
-    return { ok: false, message: `kube-agents: fetch failed on the daemon:\n${failures.join("\n")}` };
-  }
-  const symref = await git(["ls-remote", "--symref", url, "HEAD"], { cwd: dir });
-  const head = /^ref: (refs\/heads\/\S+)\s+HEAD/m.exec(symref.stdout)?.[1];
+    try {
+      return await gate.withSlot(async () => {
+        // a refresh that ran while this one waited may have brought the mirror up to date
+        if (listing && (await mirrorMatches(git, dir, listing))) {
+          gate.stats.skipped += 1;
+          return undefined;
+        }
+        let fetched = { code: 1, stdout: "", stderr: "" };
+        const failures: string[] = [];
+        for (const candidate of candidates) {
+          fetched = await gate.timed(() =>
+            git(["fetch", "--prune", "--force", "--no-tags", candidate, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], { cwd: dir }),
+          );
+          if (fetched.code === 0) {
+            workingUrls.set(target.id, candidate);
+            return undefined;
+          }
+          failures.push(`${scrub(candidate)}: ${scrub(fetched.stderr.trim())}`);
+        }
+        return { ok: false, message: `kube-agents: fetch failed on the daemon:\n${failures.join("\n")}` };
+      });
+    } catch (error) {
+      return { ok: false, message: `kube-agents: ${scrub((error as Error).message)}` };
+    }
+  });
+  if (refreshed) return refreshed;
+  const head = listing?.head;
   const listed = await git(["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags"], { cwd: dir });
   if (listed.code !== 0) return { ok: false, message: `kube-agents: ${scrub(listed.stderr.trim())}` };
   const refs: [string, string][] = listed.stdout

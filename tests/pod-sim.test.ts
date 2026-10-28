@@ -5,12 +5,18 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFil
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { ConfigSchema } from "../shared/settings.js";
 import { KubernetesRuntime } from "../server/runtime.js";
 import { runGit } from "../server/git.js";
+import { mirrorGate } from "../server/mirror-gate.js";
 import { PROBE_SCRIPT, parseProbe } from "../server/autoarchive.js";
 import { LocalPodKube } from "./local-pod.js";
+
+// these tests commit to the remote behind the bridge's back and pull at once: no shared remote listings
+beforeAll(() => {
+  mirrorGate.ttlMs = 0;
+});
 
 const ID = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
 const sh = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, env: { ...process.env, ...ID }, encoding: "utf8" }).trim();
