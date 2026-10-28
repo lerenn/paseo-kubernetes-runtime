@@ -809,6 +809,7 @@ export class KubernetesRuntime {
         sleep: this.deps.sleep,
         now: this.deps.now,
         onProblem: (problem) => ctx.notice(problem, "warning"),
+        sandbox: async () => (await kube.listSandboxes(`${WORKSPACE_ID_LABEL}=${ws.id}`)).find((s) => s.name === pod),
       });
       await installAssets(kube, pod);
       if (ops && !ws.commands.has(OPS_SHIM)) {
