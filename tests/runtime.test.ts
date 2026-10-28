@@ -140,6 +140,27 @@ describe("prepare: the pod is created when the first process is about to start",
     missing = false;
   });
 
+  it("logs Codex in with the pod's OPENAI_API_KEY once per pod, never for other providers, and a failure is logged, not fatal", async () => {
+    const logs: string[] = [];
+    const t = setup({}, { log: (m: string) => void logs.push(m) });
+    const logins = () => t.kube.execs.filter((e) => e.argv[2]?.includes("codex login --with-api-key"));
+    await t.prepare();
+    expect(logins()).toHaveLength(0); // claude
+    await t.prepare({ argv: ["codex", "app-server"], env: { PASEO_AGENT_ID: "a2", CODEX_HOME: "/workspace/.home/.codex" } });
+    expect(logins()).toHaveLength(1);
+    expect(logins()[0]!.argv[2]).toContain("printenv OPENAI_API_KEY | codex login --with-api-key"); // the key is piped, never an argument
+    expect(logins()[0]!.argv[4]).toBe("/workspace/.home/.codex");
+    await t.prepare({ argv: ["codex", "app-server"], env: { PASEO_AGENT_ID: "a3" } });
+    expect(logins()).toHaveLength(1); // same pod: done once
+
+    const exec = t.kube.exec.bind(t.kube);
+    const f = setup({}, { log: (m: string) => void logs.push(m) });
+    f.kube.exec = async (pod: string, argv: string[]) => (argv[2]?.includes("codex login") ? { code: 1, stdout: "", stderr: "sk-secret" } : exec(pod, argv));
+    await f.prepare({ argv: ["codex", "app-server"] });
+    expect(logs.some((m) => m.includes("codex login --with-api-key failed (exit 1)"))).toBe(true);
+    expect(logs.join("\n")).not.toContain("sk-secret");
+  });
+
   it("explains a pod that cannot be scheduled, leaves the sandbox suspended and retries on the next prepare", async () => {
     const t = setup();
     t.kube.pods = [{ uid: "u", ready: false, terminating: false, problem: "Pod cannot be scheduled: no capacity" }];

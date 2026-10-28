@@ -11,7 +11,7 @@ import type { KubernetesRuntimeConfig } from "./config.js";
 import { type GitRunner, runGit, scrub } from "./git.js";
 import type { Kube, PodInfo, PodProcess, SandboxInfo } from "./kube.js";
 import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
-import { ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, clearSubmoduleFailure, recordSubmoduleFailure, submoduleWait, seedDirectory, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
+import { ensureCodexLogin, ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, clearSubmoduleFailure, recordSubmoduleFailure, submoduleWait, seedDirectory, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
 import { paseoWorkspaceBusy } from "./orphans.js";
 import {
@@ -219,6 +219,7 @@ const TURN_ANNOTATION_DEBOUNCE_MS = 30_000;
 
 /** Stands in `commands` for the Scoped Daemon Access shim having been installed in the current pod. */
 const OPS_SHIM = "paseo (scoped daemon access)";
+const CODEX_LOGIN = "codex (logged in with OPENAI_API_KEY)";
 
 /** The single indicator of a pod row in the sidebar. */
 const HOST_ICON = "ship-wheel";
@@ -706,7 +707,7 @@ export class KubernetesRuntime {
     this.lastDemand = this.now();
     if (config.warmPool.enabled && config.warmPool.idleMinutes > 0) void this.maintainPool().catch(() => undefined); // somebody needs a pod: bring the pool back if it had idled out
     // Fast path: the same pod is up and everything this launch needs is already in place.
-    if (ws.sandbox && ws.phase === "running" && ws.readyUid && !grows && (!need.command || ws.commands.has(need.command)) && (!ops || ws.commands.has(OPS_SHIM))) {
+    if (ws.sandbox && ws.phase === "running" && ws.readyUid && !grows && (!need.command || ws.commands.has(need.command)) && (need.command !== "codex" || ws.commands.has(CODEX_LOGIN)) && (!ops || ws.commands.has(OPS_SHIM))) {
       const info = await kube.podInfo(ws.sandbox).catch(() => null);
       if (info?.ready && !info.terminating && info.uid === ws.readyUid) {
         await this.syncLabels(kube, ws, "running"); // another agent may have started in this workspace
@@ -781,6 +782,11 @@ export class KubernetesRuntime {
         ctx.notice(`Checking ${need.command} in the pod...`);
         await ensureCommand(kube, pod, need.command);
         ws.commands.add(need.command);
+      }
+      if (need.command === "codex" && !ws.commands.has(CODEX_LOGIN)) {
+        const login = await ensureCodexLogin(kube, pod, need.env?.CODEX_HOME);
+        if (login.ok) ws.commands.add(CODEX_LOGIN);
+        else this.log(`[kubernetes-runtime] ${login.message} in ${pod}; Codex may answer 401`);
       }
       ws.readyUid = info.uid;
       this.setPhase(ws, "running");

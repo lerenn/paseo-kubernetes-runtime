@@ -154,6 +154,23 @@ export async function ensureCommand(kube: Kube, pod: string, command: string): P
   if (installed.code !== 0) throw new Error(`could not install ${pkg} in the pod: ${installed.stderr.trim() || "npm failed"}`);
 }
 
+const CODEX_LOGIN_SCRIPT = `[ -n "$OPENAI_API_KEY" ] || exit 0
+export PATH="$HOME/bin:$HOME/.npm-global/bin:$PATH"
+[ -z "$1" ] || { export CODEX_HOME="$1"; mkdir -p "$1"; } # Codex refuses a CODEX_HOME that does not exist
+printenv OPENAI_API_KEY | codex login --with-api-key >/dev/null 2>&1
+`;
+
+/**
+ * Codex does not turn OPENAI_API_KEY in its environment into a bearer header (it answers 401 "Missing bearer"), so a pod that
+ * carries the key (a profile's `extraSecrets`) logs Codex in with it: `codex login --with-api-key` writes auth.json in
+ * CODEX_HOME. The key travels from the container env to Codex's stdin inside the pod and is never printed. Safe to repeat;
+ * a pod without the key is left alone. Best effort: a failure is returned, not thrown, so other agents are unaffected.
+ */
+export async function ensureCodexLogin(kube: Kube, pod: string, codexHome?: string): Promise<{ ok: boolean; message: string }> {
+  const r = await kube.exec(pod, ["sh", "-c", CODEX_LOGIN_SCRIPT, "sh", codexHome ?? ""]).catch((e: Error) => ({ code: 1, stdout: "", stderr: e.message }));
+  return r.code === 0 ? { ok: true, message: "" } : { ok: false, message: `codex login --with-api-key failed (exit ${r.code})` };
+}
+
 const JQ_VERSION = "1.7.1";
 /** SHA-256 of the jq release binaries, so the download is verified. */
 const JQ_SHA256 = {
