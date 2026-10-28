@@ -432,6 +432,50 @@ describe("idle suspension exemptions", () => {
   });
 });
 
+describe("the pod control of other plugins (podControl)", () => {
+  async function ready(rules: object = {}, extra: object = {}) {
+    const t = setup({ podIdleMinutes: 30, ...rules }, { workspaceBusy: async () => false, ...extra });
+    await t.prepare();
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json", stderr: "" };
+    return t;
+  }
+
+  it("suspends and resumes a quiet pod, reporting both to Paseo", async () => {
+    const t = await ready();
+    expect(await t.runtime.podControl("wks_1", "suspend")).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+    expect(t.notices.map((n) => n[0])).toContain("The pod is suspended.");
+    expect(await t.runtime.podControl("wks_1", "resume")).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("running");
+  });
+
+  it("refuses a pod with a running agent unless forced", async () => {
+    let busy: boolean | null = true;
+    const t = await ready({}, { workspaceBusy: async () => busy });
+    expect(await t.runtime.podControl("wks_1", "suspend")).toMatchObject({ ok: false, busy: expect.stringContaining("agent is running") });
+    busy = null;
+    expect(await t.runtime.podControl("wks_1", "suspend")).toMatchObject({ ok: false, busy: expect.stringContaining("could not say") });
+    expect(t.registry.list()[0]!.state).toBe("running");
+    expect(await t.runtime.podControl("wks_1", "suspend", { force: true })).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+
+  it("leaves an idle-exempt workspace alone unless forced", async () => {
+    const t = await ready({ idleExemptLabels: ["paseo.keepalive=1"] }, { workspaceLabels: async () => [{ "paseo.keepalive": "1" }] });
+    expect(await t.runtime.podControl("wks_1", "suspend")).toMatchObject({ ok: false, busy: expect.stringContaining("idleExemptLabels") });
+    expect(t.registry.list()[0]!.state).toBe("running");
+    expect(await t.runtime.podControl("wks_1", "suspend", { force: true })).toEqual({ ok: true });
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+
+  it("suspends a workspace whose labels match no rule, and says so for an unknown workspace or action", async () => {
+    const t = await ready({ idleExemptLabels: ["paseo.keepalive=1"] }, { workspaceLabels: async () => [{ role: "worker" }] });
+    expect(await t.runtime.podControl("wks_1", "suspend")).toEqual({ ok: true });
+    expect(await t.runtime.podControl("nope", "suspend")).toMatchObject({ ok: false, message: expect.stringContaining("no pod") });
+    expect(await t.runtime.podControl("wks_1", "delete" as never)).toMatchObject({ ok: false });
+  });
+});
+
 describe("idle-exempt labels after a plugin reload", () => {
   const rules = { podIdleMinutes: 30, idleExemptLabels: ["paseo.keep=1", "paseo.mail-alias"] };
 

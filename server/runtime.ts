@@ -1980,6 +1980,23 @@ export class KubernetesRuntime {
     return { ok: true };
   }
 
+  /**
+   * What other plugins may do to a pod (see pod-control.ts): suspend and resume only. Like the idle suspend, a suspend
+   * leaves a workspace with an `idleExemptLabels` label alone unless `force`; a running agent is refused by `podAction`.
+   */
+  async podControl(workspaceId: string, action: "suspend" | "resume", options: { force?: boolean } = {}): Promise<{ ok: boolean; busy?: string; message?: string }> {
+    if (action !== "suspend" && action !== "resume") return { ok: false, message: `unsupported action: ${String(action)}` };
+    if (action === "suspend" && !options.force) {
+      if (!this.states.has(workspaceId)) await this.adopt().catch(() => undefined);
+      const ws = this.states.get(workspaceId);
+      const config = await this.deps.getConfig();
+      if (ws?.sandbox && ws.phase === "running" && config.idleExemptLabels.length && (await this.exemptFromIdle(config, ws))) {
+        return { ok: false, busy: "the workspace carries an idleExemptLabels label" };
+      }
+    }
+    return this.podAction(workspaceId, action, { force: options.force });
+  }
+
   private async destroyWorkspace(ws: WorkspaceState): Promise<void> {
     this.firstAgentLabels.delete(ws.id);
     await this.serial(ws, async () => {
