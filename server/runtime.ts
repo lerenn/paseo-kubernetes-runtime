@@ -228,6 +228,9 @@ interface WorkspaceState {
   probe?: ProbeResult;
   /** Everything that changes the pod (create, resume, suspend, destroy, prepare) runs one at a time. */
   chain: Promise<unknown>;
+  /** When and how often Paseo was told this workspace is suspended since it last ran (see `reconcileSuspensions`). */
+  suspendReportedAt?: number;
+  suspendReports?: number;
 }
 
 /** How long after the last turn ended the turn annotations come off (turns follow one another closely). */
@@ -243,6 +246,14 @@ const HOST_ICON = "ship-wheel";
 export const BRIDGE_EXEC_LIMIT = 4;
 const BRIDGE_PROBE_JITTER_MS = 1_500;
 const DESCRIBE_TTL_MS = 2_000;
+/**
+ * Paseo keeps an agent's suspended mark in memory and sets it only from the plugin's one-shot report, so a daemon or plugin
+ * restart (or an agent not loaded yet) loses it. A suspended pod is therefore reported again: soon after the plugin starts
+ * (the agents may load after it), then now and then. Each report adds a note to the agent's timeline, hence the spacing.
+ */
+const SUSPEND_REPORT_SOON_MS = 2 * 60_000;
+const SUSPEND_REPORT_EVERY_MS = 30 * 60_000;
+const SUSPEND_REPORT_SOON_COUNT = 2;
 
 /** ` [container x ended: OOMKilled, exit code 137, at ...]` from the pod's last terminated container state; empty when it reports none. */
 export function describeLastTerminated(info: PodInfo | null): string {
@@ -320,6 +331,8 @@ export class KubernetesRuntime {
 
   /** Tells Paseo a stop is planned, before the process stops, so the exit is not shown as an error. Never throws. */
   private reportSuspended(ws: WorkspaceState, reason: WorkspaceRuntimeSuspendReason, message: string): void {
+    ws.suspendReportedAt = this.now();
+    ws.suspendReports = (ws.suspendReports ?? 0) + 1;
     try {
       this.handle?.reportSuspended({ workspaceId: ws.id, reason, message });
     } catch (error) {
@@ -328,6 +341,8 @@ export class KubernetesRuntime {
   }
 
   private reportResumed(ws: WorkspaceState): void {
+    ws.suspendReportedAt = undefined;
+    ws.suspendReports = undefined;
     try {
       this.handle?.reportResumed({ workspaceId: ws.id });
     } catch {
@@ -362,11 +377,13 @@ export class KubernetesRuntime {
       return () => clearInterval(timer);
     }))(() => {
       void this.checkAutoArchive().catch((e: Error) => this.log(`[kubernetes-runtime] auto-archive check failed: ${e.message}`));
+      void this.reconcileSuspensions().catch((e: Error) => this.log(`[kubernetes-runtime] could not re-check suspended pods: ${e.message}`));
       this.checkBridges();
       this.logProbeStats();
       this.logKubeStats();
     }, 60_000);
     await this.adopt().catch(() => undefined);
+    void this.reconcileSuspensions().catch(() => undefined);
     void this.maintainPool().catch(() => undefined);
   }
 
@@ -406,6 +423,25 @@ export class KubernetesRuntime {
       // A pod that runs when the plugin starts had its bridge (and with it the loopback tunnels its agents' MCP
       // servers use) die with the previous plugin process: bring it back without waiting for the next launch.
       if (sandbox.operatingMode !== "Suspended") void this.reviveBridge(kube, ws, "the plugin started", true);
+    }
+  }
+
+  /**
+   * Makes Paseo's suspended mark follow the cluster: every workspace whose Sandbox is really suspended is reported as
+   * such when the plugin has not yet (after a start or reload), shortly after that once more, then every half hour.
+   * Run from the plugin's one-minute tick, and once after `adopt`.
+   */
+  async reconcileSuspensions(): Promise<void> {
+    if (!this.deps.daemonId || !this.handle) return;
+    const kube = this.deps.kubeFor(await this.deps.getConfig());
+    const sandboxes = await kube.listSandboxes(`${DAEMON_LABEL}=${this.deps.daemonId}`);
+    const t = this.now();
+    for (const sandbox of sandboxes) {
+      if (sandbox.operatingMode !== "Suspended") continue;
+      const ws = [...this.states.values()].find((w) => w.sandbox === sandbox.name);
+      if (!ws || ws.phase !== "suspended") continue;
+      const due = ws.suspendReportedAt === undefined || t - ws.suspendReportedAt >= ((ws.suspendReports ?? 0) < SUSPEND_REPORT_SOON_COUNT ? SUSPEND_REPORT_SOON_MS : SUSPEND_REPORT_EVERY_MS);
+      if (due) this.reportSuspended(ws, "idle", "Pod suspended to save resources; it wakes on the next message.");
     }
   }
 
@@ -977,6 +1013,7 @@ export class KubernetesRuntime {
       ws.bridge = undefined;
       ws.commands.clear();
       this.setPhase(ws, "suspended");
+      this.reportSuspended(ws, "idle", "The pod could not start and is suspended; it is tried again on the next message.");
       const message = (error as Error).message;
       ctx.notice(`Could not start the pod: ${message}`, "error");
       throw new Error(`kube: could not start the pod: ${message}`);
