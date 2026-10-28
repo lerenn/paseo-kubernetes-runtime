@@ -1,7 +1,5 @@
 name: image
 # Builds the default pod image and publishes it to ghcr. Pin the digest it prints in the plugin's Image setting.
-# On main it also copies each image, by digest and with the same sha-<commit> tag, to the lab ECR when the
-# repository variable LAB_ECR_PUSH_ROLE_ARN is set (docs/ecr-push.md).
 on:
   push:
     branches: [main]
@@ -10,12 +8,9 @@ on:
 permissions:
   contents: read
   packages: write
-  id-token: write
 env:
   IMAGE: ghcr.io/lerenn/paseo-kubernetes-runtime-default
   GO_IMAGE: ghcr.io/lerenn/paseo-kubernetes-runtime-go
-  ECR_REGISTRY: 824843843469.dkr.ecr.eu-west-3.amazonaws.com
-  ECR_REGION: eu-west-3
 jobs:
   image:
     runs-on: ubuntu-latest
@@ -50,22 +45,6 @@ jobs:
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
       - name: Digest
         run: echo "${{ env.IMAGE }}@${{ steps.push.outputs.digest }}" | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: AWS credentials (lab ECR)
-        if: github.ref == 'refs/heads/main' && vars.LAB_ECR_PUSH_ROLE_ARN != ''
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.LAB_ECR_PUSH_ROLE_ARN }}
-          aws-region: ${{ env.ECR_REGION }}
-      - name: Log in to the lab ECR
-        if: github.ref == 'refs/heads/main' && vars.LAB_ECR_PUSH_ROLE_ARN != ''
-        uses: aws-actions/amazon-ecr-login@v2
-      - name: Copy to the lab ECR
-        if: github.ref == 'refs/heads/main' && vars.LAB_ECR_PUSH_ROLE_ARN != ''
-        run: |
-          docker buildx imagetools create \
-            --tag "${{ env.ECR_REGISTRY }}/lab/paseo-agent-default:sha-${{ github.sha }}" \
-            "${{ env.IMAGE }}@${{ steps.push.outputs.digest }}"
-          echo "${{ env.ECR_REGISTRY }}/lab/paseo-agent-default:sha-${{ github.sha }} (from ${{ steps.push.outputs.digest }})" | tee -a "$GITHUB_STEP_SUMMARY"
   image-go:
     # The default image plus Go 1.25 (profile prbr-picky). Built from the default image just published.
     needs: image
@@ -102,19 +81,3 @@ jobs:
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
       - name: Digest
         run: echo "${{ env.GO_IMAGE }}@${{ steps.push.outputs.digest }}" | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: AWS credentials (lab ECR)
-        if: github.ref == 'refs/heads/main' && vars.LAB_ECR_PUSH_ROLE_ARN != ''
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.LAB_ECR_PUSH_ROLE_ARN }}
-          aws-region: ${{ env.ECR_REGION }}
-      - name: Log in to the lab ECR
-        if: github.ref == 'refs/heads/main' && vars.LAB_ECR_PUSH_ROLE_ARN != ''
-        uses: aws-actions/amazon-ecr-login@v2
-      - name: Copy to the lab ECR
-        if: github.ref == 'refs/heads/main' && vars.LAB_ECR_PUSH_ROLE_ARN != ''
-        run: |
-          docker buildx imagetools create \
-            --tag "${{ env.ECR_REGISTRY }}/lab/paseo-agent-go:sha-${{ github.sha }}" \
-            "${{ env.GO_IMAGE }}@${{ steps.push.outputs.digest }}"
-          echo "${{ env.ECR_REGISTRY }}/lab/paseo-agent-go:sha-${{ github.sha }} (from ${{ steps.push.outputs.digest }})" | tee -a "$GITHUB_STEP_SUMMARY"
