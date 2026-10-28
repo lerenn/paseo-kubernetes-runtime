@@ -56,6 +56,13 @@ describe("waitPodReady with a full quota", () => {
     expect(notices).toEqual([expect.stringContaining("Queued: namespace quota 'agents' is full")]);
   });
 
+  it("tells onQuota about the block on every poll while it holds", async () => {
+    const { kube, options } = harness((n) => (n < 2 ? null : pod(true)), blocked());
+    const seen: string[] = [];
+    await waitPodReady(kube, "pka-x", { ...options, onQuota: (b) => seen.push(b.requested) });
+    expect(seen).toEqual(["8Gi", "8Gi"]);
+  });
+
   it("fails naming the quota instead of 'it does not exist'", async () => {
     const { kube, options } = harness(() => null, blocked());
     await expect(waitPodReady(kube, "pka-x", options)).rejects.toThrow(

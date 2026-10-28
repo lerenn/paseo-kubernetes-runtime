@@ -14,7 +14,7 @@ import { migrateLegacyData } from "./server/migrate.js";
 import { OrphanReaper } from "./server/orphans.js";
 import { podOnlyAgent, podOnlyWorkspace } from "./server/pod-only.js";
 import { LABELS_REF_ENV, LabelHandoff, withAgentLabels } from "./server/label-handoff.js";
-import { labelsOfAgent, labelsOfWorkspace, sendUnlessBusy, workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
+import { labelsOfAgent, labelsOfWorkspace, sendUnlessBusy, workspaceAgentsBusy, workspaceAgentsFinished, type AgentListApi } from "./server/agent-activity.js";
 import { PodRegistry } from "./server/registry.js";
 import { KubernetesRuntime } from "./server/runtime.js";
 import { RUNTIME_ID } from "./shared/runtime-options.js";
@@ -45,7 +45,7 @@ export default function contribute(server: PluginServerContext) {
   const capture = (ctx: { paseo?: unknown } | undefined) => {
     if (ctx?.paseo && !paseoApi) paseoApi = ctx.paseo as AgentListApi;
   };
-  const runtime = new KubernetesRuntime({ getConfig, kubeFor, daemonId, registry, agentsBusy: (workspaceId) => workspaceAgentsBusy(paseoApi, workspaceId),
+  const runtime = new KubernetesRuntime({ getConfig, kubeFor, daemonId, registry, agentsBusy: (workspaceId) => workspaceAgentsBusy(paseoApi, workspaceId), agentsFinished: (workspaceId) => workspaceAgentsFinished(paseoApi, workspaceId),
     recoveryStateFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "interruptions.json"),
     autoArchiveLogFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "auto-archive.json"),
     workspaceLabels: (workspaceId) => labelsOfWorkspace(paseoApi, workspaceId),
