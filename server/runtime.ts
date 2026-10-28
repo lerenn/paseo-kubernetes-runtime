@@ -9,6 +9,7 @@ import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, serveFetchChun
 import { applyPush, loopbackPorts, startBridge, type RunningBridge } from "./bridge.js";
 import type { KubernetesRuntimeConfig } from "./config.js";
 import { type GitRunner, runGit, scrub } from "./git.js";
+import { Semaphore } from "./coalesce.js";
 import type { Kube, PodInfo, PodProcess, SandboxInfo } from "./kube.js";
 import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
 import { ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, clearSubmoduleFailure, recordSubmoduleFailure, submoduleWait, seedDirectory, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
@@ -107,6 +108,8 @@ export interface RuntimeDeps {
   /** Calls `fn` every `ms` until the returned stop function runs (injected for tests). */
   ticker?: (fn: () => void, ms: number) => () => void;
   sleep?: (ms: number) => Promise<void>;
+  /** Random number in [0, 1) for the probe jitter (injected for tests). */
+  jitter?: () => number;
   /** Whether Paseo has an agent running a turn in this workspace directory; null when it cannot tell (injected for tests). */
   workspaceBusy?: (cwd: string) => Promise<boolean | null>;
   /** Sends a prompt to an agent (the Paseo API); `skip` never steers a turn that is already running. Absent: no recovery prompts. */
@@ -222,6 +225,18 @@ const OPS_SHIM = "paseo (scoped daemon access)";
 
 /** The single indicator of a pod row in the sidebar. */
 const HOST_ICON = "ship-wheel";
+/** Kube execs of the bridge liveness probes and restores that run at once. */
+export const BRIDGE_EXEC_LIMIT = 4;
+const BRIDGE_PROBE_JITTER_MS = 1_500;
+const DESCRIBE_TTL_MS = 2_000;
+
+/** ` [container x ended: OOMKilled, exit code 137, at ...]` from the pod's last terminated container state; empty when it reports none. */
+export function describeLastTerminated(info: PodInfo | null): string {
+  const t = info?.lastTerminated;
+  if (!t) return "";
+  const parts = [t.reason ?? "no reason", ...(t.exitCode !== undefined ? [`exit code ${t.exitCode}`] : []), ...(t.signal ? [`signal ${t.signal}`] : []), ...(t.finishedAt ? [`at ${t.finishedAt}`] : [])];
+  return ` [container ${t.container} last terminated: ${parts.join(", ")}]`;
+}
 
 export const RUNTIME_LABEL = "Kubernetes Runtime";
 
@@ -248,6 +263,11 @@ export class KubernetesRuntime {
   private legacyProbing = false;
   private archiveSummary: Pick<AutoArchiveStatus, "scheduled" | "blocked"> & { kept: Map<string, string> } = { scheduled: [], blocked: [], kept: new Map() };
   private readonly oom: OomLedger;
+  /** Kube execs of the bridge liveness probes and restores: a few at a time, so a busy cluster is not hit by every workspace at once. */
+  private readonly bridgeExecs = new Semaphore(BRIDGE_EXEC_LIMIT);
+  private probeStats = { probes: 0, down: 0, errors: 0, totalMs: 0, maxMs: 0, restores: 0 };
+  /** What `describeWorkspace` answered, by workspace, for a couple of seconds: apps ask for it often. */
+  private readonly describeCache = new Map<string, { at: number; value: WorkspaceRuntimeDisplay | null }>();
   private readonly docker: DockerSandboxes;
   private stopInterruptTicker: () => void = () => undefined;
 
@@ -305,6 +325,7 @@ export class KubernetesRuntime {
     }))(() => {
       void this.checkAutoArchive().catch((e: Error) => this.log(`[kubernetes-runtime] auto-archive check failed: ${e.message}`));
       this.checkBridges();
+      this.logProbeStats();
     }, 60_000);
     await this.adopt().catch(() => undefined);
     void this.maintainPool().catch(() => undefined);
@@ -395,7 +416,8 @@ export class KubernetesRuntime {
         if (attempt > 0 || !immediate) await sleep(Math.min(60_000, 2_000 * 2 ** attempt));
         if (this.stopped || ws.bridge || ws.phase !== "running") return;
         try {
-          if (await this.restoreBridge(kube, ws)) {
+          this.probeStats.restores += 1;
+          if (await this.bridgeExecs.run(() => this.restoreBridge(kube, ws))) {
             this.log(`[kubernetes-runtime] bridge ${ws.id} (${ws.sandbox}) restored after ${reason}, attempt ${attempt + 1}`);
             if (ws.bridgeDown) ws.notice?.("The pod's bridge is back.");
             ws.bridgeDown = false;
@@ -417,10 +439,30 @@ export class KubernetesRuntime {
   /** Whether `bridge.mjs serve` answers on its socket in the pod; null when the probe itself could not run (an exec error says nothing about the bridge). */
   private async probeBridge(kube: Kube, pod: string): Promise<boolean | null> {
     const script = 'const s=require("net").connect(process.env.HOME+"/bridge.sock");const t=setTimeout(()=>process.exit(8),2000);s.on("connect",()=>{clearTimeout(t);s.end();process.exit(0)});s.on("error",()=>process.exit(7))';
-    const r = await kube.exec(pod, ["node", "-e", script]).catch(() => null);
-    if (!r) return null;
-    if (r.code === 0) return true;
-    return r.code === 7 || r.code === 8 ? false : null;
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    await sleep((this.deps.jitter ?? Math.random)() * BRIDGE_PROBE_JITTER_MS); // spread the workspaces of one tick
+    return this.bridgeExecs.run(async () => {
+      const started = this.now();
+      const r = await kube.exec(pod, ["node", "-e", script]).catch(() => null);
+      const ms = Math.max(0, this.now() - started);
+      const alive = !r ? null : r.code === 0 ? true : r.code === 7 || r.code === 8 ? false : null;
+      const stats = this.probeStats;
+      stats.probes += 1;
+      stats.totalMs += ms;
+      stats.maxMs = Math.max(stats.maxMs, ms);
+      if (alive === false) stats.down += 1;
+      if (alive === null) stats.errors += 1;
+      return alive;
+    });
+  }
+
+  /** One line a minute: how many liveness probes ran, how long they took, how many execs ran at once. Silent when nothing ran. */
+  logProbeStats(): void {
+    const s = this.probeStats;
+    this.probeStats = { probes: 0, down: 0, errors: 0, totalMs: 0, maxMs: 0, restores: 0 };
+    const peak = this.bridgeExecs.takePeak();
+    if (!s.probes && !s.restores) return;
+    this.log(`[kubernetes-runtime] bridge probes last minute: ${s.probes} (down ${s.down}, errors ${s.errors}), latency avg ${s.probes ? Math.round(s.totalMs / s.probes) : 0} ms max ${s.maxMs} ms, restores ${s.restores}, kube execs at once ${peak}/${BRIDGE_EXEC_LIMIT}`);
   }
 
   /** Liveness: a running workspace gets its bridge restored when the channel is gone, or when it looks open but the bridge in the pod does not answer (probed at most once a minute). */
@@ -494,6 +536,7 @@ export class KubernetesRuntime {
   private setPhase(ws: WorkspaceState, phase: PodState): void {
     const before = ws.phase;
     ws.phase = phase;
+    this.describeCache.delete(ws.id);
     // Paseo asks `describeWorkspace` again after a notice for the workspace: this keeps the badge's state current
     if (before !== "none" && before !== phase && (phase === "running" || phase === "suspended")) this.stateChanged(ws, `The pod is ${phase}.`);
     if (ws.sandbox) this.deps.registry?.set(ws.id, ws.sandbox, phase, this.now());
@@ -1470,8 +1513,19 @@ export class KubernetesRuntime {
     };
   }
 
+  /** `describeWorkspace` for a couple of seconds per workspace: the apps ask for it on every screen, and a busy plugin process queues each ask. */
+  describeCached(request: WorkspaceRuntimeWorkspaceRequest): WorkspaceRuntimeDisplay | null {
+    const t = this.now();
+    const hit = this.describeCache.get(request.workspaceId);
+    if (hit && t - hit.at < DESCRIBE_TTL_MS) return hit.value;
+    const value = this.describeWorkspace(request);
+    this.describeCache.set(request.workspaceId, { at: t, value });
+    return value;
+  }
+
   /** Tells Paseo to ask `describeWorkspace` again: the pod changed state. */
   private stateChanged(ws: WorkspaceState, message: string): void {
+    this.describeCache.delete(ws.id);
     ws.notice?.(message);
   }
 
@@ -1591,7 +1645,7 @@ export class KubernetesRuntime {
         this.workspace(request); // validates the options; nothing exists in the cluster until a process is about to start
       },
       inspect: (request) => this.inspect(request),
-      describeWorkspace: (request) => this.describeWorkspace(request),
+      describeWorkspace: (request) => this.describeCached(request),
       mapCwd: async (request) => {
         const ws = this.workspace(request);
         return (await this.layoutFor(ws)) === "mapped" ? MAPPED_CHECKOUT : ws.options.cwd;
@@ -1849,7 +1903,7 @@ export class KubernetesRuntime {
         const stop = classifyStop(info, ws.readyUid);
         const lost = ws.phase === "suspended" || stop.kind === "interrupted";
         if (code !== 0) {
-          this.log(`[kubernetes-runtime] ${request.argv[0]} in ${pod} exited with ${code ?? signal}${lost ? " (pod lost or suspended)" : ""} (${stop.why})${stderrTail.trim() ? `: ${scrub(stderrTail.trim())}` : ""}`);
+          this.log(`[kubernetes-runtime] ${request.argv[0]} in ${pod} exited with ${code ?? signal}${lost ? " (pod lost or suspended)" : ""} (${stop.why})${describeLastTerminated(info)}${stderrTail.trim() ? `: ${scrub(stderrTail.trim())}` : ""}`);
         }
         if (lost && code !== 0) {
           if (ws.phase === "suspended") return { code, signal, reason: "suspended" as const, message: "The idle pod was suspended; the next message brings it back" };

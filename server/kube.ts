@@ -25,6 +25,8 @@ export interface PodInfo {
   oomAt?: string;
   /** The workspace container's memory limit as the pod spec says (e.g. 3Gi). */
   memoryLimit?: string;
+  /** The last container end the pod reports (its `state` or `lastState` terminated), to tell an OOM kill from another one after the fact. */
+  lastTerminated?: { container: string; reason?: string; exitCode?: number; signal?: number; finishedAt?: string };
   /** Why the pod is not running yet, in a form fit to show a user (scheduling, volume, image pull). */
   problem?: string;
 }
@@ -46,6 +48,9 @@ export function parsePodInfo(pod: any): PodInfo {
     .map((c: any) => [c.state?.terminated, c.lastState?.terminated].find((t) => t?.reason === "OOMKilled"))
     .find(Boolean);
   const oom = Boolean(killed);
+  const ended = (pod?.status?.containerStatuses ?? [])
+    .map((c: any) => ({ container: c.name, t: c.state?.terminated ?? c.lastState?.terminated }))
+    .find((c: any) => c.t);
   const memoryLimit = pod?.spec?.containers?.[0]?.resources?.limits?.memory;
   return {
     uid: pod?.metadata?.uid ?? "",
@@ -56,6 +61,17 @@ export function parsePodInfo(pod: any): PodInfo {
     ...(oom ? { oomKilled: true } : {}),
     ...(killed?.finishedAt ? { oomAt: killed.finishedAt } : {}),
     ...(memoryLimit ? { memoryLimit } : {}),
+    ...(ended
+      ? {
+          lastTerminated: {
+            container: String(ended.container ?? ""),
+            ...(ended.t.reason ? { reason: ended.t.reason } : {}),
+            ...(typeof ended.t.exitCode === "number" ? { exitCode: ended.t.exitCode } : {}),
+            ...(typeof ended.t.signal === "number" ? { signal: ended.t.signal } : {}),
+            ...(ended.t.finishedAt ? { finishedAt: ended.t.finishedAt } : {}),
+          },
+        }
+      : {}),
     ...(problem ? { problem } : {}),
   };
 }

@@ -40,11 +40,11 @@ export async function paseoAgentState(agentId: string, exec: Exec = execFileAsyn
  * The workspaces Paseo still has (active and background) with their names, or null when that cannot be read, in
  * which case nothing is deleted on a workspace's account.
  */
-export async function paseoWorkspaces(exec: Exec = execFileAsync as unknown as Exec): Promise<Map<string, string> | null> {
+export async function paseoWorkspaces(exec: Exec = execFileAsync as unknown as Exec, timeoutMs = 20_000): Promise<Map<string, string> | null> {
   const found = new Map<string, string>();
   try {
     for (const extra of [[], ["--background"]]) {
-      const { stdout } = await exec("paseo", ["workspace", "ls", "--json", ...extra], { timeout: 20_000 });
+      const { stdout } = await exec("paseo", ["workspace", "ls", "--json", ...extra], { timeout: timeoutMs });
       const list = JSON.parse(stdout) as { workspaceId?: string; name?: string }[];
       if (!Array.isArray(list)) return null;
       for (const entry of list) if (entry.workspaceId) found.set(entry.workspaceId, entry.name ?? "");

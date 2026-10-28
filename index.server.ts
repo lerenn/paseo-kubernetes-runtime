@@ -5,7 +5,8 @@ import { credentialsRemove, credentialsSet, credentialsStatus } from "./shared/c
 import { ConfigSchema, kubeSettings } from "./shared/settings.js";
 import { kubeKeep, kubePodAction, kubeReconcile, kubeStatus } from "./shared/status.js";
 import { paseoWorkspaces } from "./server/orphans.js";
-import { paseoAgents, readPodRows } from "./server/status.js";
+import { paseoAgents, readCluster } from "./server/status.js";
+import { PodRowsService } from "./server/status-service.js";
 import { readDaemonId } from "./server/daemon.js";
 import { readStatus, removeCredential, setCredential } from "./server/credentials.js";
 import { Kubectl } from "./server/kube.js";
@@ -120,14 +121,24 @@ export default function contribute(server: PluginServerContext) {
     const config = await getConfig();
     return { set: await removeCredential(kubeFor(config), config.credentialsSecret, key) };
   });
+  // Polled by several screens: read once at a time and kept a few seconds, each source with its own timeout (see PodRowsService)
+  const podRows = new PodRowsService({
+    titles: () => paseoWorkspaces(undefined, 5_000),
+    agents: () => paseoAgents(undefined, 5_000),
+    cluster: async () => (daemonId ? readCluster(kubeFor(await getConfig()), daemonId) : { sandboxes: [], claims: [], pods: new Map() }),
+    docker: async () => runtime.dockerStatuses(await getConfig()),
+    entries: () => registry.list(),
+    oom: () => runtime.oomStats(),
+    log: (line) => console.log(line),
+  });
   server.handle(kubeStatus, async () => {
     const config = await getConfig();
-    const [titles, agents] = await Promise.all([paseoWorkspaces(), paseoAgents()]);
-    const pods = await readPodRows(kubeFor(config), daemonId, registry.list(), titles, agents, runtime.oomStats(), await runtime.dockerStatuses(config));
+    const snapshot = await podRows.rows();
     return {
       reaper: reaper.current(),
-      pods: pods.map((row) => ({ ...row, ...runtime.autoArchiveBadge(row.workspaceId) })),
+      pods: snapshot.value.map((row) => ({ ...row, ...runtime.autoArchiveBadge(row.workspaceId) })),
       autoArchive: runtime.autoArchiveStatus(config),
+      ...(snapshot.stale ? { stale: true, ageMs: snapshot.ageMs } : {}),
     };
   });
   server.handle(kubeKeep, ({ workspaceId, keep }) => runtime.setKeep(workspaceId, keep));
