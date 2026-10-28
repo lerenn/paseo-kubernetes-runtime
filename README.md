@@ -181,6 +181,28 @@ and the volume size. Per row: Suspend and Restart (running), Resume (suspended),
 archive the workspace too. A pod with a running agent or a background command is only touched after a second
 confirmation that names what is running. Above the table, "Last reconcile" and a "Reconcile now" button.
 
+## Git proxy and submodules (`gitProxy`)
+
+Everything git in a pod goes through the daemon; the pod never reaches GitHub. Setting `gitProxy` (on by default):
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Turns the scoping, the cache warm-up and the submodule tools below on. Off: the old "Other repositories" behaviour (a whole host). |
+| `allowOrgs` | `anyshift-io`, `anyshift-engineering`, `lerenn` | GitHub orgs whose repositories a pod may clone and fetch. The pod's `url.<paseo://github.com/<org>/>.insteadOf` rules cover `https://github.com/<org>/`, `git@github.com:<org>/` and `ssh://git@github.com/<org>/`; other orgs are not rewritten and not reachable. It narrows `otherRepos` for github.com (which `allow` still narrows further). |
+| `provisionWaitSeconds` | `30` | How long an agent's start waits for the submodules to be checked out; 0 never waits. They keep going in the background after it. |
+
+- **On-demand mirrors.** A clone, fetch or submodule update of an allowed repository (a submodule of the project is always
+  allowed) is served from the daemon's cache of that repository, made on first use and refreshed with the daemon's
+  credentials. It shares the mirror gate (one `ls-remote` per remote per 8 s, no fetch when nothing changed, 2 fetches at once).
+- **Warm-up.** When a workspace starts, the daemon refreshes its cache of the project's submodules (at the checkout's HEAD)
+  while the pod is still being scheduled, so the pod's own fetches only relay data the daemon already has.
+- **Provisioning.** After the checkout is seeded, the submodules at the pinned commits are fetched through the bridge and
+  checked out one by one (each is `ready` as soon as it is), and the start of the agent waits for them up to `provisionWaitSeconds`.
+- **Safety net.** Agents of a pod workspace whose project has submodules get a note in their system prompt listing them and
+  telling them to check before reading, and an MCP server `submodules` (loopback, tunnelled like the other MCP servers)
+  with `submodule_status` (per path: `pending`/`fetching`/`ready`/`failed`, progress 0 to 1, estimated seconds left) and
+  `submodule_wait(path, timeout)` (at most 600 s).
+
 ## Settings
 
 A sidebar item "Kubernetes Runtime" opens a screen: namespace and image; an Advanced section (kubectl context, node

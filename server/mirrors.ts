@@ -31,6 +31,24 @@ export interface RepoAccess {
   enabled: boolean;
   hosts: string[];
   allow: string[];
+  /** Hosts (lower case) where only these owners are reachable, from the git proxy's `allowOrgs`. */
+  scoped?: Record<string, string[]>;
+}
+
+/**
+ * What a pod may clone through the daemon: the "Other repositories" setting, with the git proxy's org list narrowing
+ * github.com (and turning the feature on for it). `prefixes` are the `host` or `host/org` entries the pod's `insteadOf`
+ * rules are made from.
+ */
+export function repoPolicy(
+  otherRepos: { enabled: boolean; hosts: string[]; allow: string[] },
+  gitProxy: { enabled: boolean; allowOrgs: string[] },
+): { access: RepoAccess; prefixes: string[] } {
+  const hosts = otherRepos.enabled ? [...otherRepos.hosts] : [];
+  if (gitProxy.enabled && !hosts.some((h) => h.toLowerCase() === "github.com")) hosts.push("github.com");
+  const scoped = gitProxy.enabled ? { "github.com": gitProxy.allowOrgs.map((o) => o.toLowerCase()) } : undefined;
+  const prefixes = hosts.flatMap((h) => (scoped && h.toLowerCase() === "github.com" ? scoped["github.com"]!.map((o) => `github.com/${o}`) : [h]));
+  return { access: { enabled: hosts.length > 0, hosts, allow: otherRepos.enabled ? otherRepos.allow : [], ...(scoped ? { scoped } : {}) }, prefixes };
 }
 
 const REPO_PART = /^[A-Za-z0-9_.-]+$/;
@@ -53,6 +71,8 @@ export function otherRepoTarget(id: string, access: RepoAccess): FetchTarget | {
   const [, host, owner, repo] = m as unknown as [string, string, string, string];
   if (!REPO_PART.test(owner) || !REPO_PART.test(repo) || owner.startsWith(".") || repo.startsWith(".")) return { refused: "malformed repository name" };
   if (!access.hosts.some((h) => h.toLowerCase() === host.toLowerCase())) return { refused: `${host} is not one of the hosts pods may reach (${access.hosts.join(", ") || "none"})` };
+  const orgs = access.scoped?.[host.toLowerCase()];
+  if (orgs && !orgs.includes(owner.toLowerCase())) return { refused: `${owner} is not one of the orgs pods may clone from through the daemon (${orgs.join(", ") || "none"}; the git proxy's allowOrgs)` };
   if (!repoAllowed(`${owner}/${repo}`, access.allow)) return { refused: `${owner}/${repo} is not in the allowed repositories` };
   return {
     id,
@@ -106,6 +126,25 @@ async function submoduleUrls(git: GitRunner, cwd: string, shas: readonly string[
   return [...urls];
 }
 
+/** Each submodule recorded at the given commits (path and the fetch target serving its remote), the first commit that names a path wins. */
+export async function submoduleTargets(git: GitRunner, cwd: string, originUrl: string, shas: readonly string[]): Promise<{ path: string; targetId: string }[]> {
+  const found = new Map<string, string>();
+  for (const sha of shas) {
+    if (!SHA.test(sha)) continue;
+    const r = await git(["config", "--blob", `${sha}:.gitmodules`, "--get-regexp", "^submodule\\..*\\.(path|url)$"], { cwd });
+    if (r.code !== 0) continue;
+    const byName = new Map<string, { path?: string; url?: string }>();
+    for (const line of r.stdout.split("\n")) {
+      const m = /^submodule\.(.+)\.(path|url)\s+(.+)$/.exec(line.trim());
+      if (m) byName.set(m[1]!, { ...byName.get(m[1]!), [m[2] as "path" | "url"]: m[3]!.trim() });
+    }
+    for (const { path, url } of byName.values()) {
+      if (path && url && !found.has(path)) found.set(path, mirrorId(normalize(resolveSubmoduleUrl(originUrl, url))));
+    }
+  }
+  return [...found].map(([path, targetId]) => ({ path, targetId }));
+}
+
 /** Everything the pod may fetch from: the project's origin, plus the submodules recorded at `shas`. */
 export async function fetchTargets(
   git: GitRunner,
@@ -141,11 +180,15 @@ git config --global remote.origin.uploadpack "$HOME/bin/paseo-upload-pack"
 cwd="$1"; name="$2"; email="$3"; hosts="$4"; shift 4
 # pods made before the outbox hook packed from the checkout learn where it is
 [ -d "$HOME/outbox.git" ] && git config --file "$HOME/outbox.git/config" paseo.checkout "$cwd"
-# every URL of an allowed host goes through git-remote-paseo, which serves a mirror of that repository; the longer
-# rules for the project's own remotes below win over these
+# every URL of an allowed host (or of one of its orgs, "host/org") goes through git-remote-paseo, which serves a mirror
+# of that repository; the longer rules for the project's own remotes below win over these. Rules of an earlier setup
+# (a whole host before it was narrowed to orgs) are dropped first.
+for k in $(git config --global --name-only --get-regexp '^url\\.paseo://.*\\.insteadof$' 2>/dev/null || true); do git config --global --unset-all "$k" || true; done
 for h in $hosts; do
-  git config --global --unset-all "url.paseo://$h/.insteadOf" || true
-  for prefix in "https://$h/" "git@$h:" "ssh://git@$h/"; do git config --global --add "url.paseo://$h/.insteadOf" "$prefix"; done
+  host=$(printf %s "$h" | cut -d/ -f1)
+  org=$(printf %s "$h" | cut -s -d/ -f2)
+  if [ -n "$org" ]; then org="$org/"; fi
+  for prefix in "https://$host/$org" "git@$host:$org" "ssh://git@$host/$org"; do git config --global --add "url.paseo://$host/$org.insteadOf" "$prefix"; done
 done
 git config --global user.name "$name"
 git config --global user.email "$email"
@@ -170,6 +213,7 @@ export function mirrorSetupArgs(
   cwd: string,
   identity: { name: string; email: string },
   targets: readonly FetchTarget[],
+  /** `host` or `host/org` entries (see `repoPolicy`). */
   hosts: readonly string[] = [],
 ): string[] {
   return [cwd, identity.name, identity.email, hosts.join(" "), ...targets.flatMap((t) => [t.id, t.origin ? "1" : "0", ...t.podUrls, "--"])];
@@ -259,19 +303,15 @@ async function mirrorMatches(git: GitRunner, dir: string, listing: RemoteListing
 }
 
 /**
- * Refreshes the target in the daemon's cache from the real remote (daemon credentials), then answers the pod
- * with every branch and tag plus a thin pack of what the pod does not have yet.
+ * Brings the daemon's cache of a target up to date with its real remote (the part of a fetch that talks to GitHub): shared
+ * listing, no fetch when nothing changed, at most a few at once. `error` is the reply to give the pod when it failed.
  */
-export async function applyFetch(
+export async function refreshMirror(
   git: GitRunner,
   cwd: string,
-  request: FetchRequest,
-  targets: readonly FetchTarget[],
+  target: FetchTarget,
   gate: MirrorGate = mirrorGate,
-): Promise<FetchReply> {
-  const target = targets.find((t) => t.id === request.mirror);
-  if (!target) return { ok: false, message: "kube-agents: this remote is not part of the project (only its origin and submodules can be fetched from a pod)" };
-  if (!Array.isArray(request.haves) || !request.haves.every((h) => SHA.test(h))) return { ok: false, message: "kube-agents: malformed fetch request" };
+): Promise<{ dir: string; listing: RemoteListing | undefined; error?: FetchReply }> {
   // pods asking at once must not all try to create the same bare repository
   const dir = await gate.serialized(`dir:${target.id}`, () => cacheDir(git, cwd, target));
 
@@ -309,8 +349,27 @@ export async function applyFetch(
       return { ok: false, message: `kube-agents: ${scrub((error as Error).message)}` };
     }
   });
-  if (refreshed) return refreshed;
-  const head = listing?.head;
+  return { dir, listing, error: refreshed };
+}
+
+/**
+ * Refreshes the target in the daemon's cache from the real remote (daemon credentials), then answers the pod
+ * with every branch and tag plus a thin pack of what the pod does not have yet.
+ */
+export async function applyFetch(
+  git: GitRunner,
+  cwd: string,
+  request: FetchRequest,
+  targets: readonly FetchTarget[],
+  gate: MirrorGate = mirrorGate,
+): Promise<FetchReply> {
+  const target = targets.find((t) => t.id === request.mirror);
+  if (!target) return { ok: false, message: "kube-agents: this remote is not part of the project (only its origin and submodules can be fetched from a pod)" };
+  if (!Array.isArray(request.haves) || !request.haves.every((h) => SHA.test(h))) return { ok: false, message: "kube-agents: malformed fetch request" };
+  const cache = await refreshMirror(git, cwd, target, gate);
+  if (cache.error) return cache.error;
+  const { dir } = cache;
+  const head = cache.listing?.head;
   const listed = await git(["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags"], { cwd: dir });
   if (listed.code !== 0) return { ok: false, message: `kube-agents: ${scrub(listed.stderr.trim())}` };
   const refs: [string, string][] = listed.stdout
