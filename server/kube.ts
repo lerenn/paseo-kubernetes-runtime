@@ -19,6 +19,8 @@ export interface PodInfo {
   phase?: string;
   /** Set when the pod is being disrupted involuntarily (a node reclaim, an eviction): the `DisruptionTarget` condition's reason. */
   disrupted?: string;
+  /** The kubelet evicted the pod (`status.reason: Evicted`, a node under resource pressure). */
+  evicted?: boolean;
   /** A container was killed for memory. */
   oomKilled?: boolean;
   /** When the OOM-killed container ended (ISO), to tell one kill from the next. */
@@ -58,6 +60,7 @@ export function parsePodInfo(pod: any): PodInfo {
     terminating: Boolean(pod?.metadata?.deletionTimestamp),
     phase: pod?.status?.phase,
     ...(disruption ? { disrupted: disruption.reason ?? "Disrupted" } : {}),
+    ...(pod?.status?.reason === "Evicted" ? { evicted: true } : {}),
     ...(oom ? { oomKilled: true } : {}),
     ...(killed?.finishedAt ? { oomAt: killed.finishedAt } : {}),
     ...(memoryLimit ? { memoryLimit } : {}),

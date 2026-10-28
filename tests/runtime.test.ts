@@ -432,6 +432,54 @@ describe("idle suspension exemptions", () => {
   });
 });
 
+describe("idle-exempt labels after a plugin reload", () => {
+  const rules = { podIdleMinutes: 30, idleExemptLabels: ["paseo.keep=1", "paseo.mail-alias"] };
+
+  it("asks Paseo for the labels when the plugin has seen none, so a keep-labelled agent is not suspended", async () => {
+    const t = setup(rules, { workspaceLabels: async () => [{ "paseo.keep": "1" }] });
+    await t.prepare(); // no noteAgent: as after a reload
+    t.advance(120 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running");
+  });
+
+  it("honours a key-only rule on any live agent of the workspace", async () => {
+    const t = setup(rules, { workspaceLabels: async () => [{ role: "worker" }, { "paseo.mail-alias": "coordinator" }] });
+    await t.prepare();
+    t.advance(120 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running");
+  });
+
+  it("keeps the pod while the labels cannot be read at all", async () => {
+    const t = setup(rules, { workspaceLabels: async () => null });
+    await t.prepare();
+    t.advance(120 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running");
+  });
+
+  it("suspends once Paseo says no agent carries an exempt label", async () => {
+    const t = setup(rules, { workspaceLabels: async () => [{ role: "worker" }] });
+    await t.prepare();
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+});
+
+describe("a suspend never takes a turn that started at the last moment", () => {
+  it("looks at Paseo once more right before suspending", async () => {
+    let asked = 0;
+    const t = setup({ podIdleMinutes: 30 }, { agentsBusy: async () => ++asked > 1 });
+    await t.prepare();
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(asked).toBe(2);
+    expect(t.registry.list()[0]!.state).toBe("running");
+  });
+});
+
 describe("idle suspension and background work inside an agent's process", () => {
   const idleTree = [
     "    1     0 Ss   sleep infinity",
@@ -640,6 +688,86 @@ describe("an idle suspend ends the agent's process itself", () => {
     expect(await t.runtime.podAction("wks_1", "resume")).toEqual({ ok: true });
     t.kube.pods = [{ uid: "old", ready: false, terminating: true }];
     expect(await p.exit).toMatchObject({ reason: "suspended", message: expect.stringContaining("idle pod was suspended") });
+  });
+});
+
+describe("reporting a planned stop to Paseo", () => {
+  const handle = () => {
+    const calls: string[] = [];
+    return {
+      calls,
+      reportSuspended: (r: { workspaceId: string; reason: string; message?: string }) => void calls.push(`suspended:${r.workspaceId}:${r.reason}:${r.message ?? ""}`),
+      reportResumed: (r: { workspaceId: string }) => void calls.push(`resumed:${r.workspaceId}`),
+    };
+  };
+
+  it("reports an idle suspend before the process is signalled, and the resume", async () => {
+    const t = setup({ podIdleMinutes: 30 });
+    const h = handle();
+    t.runtime.attachHandle(h);
+    await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    h.calls.length = 0;
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(h.calls).toEqual(["suspended:wks_1:idle:Pod suspended to save resources; it wakes on the next message."]);
+    expect(t.kube.procs[0]!.killed).toEqual(["SIGTERM"]);
+    await t.runtime.podAction("wks_1", "resume");
+    expect(h.calls.at(-1)).toBe("resumed:wks_1");
+  });
+
+  it("reports a suspend asked for on the screen as manual", async () => {
+    const t = setup();
+    const h = handle();
+    t.runtime.attachHandle(h);
+    await t.prepare();
+    await t.runtime.podAction("wks_1", "suspend");
+    expect(h.calls.some((c) => c.startsWith("suspended:wks_1:manual:"))).toBe(true);
+  });
+
+  it("still suspends on a Paseo that gives no handle", async () => {
+    const t = setup({ podIdleMinutes: 30 });
+    t.runtime.attachHandle(undefined);
+    await t.prepare();
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+
+  it("kills a process that is still alive after the grace period, and still reports the planned exit", async () => {
+    const t = setup({ podIdleMinutes: 30 }, { stopGraceMs: 5 });
+    const p = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.kube.killEnds = false;
+    const proc = t.kube.procs[0]!;
+    t.advance(31 * MIN);
+    const ticking = t.tick();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(proc.killed).toEqual(["SIGTERM", "SIGKILL"]);
+    proc.end(137);
+    await ticking;
+    expect(await p.exit).toMatchObject({ code: 137, reason: "suspended" });
+  });
+
+  it("reports an eviction by its cause, once for the pod, and leaves an out-of-memory kill an error", async () => {
+    const t = setup({ recovery: { interruptedExit: true } });
+    const h = handle();
+    t.runtime.attachHandle(h);
+    const a = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    const b = await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.kube.pods = [{ uid: "uid-1", ready: false, terminating: false, evicted: true }];
+    t.kube.procs[0]!.end(137);
+    t.kube.procs[1]!.end(137);
+    expect(await a.exit).toMatchObject({ reason: "interrupted" });
+    expect(await b.exit).toMatchObject({ reason: "interrupted" });
+    expect(h.calls.filter((c) => c.startsWith("suspended:wks_1:quota-eviction:"))).toHaveLength(1);
+
+    const oom = setup();
+    const o = handle();
+    oom.runtime.attachHandle(o);
+    const p = await oom.reg.exec({ ...oom.base, purpose: "session", argv: ["claude"], env: {} } as never, oom.ctx);
+    oom.kube.pods = [{ uid: "uid-1", ready: true, terminating: false, oomKilled: true }];
+    oom.kube.procs[0]!.end(137);
+    expect(await p.exit).toMatchObject({ reason: "exited", code: 137 });
+    expect(o.calls.filter((c) => c.startsWith("suspended"))).toEqual([]);
   });
 });
 

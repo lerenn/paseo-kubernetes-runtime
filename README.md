@@ -69,6 +69,13 @@ Paseo daemon                                   cluster (paseo-agents)
   the current image, and the provider resumes its own session. A process that ends because the pod went away is
   reported as `runtime-lost`, so the agent run fails like any process exit and the next message relaunches it. Our own idle
   suspension is reported as the planned `suspended` exit, which idle agents drop quietly instead of showing an error.
+  Before it stops anything the plugin tells Paseo through the handle `registerWorkspaceRuntime` returns
+  (`reportSuspended`, reason `idle`, or `manual` for the screen's Suspend); the agent then shows as suspended with a calm
+  timeline note, and the next input clears it. The provider processes get SIGTERM, then SIGKILL after 10 s. A suspend is
+  decided only when Paseo says no agent has a turn open, checked again right before the pod is touched; an answer it
+  cannot give keeps the pod. `idleExemptLabels` (`key=value`, or a bare `key`) keep a workspace running for as long as
+  any live agent of it carries one; after a plugin reload the labels are read from Paseo's agent list, and while they
+  cannot be read the pod is kept. Needs a Paseo with suspended agents; on an older one the suspend works as before.
 - **Archive.** Archiving the workspace (`destroy`) deletes the Sandbox and its volume claim. There is no expiry on a
   workspace's storage.
 - **Orphans.** A reconciler (at start, then every 10 minutes) deletes the Sandbox and claim of any workspace Paseo no
@@ -258,6 +265,8 @@ daemon exports `/work`, mapped to `/` of the engine), so the same path then exis
 A pod taken away under a running agent (a Spot interruption, a node loss, an eviction) is told apart from an idle suspend and
 from a process that failed on its own: when a process ends and the plugin did not end it, the pod is looked at (gone,
 replaced, being deleted, `DisruptionTarget`, not ready: interrupted; healthy: the process failed, an OOM kill is named).
+An interruption is reported to Paseo with its cause: `quota-eviction` (kubelet eviction, scheduler preemption) or `node-removal` (the
+node going away: Karpenter, a drain, a Spot reclaim, a lost node). An OOM kill is a failure of the process and stays an error.
 Settings `recovery`:
 
 - `interruptedExit` (off): report the stop as the exit reason `interrupted` instead of `runtime-lost`. Turn it on once the Paseo in use

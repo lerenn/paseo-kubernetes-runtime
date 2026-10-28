@@ -53,7 +53,9 @@ import type {
   WorkspaceRuntimeInputRequest,
   WorkspaceRuntimePrepareRequest,
   WorkspaceRuntimeProcess,
+  WorkspaceRuntimeHandle,
   WorkspaceRuntimeRegistration,
+  WorkspaceRuntimeSuspendReason,
   WorkspaceRuntimeStatus,
   WorkspaceRuntimeWorkspaceRequest,
 } from "./runtime-types.js";
@@ -126,6 +128,8 @@ export interface RuntimeDeps {
   agentsBusy?: (workspaceId: string) => Promise<boolean | null>;
   /** Archives a workspace in Paseo (the delete action's option, and auto-archive, which adds a reason and `ifIdle`); injected for tests. */
   archiveWorkspace?: (workspaceId: string, options?: { reason?: string; ifIdle?: boolean }) => Promise<void>;
+  /** How long a stopped provider process may take to end after SIGTERM before it is killed (default 10 s). */
+  stopGraceMs?: number;
   /** Labels of each (not archived) agent of a workspace, from Paseo's agent list; null when it cannot say (injected for tests). */
   workspaceLabels?: (workspaceId: string) => Promise<Record<string, string>[] | null>;
   /** Where the last auto-archive decisions are kept. */
@@ -257,6 +261,8 @@ export class KubernetesRuntime {
   private readonly execs = new Set<{ ws: WorkspaceState; proc: PodProcess; exited: Promise<unknown>; /** Ended on purpose by a suspend: reported as the planned `suspended` exit, whatever happens to the workspace afterwards. */ planned: boolean }>();
   private readonly states = new Map<string, WorkspaceState>();
   private stopTicker: () => void = () => undefined;
+  /** Paseo's channel for reporting a planned stop; absent on a Paseo without suspended agents. */
+  private handle: WorkspaceRuntimeHandle | undefined;
   private readonly git: GitRunner;
   private readonly now: () => number;
 
@@ -300,6 +306,28 @@ export class KubernetesRuntime {
 
   private log(line: string): void {
     (this.deps.log ?? ((l: string) => console.log(l)))(line);
+  }
+
+  /** The handle `registerWorkspaceRuntime` returned, if this Paseo returns one. */
+  attachHandle(handle: WorkspaceRuntimeHandle | undefined): void {
+    this.handle = handle;
+  }
+
+  /** Tells Paseo a stop is planned, before the process stops, so the exit is not shown as an error. Never throws. */
+  private reportSuspended(ws: WorkspaceState, reason: WorkspaceRuntimeSuspendReason, message: string): void {
+    try {
+      this.handle?.reportSuspended({ workspaceId: ws.id, reason, message });
+    } catch (error) {
+      this.log(`[kubernetes-runtime] could not report the suspend of ${ws.id}: ${(error as Error).message}`);
+    }
+  }
+
+  private reportResumed(ws: WorkspaceState): void {
+    try {
+      this.handle?.reportResumed({ workspaceId: ws.id });
+    } catch {
+      // advisory: the next input clears the state in Paseo anyway
+    }
   }
 
   /** Starts the idle timer and picks up the pods a previous plugin run left running. */
@@ -850,6 +878,7 @@ export class KubernetesRuntime {
       }
       ws.readyUid = info.uid;
       this.setPhase(ws, "running");
+      this.reportResumed(ws);
       ws.lastActivity = this.now();
       await this.syncLabels(kube, ws, "running");
       if (dockerOn) await this.startDocker(ws, config, ctx);
@@ -984,7 +1013,7 @@ export class KubernetesRuntime {
     }
   }
 
-  private async suspend(ws: WorkspaceState): Promise<void> {
+  private async suspend(ws: WorkspaceState, reason: "idle" | "manual" = "idle"): Promise<void> {
     if (!ws.sandbox || ws.phase !== "running") return;
     const config = await this.deps.getConfig();
     const kube = this.deps.kubeFor(config);
@@ -996,15 +1025,12 @@ export class KubernetesRuntime {
     ws.readyUid = undefined;
     ws.commands.clear();
     this.setPhase(ws, "suspended");
+    // Tell Paseo first: the agents show as suspended and the exits below are no errors, whatever code the pod gives them.
+    this.reportSuspended(ws, reason, reason === "idle" ? "Pod suspended to save resources; it wakes on the next message." : "Pod suspended on request; it wakes on the next message.");
     // End the provider processes ourselves first and wait for their exits to be reported as the planned stop. Left
     // to the pod's deletion they die 30 s later, and by then a Git poll may already have resumed the workspace, so
     // the exit would read as a lost pod and the agent would show an error.
-    const mine = [...this.execs].filter((e) => e.ws === ws);
-    for (const e of mine) {
-      e.planned = true;
-      e.proc.kill("SIGTERM");
-    }
-    await Promise.race([Promise.allSettled(mine.map((e) => e.exited)), new Promise((r) => setTimeout(r, 5_000).unref?.())]);
+    await this.endProcesses([...this.execs].filter((e) => e.ws === ws));
     await this.syncLabels(kube, ws, "suspended");
     if (ws.docker) await this.docker.stop(ws.sandbox, config).catch((e: Error) => this.log(`[kubernetes-runtime] could not stop the docker sandbox of ${ws.sandbox}: ${e.message}`));
     ws.probe = probe;
@@ -1018,6 +1044,29 @@ export class KubernetesRuntime {
     }).catch(() => undefined);
     if (ws.activityAt !== undefined) ws.activityPersisted = ws.activityAt;
     await kube.patchSandbox(ws.sandbox, suspendPatch());
+  }
+
+  /** SIGTERM first; a process still alive after the grace period (`stopGraceMs`) is killed. Their exits are the planned stop. */
+  private async endProcesses(mine: { proc: PodProcess; exited: Promise<unknown>; planned: boolean }[]): Promise<void> {
+    for (const e of mine) {
+      e.planned = true;
+      e.proc.kill("SIGTERM");
+    }
+    const ended = async (ms: number) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<false>((r) => void (timer = setTimeout(() => r(false), ms)));
+      (timer as { unref?: () => void } | undefined)?.unref?.();
+      const done = Promise.allSettled(mine.map((e) => e.exited)).then(() => true as const);
+      try {
+        return await Promise.race([done, late]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    if (await ended(this.deps.stopGraceMs ?? 10_000)) return;
+    this.log(`[kubernetes-runtime] a provider process did not end ${(this.deps.stopGraceMs ?? 10_000) / 1000} s after SIGTERM; killing it`);
+    for (const e of mine) e.proc.kill("SIGKILL");
+    await ended(2_000);
   }
 
   /** Runs the probe script in the pod; anything it cannot settle is an unknown. */
@@ -1173,13 +1222,22 @@ export class KubernetesRuntime {
     return byDirectory === false && byId === false ? false : null;
   }
 
-  /** Whether the workspace's first agent carries one of the `idleExemptLabels`. Unknown labels (after a plugin restart) do not exempt. */
-  private exemptFromIdle(config: KubernetesRuntimeConfig, ws: WorkspaceState): boolean {
-    const labels = this.agentLabels(ws);
-    return !!labels && config.idleExemptLabels.some((rule) => {
-      const i = rule.indexOf("=");
-      return i < 0 ? rule in labels : labels[rule.slice(0, i)] === rule.slice(i + 1);
-    });
+  /**
+   * Whether the workspace carries one of the `idleExemptLabels`. The labels this plugin recorded are used first; after a
+   * plugin reload it has recorded none, so Paseo's agent list is asked (every live agent of the workspace counts). When
+   * neither can say, the workspace is exempt for now: a suspend that cannot be undone must not rest on a guess.
+   */
+  private async exemptFromIdle(config: KubernetesRuntimeConfig, ws: WorkspaceState): Promise<boolean> {
+    const matches = (labels: Record<string, string>) =>
+      config.idleExemptLabels.some((rule) => {
+        const i = rule.indexOf("=");
+        return i < 0 ? rule in labels : labels[rule.slice(0, i)] === rule.slice(i + 1);
+      });
+    const known = this.agentLabels(ws);
+    if (known && matches(known)) return true;
+    const live = this.deps.workspaceLabels ? await this.deps.workspaceLabels(ws.id).catch(() => null) : null;
+    if (live) return live.some(matches);
+    return known === undefined;
   }
 
   /** Suspends every workspace whose agents have all been idle for `podIdleMinutes`. */
@@ -1188,9 +1246,9 @@ export class KubernetesRuntime {
     const limit = config.podIdleMinutes * 60_000;
     if (limit <= 0 || config.storage.mode !== "persistent") return;
     for (const ws of this.states.values()) {
-      if (config.idleExemptLabels.length && this.exemptFromIdle(config, ws)) continue;
       const busy = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
       if (ws.phase === "running" && !busy && this.now() - ws.lastActivity >= limit) {
+        if (config.idleExemptLabels.length && (await this.exemptFromIdle(config, ws))) continue;
         // What this decision is based on. The checks below take a while (Paseo's answer, a look inside the pod), and a
         // prompt can arrive in the meantime: it moves `lastActivity`, and the suspend must not go ahead then.
         const decidedAt = ws.lastActivity;
@@ -1208,7 +1266,11 @@ export class KubernetesRuntime {
         await this.serial(ws, async () => {
           const busyNow = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
           if (ws.phase !== "running" || ws.lastActivity !== decidedAt || busyNow) return; // someone used it since: leave it running
-          await this.suspend(ws);
+          // Last look before the point of no return: only an idle agent is ever suspended. A turn that started since the
+          // check above (or an answer Paseo cannot give) keeps the pod.
+          if ((await this.workspaceRunning(ws)) !== false) return void this.markActive(ws);
+          if (ws.phase !== "running" || ws.lastActivity !== decidedAt) return;
+          await this.suspend(ws, "idle");
         }).catch(() => undefined);
       }
     }
@@ -1815,7 +1877,7 @@ export class KubernetesRuntime {
       if (ws.phase === "running") {
         const busy = await guard();
         if (busy) return busy;
-        await this.serial(ws, () => this.suspend(ws));
+        await this.serial(ws, () => this.suspend(ws, "manual"));
       } else if (action === "suspend") {
         return { ok: true, message: "The pod is not running." };
       }
@@ -1938,9 +2000,13 @@ export class KubernetesRuntime {
         if (lost && code !== 0) {
           if (ws.phase === "suspended") return { code, signal, reason: "suspended" as const, message: "The idle pod was suspended; the next message brings it back" };
           const at = new Date(this.now());
+          const firstToSee = ws.interruptedUid !== (ws.readyUid ?? pod); // every process of the pod reports the loss: Paseo hears of it once
           void this.onInterrupted(ws, pod, at, stop.why).catch(() => undefined);
           if ((await this.deps.getConfig()).recovery.interruptedExit) {
-            return { code, signal, reason: "interrupted" as const, message: `Interrupted by a node reclaim at ${at.toISOString().slice(11, 16)}Z (${stop.why}); the agent carries on once its pod is back` };
+            const message = `Interrupted by a node reclaim at ${at.toISOString().slice(11, 16)}Z (${stop.why}); the agent carries on once its pod is back`;
+            // the cause as Paseo names it (an eviction or a node removal), ahead of the exit
+            if (stop.cause && firstToSee) this.reportSuspended(ws, stop.cause, message);
+            return { code, signal, reason: "interrupted" as const, message };
           }
           return { code, signal, reason: "runtime-lost" as const, message: "The pod was lost; the next message brings it back" };
         }
