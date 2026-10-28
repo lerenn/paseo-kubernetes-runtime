@@ -25,6 +25,8 @@ export interface PodInfo {
   oomAt?: string;
   /** The workspace container's memory limit as the pod spec says (e.g. 3Gi). */
   memoryLimit?: string;
+  /** The workspace container's memory request (what the namespace quota counts). */
+  memoryRequest?: string;
   /** The last container end the pod reports (its `state` or `lastState` terminated), to tell an OOM kill from another one after the fact. */
   lastTerminated?: { container: string; reason?: string; exitCode?: number; signal?: number; finishedAt?: string };
   /** Why the pod is not running yet, in a form fit to show a user (scheduling, volume, image pull). */
@@ -61,6 +63,7 @@ export function parsePodInfo(pod: any): PodInfo {
     ...(oom ? { oomKilled: true } : {}),
     ...(killed?.finishedAt ? { oomAt: killed.finishedAt } : {}),
     ...(memoryLimit ? { memoryLimit } : {}),
+    ...(pod?.spec?.containers?.[0]?.resources?.requests?.memory ? { memoryRequest: pod.spec.containers[0].resources.requests.memory as string } : {}),
     ...(ended
       ? {
           lastTerminated: {

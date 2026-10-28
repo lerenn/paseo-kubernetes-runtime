@@ -98,3 +98,20 @@ export async function labelsOfWorkspace(paseo: AgentListApi | null, workspaceId:
     return null;
   }
 }
+
+/**
+ * Whether the workspace has agents and every one is finished: status `closed` or archived, no turn open. False when one is
+ * still alive (or there is none to judge by); null when the list cannot be read, which callers treat as "not finished".
+ */
+export async function workspaceAgentsFinished(paseo: AgentListApi | null, workspaceId: string): Promise<boolean | null> {
+  if (!paseo) return null;
+  try {
+    const result = (await paseo.agents.list({})) as { entries?: { agent?: AgentLike }[] } | AgentLike[];
+    const entries = Array.isArray(result) ? result : (result.entries ?? []);
+    const agents = entries.map((e) => ((e as { agent?: AgentLike }).agent ?? e) as AgentLike).filter((a) => a.workspaceId === workspaceId);
+    if (!agents.length) return false;
+    return agents.every((a) => (!!a.archivedAt || a.status === "closed") && a.activeTurn == null && !(a.pendingPermissions?.length));
+  } catch {
+    return null;
+  }
+}

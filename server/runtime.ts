@@ -15,7 +15,7 @@ import { Semaphore } from "./coalesce.js";
 import type { Kube, PodInfo, PodProcess, SandboxInfo } from "./kube.js";
 import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
 import { ensureCodexLogin, ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, clearSubmoduleFailure, recordSubmoduleFailure, submoduleWait, seedDirectory, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
-import { waitPodReady } from "./pod-wait.js";
+import { quantity, quotaShortfall, waitPodReady, type QuotaBlock } from "./pod-wait.js";
 import { paseoWorkspaceBusy } from "./orphans.js";
 import {
   ACTIVITY_PERSIST_MS,
@@ -124,6 +124,8 @@ export interface RuntimeDeps {
   oomStateFile?: string;
   /** Whether an agent of this workspace (by id) has a turn open, from Paseo's agent list; null when it cannot say. */
   agentsBusy?: (workspaceId: string) => Promise<boolean | null>;
+  /** Whether the workspace's agents are all closed or archived (see `workspaceAgentsFinished`); null when unknown. */
+  agentsFinished?: (workspaceId: string) => Promise<boolean | null>;
   /** Archives a workspace in Paseo (the delete action's option, and auto-archive, which adds a reason and `ifIdle`); injected for tests. */
   archiveWorkspace?: (workspaceId: string, options?: { reason?: string; ifIdle?: boolean }) => Promise<void>;
   /** Labels of each (not archived) agent of a workspace, from Paseo's agent list; null when it cannot say (injected for tests). */
@@ -202,6 +204,10 @@ interface WorkspaceState {
   commands: Set<string>;
   agents: Map<string, AgentActivity>;
   lastActivity: number;
+  /** Since when every agent of the workspace has been seen finished (closed or archived); cleared when one is not. */
+  finishedSince?: number;
+  /** When a quota-blocked start last looked for workspaces to suspend. */
+  quotaEvictAt?: number;
   /** The idle clock of auto-archive: the last real activity (input, a turn, an agent at work). Mirrored to the Sandbox. */
   activityAt?: number;
   /** What the Sandbox says `activityAt` was, to write it at most every ACTIVITY_PERSIST_MS. */
@@ -234,6 +240,10 @@ const HOST_ICON = "ship-wheel";
 export const BRIDGE_EXEC_LIMIT = 4;
 const BRIDGE_PROBE_JITTER_MS = 1_500;
 const DESCRIBE_TTL_MS = 2_000;
+/** A workspace must have been idle this long before a full namespace quota may suspend it for another pod. */
+export const QUOTA_MIN_IDLE_MS = 60_000;
+/** A pod blocked by the quota looks for victims at most this often. */
+const QUOTA_EVICT_EVERY_MS = 15_000;
 
 /** ` [container x ended: OOMKilled, exit code 137, at ...]` from the pod's last terminated container state; empty when it reports none. */
 export function describeLastTerminated(info: PodInfo | null): string {
@@ -266,6 +276,8 @@ export class KubernetesRuntime {
   private archiveRunning = false;
   /** Only one suspended workspace without a stored check is resumed at a time. */
   private legacyProbing = false;
+  /** One quota eviction pass at a time. */
+  private quotaEvicting = false;
   private archiveSummary: Pick<AutoArchiveStatus, "scheduled" | "blocked"> & { kept: Map<string, string> } = { scheduled: [], blocked: [], kept: new Map() };
   private readonly oom: OomLedger;
   /** Kube execs of the bridge liveness probes and restores: a few at a time, so a busy cluster is not hit by every workspace at once. */
@@ -320,6 +332,7 @@ export class KubernetesRuntime {
       return () => clearInterval(timer);
     }))(() => {
       void this.checkInterruptions().catch(() => undefined);
+      void this.checkFinished().catch(() => undefined);
       void this.checkTurnAnnotations().catch(() => undefined);
       this.oomSummary();
     }, 10_000);
@@ -825,6 +838,7 @@ export class KubernetesRuntime {
         sleep: this.deps.sleep,
         now: this.deps.now,
         onProblem: (problem) => ctx.notice(problem, "warning"),
+        onQuota: (block) => void this.evictForQuota(ws, pod, block, config).catch((e: Error) => this.log(`[kubernetes-runtime] quota eviction failed: ${e.message}`)),
         sandbox: async () => (await kube.listSandboxes(`${WORKSPACE_ID_LABEL}=${ws.id}`)).find((s) => s.name === pod),
       });
       await installAssets(kube, pod);
@@ -1180,6 +1194,101 @@ export class KubernetesRuntime {
       const i = rule.indexOf("=");
       return i < 0 ? rule in labels : labels[rule.slice(0, i)] === rule.slice(i + 1);
     });
+  }
+
+  /** Nothing is running in the workspace: Paseo says no agent runs, and no background command lives in the pod. */
+  private async confirmedIdle(ws: WorkspaceState): Promise<boolean> {
+    if ((await this.workspaceRunning(ws)) !== false) return false;
+    return !(await this.hasBackgroundWork(ws).catch(() => true));
+  }
+
+  /** Suspends the pod unless someone used it since `decidedAt` (the last activity the decision was based on). */
+  private async suspendIfUnchanged(ws: WorkspaceState, decidedAt: number): Promise<boolean> {
+    let done = false;
+    await this.serial(ws, async () => {
+      const busyNow = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
+      if (ws.phase !== "running" || ws.lastActivity !== decidedAt || busyNow) return;
+      await this.suspend(ws);
+      done = true;
+    }).catch(() => undefined);
+    return done;
+  }
+
+  /**
+   * Suspends the pod of a workspace whose agents are all closed or archived once that has held for `finishedGraceSeconds`,
+   * without waiting for `podIdleMinutes`. Same guards as `checkIdle`.
+   */
+  async checkFinished(): Promise<void> {
+    const config = await this.deps.getConfig();
+    const grace = config.finishedGraceSeconds * 1000;
+    if (grace <= 0 || config.storage.mode !== "persistent" || !this.deps.agentsFinished) return;
+    for (const ws of this.states.values()) {
+      if (ws.phase !== "running" || !ws.sandbox) {
+        ws.finishedSince = undefined;
+        continue;
+      }
+      if (config.idleExemptLabels.length && this.exemptFromIdle(config, ws)) continue;
+      const busy = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
+      const finished = !busy && (await this.deps.agentsFinished(ws.id).catch(() => null)) === true;
+      if (!finished) {
+        ws.finishedSince = undefined;
+        continue;
+      }
+      const now = this.now();
+      ws.finishedSince ??= now;
+      if (now - ws.finishedSince < grace || now - ws.lastActivity < grace) continue;
+      const decidedAt = ws.lastActivity;
+      if (!(await this.confirmedIdle(ws))) continue;
+      this.log(`[kubernetes-runtime] suspending pod ${ws.sandbox}: all its agents are finished`);
+      if (await this.suspendIfUnchanged(ws, decidedAt)) ws.finishedSince = undefined;
+    }
+  }
+
+  /**
+   * The namespace quota refused `requester`'s pod: suspends other workspaces to make room at once, finished ones first,
+   * then the longest idle. Never a busy, exempt or requesting workspace. When the idle ones do not free enough nothing is
+   * suspended and the requester keeps waiting (the "Queued: quota" notice).
+   */
+  private async evictForQuota(requester: WorkspaceState, pod: string, block: QuotaBlock, config: KubernetesRuntimeConfig): Promise<void> {
+    if (!config.quota.evictIdle || config.storage.mode !== "persistent") return;
+    const need = quotaShortfall(block);
+    if (!need) return;
+    const now = this.now();
+    if (this.quotaEvicting || now - (requester.quotaEvictAt ?? -Infinity) < QUOTA_EVICT_EVERY_MS) return;
+    requester.quotaEvictAt = now;
+    this.quotaEvicting = true;
+    try {
+      const kube = this.deps.kubeFor(config);
+      const candidates: { ws: WorkspaceState; finished: boolean }[] = [];
+      for (const ws of this.states.values()) {
+        if (ws === requester || ws.phase !== "running" || !ws.sandbox) continue;
+        if (config.idleExemptLabels.length && this.exemptFromIdle(config, ws)) continue;
+        if ([...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0)) continue;
+        const finished = this.deps.agentsFinished ? (await this.deps.agentsFinished(ws.id).catch(() => null)) === true : false;
+        if (!finished && now - ws.lastActivity < QUOTA_MIN_IDLE_MS) continue;
+        candidates.push({ ws, finished });
+      }
+      candidates.sort((a, b) => Number(b.finished) - Number(a.finished) || a.ws.lastActivity - b.ws.lastActivity);
+      const chosen: { ws: WorkspaceState; decidedAt: number; frees: number }[] = [];
+      let freed = 0;
+      for (const { ws } of candidates) {
+        if (freed >= need) break;
+        const decidedAt = ws.lastActivity;
+        if (!(await this.confirmedIdle(ws))) continue;
+        const info = await kube.podInfo(ws.sandbox!).catch(() => null);
+        const frees = quantity(info?.memoryRequest) ?? quantity(block.requested) ?? 0;
+        chosen.push({ ws, decidedAt, frees });
+        freed += frees;
+      }
+      if (freed < need) return; // not enough idle workspaces: wait for the quota like before
+      for (const { ws, decidedAt } of chosen) {
+        const idle = Math.max(0, Math.round((this.now() - decidedAt) / 60_000));
+        const sandbox = ws.sandbox!;
+        if (await this.suspendIfUnchanged(ws, decidedAt)) this.log(`[kubernetes-runtime] quota: suspended ${sandbox} (idle ${idle}min) to start ${pod}`);
+      }
+    } finally {
+      this.quotaEvicting = false;
+    }
   }
 
   /** Suspends every workspace whose agents have all been idle for `podIdleMinutes`. */

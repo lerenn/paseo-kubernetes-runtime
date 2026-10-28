@@ -7,6 +7,8 @@ export interface WaitOptions {
   onProblem?: (message: string) => void;
   /** Reads the pod's Sandbox; its Ready condition says why no pod exists (for example the namespace quota is full). */
   sandbox?: () => Promise<SandboxInfo | undefined>;
+  /** Called on every poll while the namespace quota blocks the pod (the caller throttles what it does). */
+  onQuota?: (block: QuotaBlock) => void;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 }
@@ -23,7 +25,7 @@ const pairs = (text: string | undefined) =>
   Object.fromEntries([...(text ?? "").matchAll(/([\w./-]+)=([^,\s]+)/g)].map((m) => [m[1]!, m[2]!]));
 
 /** Quantity in base units (Ki/Mi/Gi/Ti, m, plain), or undefined when it is not one we read. */
-function quantity(q: string | undefined): number | undefined {
+export function quantity(q: string | undefined): number | undefined {
   const m = /^(\d+(?:\.\d+)?)(m|Ki|Mi|Gi|Ti)?$/.exec(q ?? "");
   if (!m) return undefined;
   const unit = { m: 1e-3, Ki: 1024, Mi: 1024 ** 2, Gi: 1024 ** 3, Ti: 1024 ** 4 }[m[2] as "m"] ?? 1;
@@ -51,6 +53,17 @@ export function parseQuotaBlock(ready: SandboxInfo["ready"]): QuotaBlock | undef
       return need !== undefined && have !== undefined && cap !== undefined && have + need > cap;
     }) ?? resources[0]!;
   return { quota, resource, requested: requested[resource]!, used: used[resource], limited: limited[resource] };
+}
+
+/**
+ * How much of a memory quota the blocked pod is short by, in bytes: requested - (limited - used). Undefined for a
+ * resource that is not memory or when a figure is missing; 0 when it would fit after all.
+ */
+export function quotaShortfall(block: QuotaBlock): number | undefined {
+  if (!/(^|\.)memory$/.test(block.resource)) return undefined;
+  const [need, have, cap] = [quantity(block.requested), quantity(block.used), quantity(block.limited)];
+  if (need === undefined || have === undefined || cap === undefined) return undefined;
+  return Math.max(0, need - (cap - have));
 }
 
 /** "namespace quota 'agents' is full (requests.memory 35Gi of 40Gi used, this pod needs 8Gi)" */
@@ -87,7 +100,10 @@ export async function waitPodReady(kube: Kube, name: string, options: WaitOption
     if (!info) {
       // no pod: the controller may be refused by the namespace quota, which it retries by itself
       const block = parseQuotaBlock((await options.sandbox?.().catch(() => undefined))?.ready);
-      if (block) quota = block;
+      if (block) {
+        quota = block;
+        options.onQuota?.(block);
+      }
     } else quota = undefined;
     const problem = quota ? quotaNotice(quota) : info?.terminating ? "Pod is being replaced" : info?.problem;
     if (problem && problem !== lastProblem) {

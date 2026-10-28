@@ -69,6 +69,18 @@ Paseo daemon                                   cluster (paseo-agents)
   the current image, and the provider resumes its own session. A process that ends because the pod went away is
   reported as `runtime-lost`, so the agent run fails like any process exit and the next message relaunches it. Our own idle
   suspension is reported as the planned `suspended` exit, which idle agents drop quietly instead of showing an error.
+- **Finished agents.** When every agent of a workspace is closed or archived (and none has a turn open), the pod is
+  suspended after `finishedGraceSeconds` (default 30, 0 = off) instead of after `podIdleMinutes`, from the 10 s tick,
+  with the same guards as idle suspension (no background work in the pod, `idleExemptLabels` respected). The next
+  input resumes it. A workspace the Paseo agent list does not show any agent for is left to `podIdleMinutes`.
+- **Full namespace quota.** When the Sandbox cannot get a pod because the namespace ResourceQuota (requests.memory) is
+  full, the plugin suspends other idle workspaces at once instead of making the new one wait: workspaces with only
+  finished agents first, then the longest idle (at least 60 s). It frees `requested - (limited - used)` in total (each
+  victim counts as its pod's memory request) and never touches the requester, a workspace with a turn, a pending
+  permission, a running agent or background work, or one matching `idleExemptLabels`; each suspend runs under the
+  workspace's lock with a final busy re-check. If the idle ones are not enough nothing is suspended and the start waits
+  with the "Queued: namespace quota" notice. One log line per eviction: `quota: suspended <pod> (idle Nmin) to start
+  <pod>`. Turn it off live with `quota.evictIdle: false`.
 - **Archive.** Archiving the workspace (`destroy`) deletes the Sandbox and its volume claim. There is no expiry on a
   workspace's storage.
 - **Orphans.** A reconciler (at start, then every 10 minutes) deletes the Sandbox and claim of any workspace Paseo no

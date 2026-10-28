@@ -284,6 +284,16 @@ export const ConfigSchema = z.object({
     .default({ interruptedExit: false, autoResume: true, checkpointNudge: true }),
   /** A workspace whose agents have all been idle this long has its pod deleted (the volume stays); any input brings it back. 0 = never. */
   podIdleMinutes: z.number().int().min(0).default(30),
+  /**
+   * A workspace whose agents are all closed or archived (none with a turn open) has its pod suspended after this many seconds
+   * instead of waiting for `podIdleMinutes`. 0 = off.
+   */
+  finishedGraceSeconds: z.number().int().min(0).default(30),
+  /**
+   * When the namespace ResourceQuota is full and a pod cannot be created, idle workspaces are suspended at once to make room
+   * (finished ones first, then the longest idle; never a busy, exempt or requesting one) instead of waiting for a pod to end.
+   */
+  quota: z.object({ evictIdle: z.boolean().default(true) }).default({ evictIdle: true }),
   autoArchive: AutoArchiveSchema.default(() => AutoArchiveSchema.parse({})),
 }).superRefine((c, ctx) => {
   const a = c.autoArchive;
