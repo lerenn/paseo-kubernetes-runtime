@@ -15,6 +15,12 @@ export const REPO_LABEL = "paseo.sh/repo";
 export const SERVICE_ACCOUNT_LABEL = "paseo.sh/service-account";
 /** On an agent pod with a Docker sandbox, so a NetworkPolicy can let it reach the sandbox (value `1`). */
 export const DOCKER_LABEL = "paseo.sh/docker";
+/** On the pod template of a workspace with the privileged `dockerd` sidecar (value `1`); an admission policy can key on it. */
+export const DOCKER_SIDECAR_LABEL = "paseo.sh/docker-sidecar";
+export const DOCKER_SIDECAR_CONTAINER = "dockerd";
+/** The engine address in sidecar mode: loopback of the pod, so no other pod can reach it. */
+export const DOCKER_SIDECAR_HOST = "tcp://127.0.0.1:2375";
+const DOCKER_DATA_VOLUME = "docker-data";
 /** On an agent pod: the name of its Sandbox, which the Docker sandbox's NetworkPolicy selects by. */
 export const SANDBOX_LABEL = "paseo.sh/sandbox";
 export const STATE_LABEL = "paseo.sh/state";
@@ -106,7 +112,7 @@ export function serviceAccountFor(config: KubernetesRuntimeConfig, labels: Recor
   })?.serviceAccount;
 }
 
-export function specHash(config: KubernetesRuntimeConfig, cwd: string, serviceAccount?: string | null, docker?: boolean): string {
+export function specHash(config: KubernetesRuntimeConfig, cwd: string, serviceAccount?: string | null, docker?: boolean, sidecar?: boolean): string {
   const shape = {
     image: config.image,
     resources: config.resources ?? null,
@@ -121,6 +127,7 @@ export function specHash(config: KubernetesRuntimeConfig, cwd: string, serviceAc
     cwd,
     // only when on, so the hash of a pod without a Docker sandbox is what it always was
     ...(docker ? { docker: config.docker } : {}),
+    ...(sidecar ? { dockerSidecar: { ...config.dockerSidecar, image: config.dockerSidecar.image ?? config.docker.image } } : {}),
   };
   return createHash("sha1").update(JSON.stringify(shape)).digest("hex").slice(0, 12);
 }
@@ -142,6 +149,40 @@ export interface SandboxSpecInput {
   serviceAccount?: string;
   /** The workspace's profile has a Docker sandbox: the pod gets `DOCKER_HOST` and the labels its NetworkPolicy goes by. */
   docker?: boolean;
+  /** The pod gets the privileged `dockerd` sidecar (Docker mode `sidecar`); never together with `docker`. */
+  dockerSidecar?: boolean;
+}
+
+/** The privileged dind container of the `sidecar` mode: dockerd on the pod's loopback only, the workspace volume mounted where the agent sees it. */
+export function dockerSidecarContainer(config: KubernetesRuntimeConfig, cwd?: string) {
+  return {
+    name: DOCKER_SIDECAR_CONTAINER,
+    image: config.dockerSidecar.image ?? config.docker.image,
+    command: ["dockerd-entrypoint.sh"],
+    args: ["dockerd", `--host=${DOCKER_SIDECAR_HOST}`, "--host=unix:///var/run/docker.sock"],
+    env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }],
+    // the pod runs as 1000 and non-root; dockerd needs root and the host's devices
+    securityContext: { privileged: true, runAsUser: 0, runAsNonRoot: false },
+    resources: config.dockerSidecar.resources,
+    volumeMounts: [
+      { name: DOCKER_DATA_VOLUME, mountPath: "/var/lib/docker" },
+      // the same volume at the same paths as the agent, so `docker run -v <checkout>:...` and compose bind mounts see the agent's files
+      { name: WORKSPACE_VOLUME, mountPath: WORKSPACE_ROOT },
+      ...(cwd ? [{ name: WORKSPACE_VOLUME, mountPath: cwd, subPath: CHECKOUT_SUBPATH }] : []),
+    ],
+  };
+}
+
+/** Containers and volumes of the pod template, with or without the sidecar (a merge patch replaces both lists, so a switched-off sidecar disappears). */
+function podContainers(config: KubernetesRuntimeConfig, cwd: string | undefined, engine: string | undefined, sidecar: boolean | undefined) {
+  return {
+    containers: [workspaceContainer(config, cwd, engine), ...(sidecar ? [dockerSidecarContainer(config, cwd)] : [])],
+    // Persistent storage comes from volumeClaimTemplates; the controller adds that volume.
+    volumes: [
+      ...(config.storage.mode === "ephemeral" ? [{ name: WORKSPACE_VOLUME, emptyDir: {} }] : []),
+      ...(sidecar ? [{ name: DOCKER_DATA_VOLUME, emptyDir: {} }] : []),
+    ],
+  };
 }
 
 /** `docker-<sandbox>`: the name of a workspace's Docker sandbox pod, Service and NetworkPolicy. */
@@ -171,6 +212,7 @@ export function claimPatch(workspaceId: string, cwd: string, meta: PodMeta, conf
 export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
   const { name, workspaceId, config, daemonId, meta, warm } = input;
   const docker = !warm && input.docker === true;
+  const sidecar = !warm && !docker && input.dockerSidecar === true;
   const serviceAccount = warm ? undefined : input.serviceAccount;
   const layout = input.layout ?? (warm ? "mapped" : "legacy");
   const cwd = layout === "mapped" ? undefined : (input.cwd ?? "");
@@ -179,6 +221,7 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
     [MANAGED_BY_LABEL]: MANAGED_BY,
     ...(serviceAccount ? { [SERVICE_ACCOUNT_LABEL]: serviceAccount } : {}),
     ...dockerPodLabels(name, docker),
+    ...(sidecar ? { [DOCKER_LABEL]: "1", [DOCKER_SIDECAR_LABEL]: "1" } : {}),
     ...(warm ? { [STATE_LABEL]: WARM_STATE } : shown),
   };
   const owner = {
@@ -194,7 +237,7 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
       namespace: config.namespace,
       labels: { ...podLabels, ...owner },
       annotations: {
-        [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT, serviceAccount, docker),
+        [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT, serviceAccount, docker, sidecar),
         ...(cwd ? { [CWD_ANNOTATION]: cwd } : { [LAYOUT_ANNOTATION]: "mapped" }),
         ...(input.cwd && layout === "mapped" ? { [CWD_ANNOTATION]: input.cwd } : {}),
         ...(meta ? metaAnnotations(meta) : {}),
@@ -219,14 +262,14 @@ export function buildSandbox(input: SandboxSpecInput): Record<string, unknown> {
           // The checkout is a subPath of the volume, and kubelet creates a subPath directory owned by root,
           // after fsGroup has been applied. A root init container makes the volume ours before the agent runs.
           initContainers: [volumeInit(config)],
-          containers: [workspaceContainer(config, cwd, docker ? dockerHost(config, name) : undefined)],
-          // Persistent storage comes from volumeClaimTemplates; the controller adds the volume.
-          ...(config.storage.mode === "ephemeral" ? { volumes: [{ name: WORKSPACE_VOLUME, emptyDir: {} }] } : {}),
+          ...withVolumes(podContainers(config, cwd, docker ? dockerHost(config, name) : sidecar ? DOCKER_SIDECAR_HOST : undefined, sidecar)),
         },
       },
     },
   };
 }
+
+const withVolumes = (p: ReturnType<typeof podContainers>) => ({ containers: p.containers, ...(p.volumes.length ? { volumes: p.volumes } : {}) });
 
 export function placement(config: KubernetesRuntimeConfig) {
   const { nodeSelector } = config;
@@ -287,11 +330,14 @@ export function suspendPatch() {
 }
 
 /** Recreates the pod on the same volume, with the current image and settings. */
-export function resumePatch(config: KubernetesRuntimeConfig, cwd?: string, serviceAccount?: string, docker?: { sandbox: string }) {
+export function resumePatch(config: KubernetesRuntimeConfig, cwd?: string, serviceAccount?: string, docker?: { sandbox: string }, sidecar?: boolean) {
+  const sc = Boolean(sidecar) && !docker;
+  const dockerLabel = docker || sc ? "1" : null;
+  const pod = podContainers(config, cwd, docker ? dockerHost(config, docker.sandbox) : sc ? DOCKER_SIDECAR_HOST : undefined, sc);
   return {
     metadata: {
-      annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT, serviceAccount, Boolean(docker)) },
-      labels: { [DOCKER_LABEL]: docker ? "1" : null, [SANDBOX_LABEL]: docker ? docker.sandbox : null },
+      annotations: { [SPEC_HASH_ANNOTATION]: specHash(config, cwd ?? MAPPED_CHECKOUT, serviceAccount, Boolean(docker), sc) },
+      labels: { [DOCKER_LABEL]: dockerLabel, [SANDBOX_LABEL]: docker ? docker.sandbox : null, [DOCKER_SIDECAR_LABEL]: sc ? "1" : null },
     },
     spec: {
       operatingMode: "Running",
@@ -302,15 +348,18 @@ export function resumePatch(config: KubernetesRuntimeConfig, cwd?: string, servi
           labels: {
             [SERVICE_ACCOUNT_LABEL]: serviceAccount ?? null,
             // the profile may have gained or lost the sandbox since the pod was made
-            [DOCKER_LABEL]: docker ? "1" : null,
+            [DOCKER_LABEL]: dockerLabel,
             [SANDBOX_LABEL]: docker ? docker.sandbox : null,
+            [DOCKER_SIDECAR_LABEL]: sc ? "1" : null,
           },
           ...(Object.keys(config.podAnnotations).length ? { annotations: config.podAnnotations } : {}),
         },
         spec: {
           ...(serviceAccount ? { serviceAccountName: serviceAccount, automountServiceAccountToken: true } : { serviceAccountName: null, automountServiceAccountToken: false }),
           ...placement(config), initContainers: [volumeInit(config)],
-          containers: [workspaceContainer(config, cwd, docker ? dockerHost(config, docker.sandbox) : undefined)],
+          containers: pod.containers,
+          // null drops the sidecar's emptyDir (the list is never empty in ephemeral mode)
+          volumes: pod.volumes.length ? pod.volumes : null,
         },
       },
     },
