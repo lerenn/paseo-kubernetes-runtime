@@ -35,6 +35,8 @@ export class SubmoduleTracker {
   private startedAt = 0;
   private known = false;
   private waiters = new Set<() => void>();
+  /** Set by the runtime: starts the provisioning again (what a `wait` on a failed submodule asks for). */
+  retry?: () => void;
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -59,7 +61,7 @@ export class SubmoduleTracker {
   /** The provisioning job ended: what is not ready failed (or is ready when `ok`). */
   finish(ok: boolean, message = ""): void {
     for (const [path, e] of this.entries) {
-      if (e.state === "ready") continue;
+      if (e.state === "ready" || (e.state === "failed" && !ok)) continue;
       this.entries.set(path, ok ? { path, state: "ready", progress: 1 } : { path, state: "failed", progress: e.progress, message: message || "fetching failed" });
     }
     this.notify();
@@ -89,8 +91,30 @@ export class SubmoduleTracker {
     };
   }
 
-  /** Resolves when `path` is ready or failed (immediately for an unknown path), or after `timeoutMs`. */
+  /** Whether any submodule is failed or still waiting (so another provisioning run is worth it). */
+  needsWork(): boolean {
+    return [...this.entries.values()].some((e) => e.state !== "ready");
+  }
+
+  /** Puts the failed submodules back to pending for another run. */
+  requeue(): void {
+    for (const [path, e] of this.entries) if (e.state === "failed") this.entries.set(path, { path, state: "pending", progress: 0, message: `retrying after: ${e.message ?? "an error"}` });
+    this.notify();
+  }
+
+  /**
+   * Resolves when `path` is ready or failed (immediately for an unknown path), or after `timeoutMs`. Asking for a failed
+   * submodule starts the provisioning again and waits for that run instead of answering `failed` at once.
+   */
   wait(path: string, timeoutMs: number): Promise<SubmoduleStatus | undefined> {
+    if (this.entries.get(path)?.state === "failed" && this.retry) {
+      this.requeue();
+      this.retry();
+    }
+    return this.waitSettled(path, timeoutMs);
+  }
+
+  private waitSettled(path: string, timeoutMs: number): Promise<SubmoduleStatus | undefined> {
     const current = () => this.entries.get(path);
     const settled = () => {
       const e = current();

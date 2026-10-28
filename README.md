@@ -201,7 +201,12 @@ Everything git in a pod goes through the daemon; the pod never reaches GitHub. S
 - **Safety net.** Agents of a pod workspace whose project has submodules get a note in their system prompt listing them and
   telling them to check before reading, and an MCP server `submodules` (loopback, tunnelled like the other MCP servers)
   with `submodule_status` (per path: `pending`/`fetching`/`ready`/`failed`, progress 0 to 1, estimated seconds left) and
-  `submodule_wait(path, timeout)` (at most 600 s).
+  `submodule_wait(path, timeout)` (at most 600 s). A `wait` on a `failed` submodule starts the provisioning again and waits
+  for that run; `failed` carries the error.
+- **Under load.** `bridge.mjs call fetch` retries (6 tries, 1 s doubling, jitter) on a refused connection (the bridge is
+  restarting), a reply cut short, a chunk that fails or a pack that does not index, and each request to the bridge times out
+  (3 min). Each submodule is tried 3 times, its commands are bounded (10 min), one failing does not stop the others, and the
+  provisioning runs again when a lost bridge is restored.
 
 ## Settings
 

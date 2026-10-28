@@ -440,6 +440,12 @@ export class KubernetesRuntime {
       this.startBridge(kube, ws, new Set([...ws.ports, ...ws.wantPorts]));
       started = true;
       await this.refreshTargets(kube, ws, pod).catch(() => undefined);
+      // submodules that failed while the bridge was down are fetched again now that it is back
+      const tracker = this.tracker(ws.options.cwd);
+      if (tracker.isKnown && tracker.needsWork()) {
+        tracker.requeue();
+        this.startSubmodules(kube, ws, pod, true);
+      }
     });
     return started;
   }
@@ -685,7 +691,9 @@ export class KubernetesRuntime {
    * Checks out the submodules in the background so the agent can start at once (a project with many submodules took
    * over half a minute). Also resumes an interrupted checkout after a suspend; only one runs at a time.
    */
-  private startSubmodules(kube: Kube, ws: WorkspaceState, pod: string): void {
+  private startSubmodules(kube: Kube, ws: WorkspaceState, pod: string, force = false): void {
+    // a wait on a failed submodule, or a restored bridge, runs it again (even inside the failure back-off)
+    this.tracker(ws.options.cwd).retry = () => this.startSubmodules(kube, ws, pod, true);
     if (ws.submodulesJob) return;
     const cwd = this.podRoot(ws);
     const notice = (message: string, level?: "info" | "warning" | "error") => ws.notice?.(message, level);
@@ -695,7 +703,7 @@ export class KubernetesRuntime {
       if (state) tracker.reset(state);
       if (!(await submodulesPending(kube, pod, cwd))) return tracker.finish(true);
       // a fetch that failed is not tried again at every start: the pod remembers it, with a growing wait
-      const wait = await submoduleWait(kube, pod, this.now());
+      const wait = force ? { ms: 0, attempts: (await submoduleWait(kube, pod, this.now())).attempts } : await submoduleWait(kube, pod, this.now());
       if (wait.ms > 0) {
         tracker.finish(false, "an earlier fetch failed; retry with `git submodule update --init` in the pod");
         notice(`Fetching the submodules failed earlier; not trying again for ${Math.ceil(wait.ms / 60_000)} min. Run \`git submodule update --init\` in the pod to retry now.`, "warning");

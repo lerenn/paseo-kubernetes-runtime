@@ -27,11 +27,11 @@ if (mode === "call") {
     if (args[5]) msg.mirror = args[5];
     msg.pack = Buffer.concat(chunks).toString("base64");
   }
+  const dir = op === "fetch" ? path.resolve(args[1]) : "";
+  const git = (a, input) => execFileSync("git", ["--git-dir", dir, ...a], { encoding: "utf8", input, maxBuffer: 1 << 28 });
   if (op === "fetch") {
     // args[1] is a mirror repository; send what it (and the checkout it borrows objects from) already has.
-    const dir = path.resolve(args[1]);
-    const git = (g, a, input) => execFileSync("git", ["--git-dir", g, ...a], { encoding: "utf8", input, maxBuffer: 1 << 28 });
-    const tips = (g) => git(g, ["for-each-ref", "--format=%(objectname)"]).split("\n").filter(Boolean);
+    const tips = (g) => execFileSync("git", ["--git-dir", g, "for-each-ref", "--format=%(objectname)"], { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n").filter(Boolean);
     const haves = new Set(tips(dir));
     try {
       for (const alt of fs.readFileSync(dir + "/objects/info/alternates", "utf8").split("\n").filter(Boolean)) {
@@ -39,31 +39,33 @@ if (mode === "call") {
       }
     } catch {}
     let target = "";
-    try { target = git(dir, ["config", "paseo.target"]).trim(); } catch {}
+    try { target = git(["config", "paseo.target"]).trim(); } catch {}
     // a mirror made on demand for any repository names it; the project's own mirrors are named by their directory
     msg.mirror = target ? "x:" + target : path.basename(dir, ".git");
     msg.haves = [...haves];
   }
-  const conn = net.connect(sock);
-  let out = "";
-  conn.on("error", (e) => { console.error("kube-agents: bridge unavailable: " + e.message); process.exit(1); });
-  conn.on("data", (d) => (out += d));
+  // A fetch is safe to repeat, so a bridge that restarts under load (connection refused, a reply cut short) or does not
+  // answer is retried with growing waits; a push is tried once. Every request to the bridge is bounded in time.
+  const TIMEOUT = Number(process.env.PASEO_BRIDGE_TIMEOUT_MS) || 180000;
+  const ATTEMPTS = op === "fetch" ? Number(process.env.PASEO_BRIDGE_ATTEMPTS) || 6 : 1;
+  const BASE = Number(process.env.PASEO_BRIDGE_RETRY_MS) || 1000;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const transient = (message) => Object.assign(new Error(message), { transient: true });
   // one request on its own connection (the first reply of a big fetch names a pack that is then pulled in chunks)
   const rpc = (m) => new Promise((resolve, reject) => {
     const c = net.connect(sock);
     let o = "";
-    c.on("error", reject);
+    const timer = setTimeout(() => { c.destroy(); reject(transient("bridge unavailable: no answer in " + Math.round(TIMEOUT / 1000) + " s")); }, TIMEOUT);
+    c.on("error", (e) => { clearTimeout(timer); reject(transient("bridge unavailable: " + e.message)); });
     c.on("data", (d) => (o += d));
-    c.on("end", () => { try { resolve(JSON.parse(o)); } catch { reject(new Error("bad bridge reply")); } });
+    c.on("end", () => { clearTimeout(timer); try { resolve(JSON.parse(o)); } catch { reject(transient("bad bridge reply")); } });
     c.end(JSON.stringify(m) + "\n");
   });
-  conn.on("end", async () => {
-    let r;
-    try { r = JSON.parse(out); } catch { console.error("kube-agents: bad bridge reply"); process.exit(1); }
+  const once = async () => {
+    const r = await rpc(msg);
     if (r.message) console.error(r.message);
+    if (op === "fetch" && !r.ok && /no longer available|too many git fetches/.test(r.message || "")) throw transient(r.message);
     if (op === "fetch" && r.ok) {
-      const dir = path.resolve(args[1]);
-      const git = (a, input) => execFileSync("git", ["--git-dir", dir, ...a], { encoding: "utf8", input, maxBuffer: 1 << 28 });
       try {
         if (r.packId) {
           const file = dir + "/incoming.pack";
@@ -71,9 +73,9 @@ if (mode === "call") {
           try {
             for (let offset = 0; offset < r.packBytes;) {
               const k = await rpc({ op: "fetch-chunk", packId: r.packId, offset });
-              if (!k.ok) throw new Error(k.message || "chunk refused");
+              if (!k.ok) throw transient(k.message || "chunk refused");
               const part = Buffer.from(k.data, "base64");
-              if (!part.length) throw new Error("empty chunk");
+              if (!part.length) throw transient("empty chunk");
               fs.writeSync(out, part);
               offset += part.length;
             }
@@ -90,11 +92,24 @@ if (mode === "call") {
         for (const [ref, sha] of want) cmds.push("update " + ref + " " + sha);
         if (cmds.length) git(["update-ref", "--stdin"], cmds.join("\n") + "\n");
         if (r.head) git(["symbolic-ref", "HEAD", r.head]);
-      } catch (e) { console.error("kube-agents: could not store the fetched commits: " + e.message); process.exit(1); }
+      } catch (e) {
+        if (e.transient) throw e;
+        // a pack that does not index is a truncated transfer more often than not: ask again
+        throw transient("could not store the fetched commits: " + e.message);
+      }
     }
-    process.exit(r.ok ? 0 : 1);
-  });
-  conn.end(JSON.stringify(msg) + "\n");
+    return r.ok ? 0 : 1;
+  };
+  let code = 1;
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    try { code = await once(); break; }
+    catch (e) {
+      console.error("kube-agents: " + e.message + (e.transient && attempt < ATTEMPTS ? " (attempt " + attempt + "/" + ATTEMPTS + ", trying again)" : ""));
+      if (!e.transient || attempt === ATTEMPTS) { code = 1; break; }
+      await sleep(Math.min(BASE * 2 ** (attempt - 1), 30000) * (0.75 + Math.random() / 2));
+    }
+  }
+  process.exit(code);
 } else if (mode === "serve") {
   const pending = new Map();
   let next = 1;
