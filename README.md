@@ -201,7 +201,12 @@ Everything git in a pod goes through the daemon; the pod never reaches GitHub. S
 - **Safety net.** Agents of a pod workspace whose project has submodules get a note in their system prompt listing them and
   telling them to check before reading, and an MCP server `submodules` (loopback, tunnelled like the other MCP servers)
   with `submodule_status` (per path: `pending`/`fetching`/`ready`/`failed`, progress 0 to 1, estimated seconds left) and
-  `submodule_wait(path, timeout)` (at most 600 s).
+  `submodule_wait(path, timeout)` (at most 600 s). A `wait` on a `failed` submodule starts the provisioning again and waits
+  for that run; `failed` carries the error.
+- **Under load.** `bridge.mjs call fetch` retries (6 tries, 1 s doubling, jitter) on a refused connection (the bridge is
+  restarting), a reply cut short, a chunk that fails or a pack that does not index, and each request to the bridge times out
+  (3 min). Each submodule is tried 3 times, its commands are bounded (10 min), one failing does not stop the others, and the
+  provisioning runs again when a lost bridge is restored.
 
 ## Settings
 
@@ -390,6 +395,10 @@ The idle clock is the last activity (input, a turn, an agent at work), kept on t
 - a final re-check under the workspace's queue right before the archive.
 
 The archive is `paseo workspace archive <id>`, with `--reason "auto-archived: idle Nd" --if-idle` when the `paseo` CLI supports them (the fork's change; detected from `--help`), so the daemon itself refuses if an agent has an open turn by then. Each decision is logged and the last 100 are kept in `plugin-data/kubernetes-runtime/auto-archive.json`. To keep a workspace, press Keep (Pods table or the Auto-archive section; it is a `paseo.sh/keep` annotation) or give its agent the label `paseo.keep=1`.
+
+## Pod control for other plugins
+
+On start the plugin offers `globalThis[Symbol.for("paseo.kubernetes-runtime")].podAction(workspaceId, "suspend" | "resume", { force })` (removed on stop or reload). The Factory uses it to suspend the worker pod of a held run. It is the Pods screen's path: the volume is kept and Paseo is told (agents show as suspended, the exits are planned). It returns `{ ok }`, or `{ ok: false, busy }` / `{ ok: false, message }`. Without `force`, a pod with a running agent or background work is refused (`busy` says what runs), and so is a workspace carrying an `idleExemptLabels` label; `force` overrides both. Resuming a running pod answers `ok`; a workspace without a pod answers `ok: false`. The pod is per workspace, so a pod shared by several agents is suspended only when none of them is running.
 
 ## Cluster requirements
 

@@ -211,9 +211,21 @@ export interface KubectlOptions {
   binary?: string;
 }
 
+/**
+ * An exec that dies (a pod's processes killed, exit 137, a dropped connection) leaves its pipes broken: a write to its
+ * stdin then emits `error` (EPIPE), and an `error` event nobody listens to is an uncaught exception that takes down the whole
+ * plugin. Every stream of a child gets a listener; the failure itself still reaches whoever wrote (the write callback or
+ * promise) and the child's exit.
+ */
+export function guardChild(child: Pick<ReturnType<typeof spawn>, "stdin" | "stdout" | "stderr" | "on">): void {
+  for (const stream of [child.stdin, child.stdout, child.stderr]) stream?.on("error", () => undefined);
+  child.on("error", () => undefined);
+}
+
 function run(binary: string, args: string[], stdin?: string): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, { stdio: ["pipe", "pipe", "pipe"] });
+    guardChild(child);
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d));
@@ -227,6 +239,9 @@ function run(binary: string, args: string[], stdin?: string): Promise<ExecResult
 export function ndjsonStream(
   child: Pick<ReturnType<typeof spawn>, "stdin" | "stdout" | "kill">,
 ): AcpStream {
+  // a write after the exec died is EPIPE on stdin: reported to the writer through its callback, never as an uncaught event
+  child.stdin?.on("error", () => undefined);
+  child.stdout?.on("error", () => undefined);
   let buffer = "";
   // The consumer cancelling the reader kills the child, whose stdout then ends: closing or
   // enqueuing after that throws, and an uncaught throw here takes down the whole plugin process.
@@ -314,6 +329,7 @@ export class Kubectl implements Kube {
   execInput(pod: string, argv: string[], input: Readable): Promise<ExecResult> {
     return new Promise((resolve, reject) => {
       const child = spawn(this.binary, [...this.base, "exec", "-i", pod, "--", ...argv], { stdio: ["pipe", "pipe", "pipe"] });
+      guardChild(child);
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (d) => (stdout += d));
@@ -328,6 +344,7 @@ export class Kubectl implements Kube {
 
   spawnExec(pod: string, argv: string[]): PodProcess {
     const child = spawn(this.binary, [...this.base, "exec", "-i", pod, "--", ...argv], { stdio: ["pipe", "pipe", "pipe"] });
+    guardChild(child);
     const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
       child.on("error", () => resolve({ code: 127, signal: null }));
       child.on("close", (code, signal) => resolve({ code, signal }));
@@ -345,6 +362,7 @@ export class Kubectl implements Kube {
     const child = spawn(this.binary, [...this.base, "exec", "-i", pod, "--", ...argv], {
       stdio: ["pipe", "pipe", "inherit"],
     });
+    child.on("error", () => undefined);
     return ndjsonStream(child);
   }
 

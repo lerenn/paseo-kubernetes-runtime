@@ -15,6 +15,7 @@ import { OrphanReaper } from "./server/orphans.js";
 import { podOnlyAgent, podOnlyWorkspace } from "./server/pod-only.js";
 import { LABELS_REF_ENV, LabelHandoff, withAgentLabels } from "./server/label-handoff.js";
 import { labelsOfAgent, labelsOfWorkspace, sendUnlessBusy, workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
+import { registerPodControl } from "./server/pod-control.js";
 import { PodRegistry } from "./server/registry.js";
 import { KubernetesRuntime } from "./server/runtime.js";
 import { startSubmoduleMcp } from "./server/submodule-mcp.js";
@@ -175,7 +176,11 @@ export default function contribute(server: PluginServerContext) {
   server.handle(kubeReconcile, async () => ({ reaper: await reaper.run() }));
 
 
+  // Other plugins (the Factory's run suspend) suspend and wake a pod through this; removed on stop so a reload leaves no stale closure
+  const removePodControl = registerPodControl(runtime);
+
   return async () => {
+    removePodControl();
     (await submoduleMcp)?.close();
     await runtime.stop();
     reaper.stop();

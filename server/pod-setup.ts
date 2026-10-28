@@ -56,9 +56,31 @@ export interface SubmoduleProgress {
   /** Submodule path and the fetch target (mirror id) its remote is served by; known when the daemon read `.gitmodules` at the seeded commit. */
   paths?: readonly { path: string; targetId: string }[];
   onState?: (path: string, state: "pending" | "fetching" | "ready" | "failed", progress: number, message?: string) => void;
+  /** Tries per submodule before it is reported failed (default 3). */
+  attempts?: number;
+  /** A pod command that has not answered in this long is given up on (default 10 min). */
+  timeoutMs?: number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
-/** Checks out the submodules recorded in the seeded commit (their commits come through the fetch bridge). */
+const withTimeout = <T>(promise: Promise<T>, ms: number, what: string): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${what} did not finish in ${Math.round(ms / 1000)} s`)), ms);
+    (timer as { unref?: () => void }).unref?.();
+    promise.then(
+      (v) => (clearTimeout(timer), resolve(v)),
+      (e) => (clearTimeout(timer), reject(e)),
+    );
+  });
+
+/** `timeout` (when the image has it) ends a git that hangs on a bridge that never answers, instead of leaving it for ever. */
+const BOUNDED_UPDATE = 'if command -v timeout >/dev/null 2>&1; then exec timeout -k 5 "$3" git -C "$1" submodule update -- "$2"; else exec git -C "$1" submodule update -- "$2"; fi';
+
+/**
+ * Checks out the submodules recorded in the seeded commit at their pinned commits. Plain `git submodule update` does the
+ * work from the mirrors the bridge filled (the bridge call retries and has a timeout of its own). A submodule that fails is tried again, and one
+ * failing does not stop the others.
+ */
 export async function initSubmodules(
   kube: Kube,
   pod: string,
@@ -70,41 +92,71 @@ export async function initSubmodules(
   const present = await kube.exec(pod, ["test", "-f", `${cwd}/.gitmodules`]);
   if (present.code !== 0) return { ok: true, message: "" };
   const paths = watch.paths ?? [];
-  const at = (targetId: string) => paths.filter((p) => p.targetId === targetId).map((p) => p.path);
-  // `git clone` does not run the fetch wrapper, so fill the submodules' mirrors first, several at a time
-  const queue = targets.filter((t) => !t.origin);
-  let failure = "";
-  const worker = async () => {
-    for (let target = queue.shift(); target && !failure; target = queue.shift()) {
-      for (const path of at(target.id)) watch.onState?.(path, "fetching", 0.1);
-      const r = await kube.exec(pod, ["sh", "-c", 'node "$HOME/bridge.mjs" call fetch "$HOME/mirrors/$1.git" </dev/null', "sh", target.id]);
-      if (r.code !== 0) failure = r.stderr.trim() || "fetch failed";
-      else for (const path of at(target.id)) watch.onState?.(path, "fetching", 0.7);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, worker));
-  if (failure) return { ok: false, message: failure };
+  const timeoutMs = watch.timeoutMs ?? 10 * 60_000;
+  const attempts = watch.attempts ?? 3;
+  const sleep = watch.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   if (paths.length === 0) {
-    const r = await kube.exec(pod, ["git", "-C", cwd, "submodule", "update", "--init", "--jobs", String(concurrency + 2)]);
+    // the submodules are not known one by one: fill the mirrors, then update all of them
+    const queue = targets.filter((t) => !t.origin);
+    let failure = "";
+    const worker = async () => {
+      for (let target = queue.shift(); target && !failure; target = queue.shift()) {
+        const r = await withTimeout(kube.exec(pod, ["sh", "-c", 'node "$HOME/bridge.mjs" call fetch "$HOME/mirrors/$1.git" </dev/null', "sh", target.id]), timeoutMs, "the fetch").catch((e: Error) => ({ code: 1, stdout: "", stderr: e.message }));
+        if (r.code !== 0) failure = r.stderr.trim() || "fetch failed";
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, worker));
+    if (failure) return { ok: false, message: failure };
+    const r = await withTimeout(kube.exec(pod, ["git", "-C", cwd, "submodule", "update", "--init", "--jobs", String(concurrency + 2)]), timeoutMs, "git submodule update").catch((e: Error) => ({ code: 1, stdout: "", stderr: e.message }));
     return { ok: r.code === 0, message: r.code === 0 ? "" : r.stderr.trim() };
   }
-  // one at a time so each becomes ready as soon as it is checked out (the mirrors already hold everything)
+  // register every submodule first (it writes .git/config, which parallel updates must not do)
   const init = await kube.exec(pod, ["git", "-C", cwd, "submodule", "init"]);
-  if (init.code !== 0) return { ok: false, message: init.stderr.trim() };
-  const todo = paths.map((p) => p.path);
-  let error = "";
+  if (init.code !== 0) return { ok: false, message: init.stderr.trim() || "git submodule init failed" };
+  const todo = paths.map((p) => p);
+  const errors: string[] = [];
+  // `git clone` of a submodule does not run the fetch wrapper, so its mirror is filled through the bridge first (once per
+  // remote, however many paths share it); the bridge call retries by itself and a failure here is retried with the update
+  const mirrors = new Map<string, Promise<{ code: number; stderr: string }>>();
+  const fillMirror = (id: string) => {
+    let run = mirrors.get(id);
+    if (!run) {
+      run = withTimeout(kube.exec(pod, ["sh", "-c", 'node "$HOME/bridge.mjs" call fetch "$HOME/mirrors/$1.git" </dev/null', "sh", id]), timeoutMs + Math.min(15_000, timeoutMs), "the fetch").catch((e: Error) => ({ code: 1, stdout: "", stderr: e.message }));
+      mirrors.set(id, run);
+      void run.then((r) => r.code !== 0 && mirrors.delete(id));
+    }
+    return run;
+  };
   const checkout = async () => {
-    for (let path = todo.shift(); path !== undefined; path = todo.shift()) {
-      const r = await kube.exec(pod, ["git", "-C", cwd, "submodule", "update", "--init", "--", path]);
-      if (r.code === 0) watch.onState?.(path, "ready", 1);
-      else {
-        error ||= r.stderr.trim() || `could not check out ${path}`;
-        watch.onState?.(path, "failed", 0.7, r.stderr.trim());
+    for (let item = todo.shift(); item !== undefined; item = todo.shift()) {
+      const { path, targetId } = item;
+      let last = "";
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        watch.onState?.(path, "fetching", 0.1 * attempt, attempt > 1 ? `retrying (${attempt}/${attempts}): ${last}` : undefined);
+        const filled = await fillMirror(targetId);
+        if (filled.code !== 0) {
+          last = filled.stderr.trim().split("\n").slice(-3).join(" ") || "fetch failed";
+          if (attempt < attempts) await sleep(2_000 * 2 ** (attempt - 1));
+          continue;
+        }
+        watch.onState?.(path, "fetching", 0.7);
+        const r = await withTimeout(kube.exec(pod, ["sh", "-c", BOUNDED_UPDATE, "sh", cwd, path, String(Math.round(timeoutMs / 1000))]), timeoutMs + Math.min(15_000, timeoutMs), `git submodule update ${path}`).catch((e: Error) => ({ code: 1, stdout: "", stderr: e.message }));
+        if (r.code === 0) {
+          last = "";
+          watch.onState?.(path, "ready", 1);
+          break;
+        }
+        last = r.stderr.trim().split("\n").slice(-3).join(" ") || `could not check out ${path}`;
+        if (attempt < attempts) await sleep(2_000 * 2 ** (attempt - 1));
+      }
+      if (last) {
+        errors.push(`${path}: ${last}`);
+        watch.onState?.(path, "failed", 0.1, last);
       }
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, paths.length) }, checkout));
-  return { ok: !error, message: error };
+  return { ok: errors.length === 0, message: errors.join("; ") };
 }
 
 /** What `git submodule status` says in the pod: each submodule path and whether it is checked out; undefined when the pod cannot say. */
