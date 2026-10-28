@@ -7,14 +7,15 @@ import { OomLedger, oomResumePrompt, parsePeak } from "./oom.js";
 import { checkpointPrompt, classifyStop, ResumeGuard, resumePrompt } from "./interruption.js";
 import { parseRuntimeOptions, type RuntimeOptions } from "../shared/runtime-options.js";
 import { gitMirrorStats, mirrorGate } from "./mirror-gate.js";
-import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, serveFetchChunk, type FetchTarget } from "./mirrors.js";
+import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, refreshMirror, repoPolicy, serveFetchChunk, submoduleTargets, type FetchTarget } from "./mirrors.js";
+import { SubmoduleTracker, gitmodulesPaths, submoduleWarning } from "./submodule-status.js";
 import { applyPush, loopbackPorts, startBridge, type RunningBridge } from "./bridge.js";
 import type { KubernetesRuntimeConfig } from "./config.js";
 import { type GitRunner, runGit, scrub } from "./git.js";
 import { Semaphore } from "./coalesce.js";
 import type { Kube, PodInfo, PodProcess, SandboxInfo } from "./kube.js";
 import { INSTALLABLE_CLIS, LAUNCH_SCRIPT } from "./pod-assets.js";
-import { ensureCodexLogin, ensureCommand, ensureJq, initSubmodules, installAssets, installOpsShim, opsEnv, clearSubmoduleFailure, recordSubmoduleFailure, submoduleWait, seedDirectory, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
+import { ensureCodexLogin, ensureCommand, ensureJq, initSubmodules, podSubmodules, installAssets, installOpsShim, opsEnv, clearSubmoduleFailure, recordSubmoduleFailure, submoduleWait, seedDirectory, seedWorkspace, setupMirrors, submodulesPending, writeEnvFile } from "./pod-setup.js";
 import { waitPodReady } from "./pod-wait.js";
 import { paseoWorkspaceBusy } from "./orphans.js";
 import {
@@ -194,6 +195,10 @@ interface WorkspaceState {
   docker?: boolean;
   /** The submodule checkout running in the background, if any. */
   submodulesJob?: Promise<void>;
+  /** Submodule paths and the fetch targets serving them, from `.gitmodules` at the seeded commit. */
+  submodulePaths?: { path: string; targetId: string }[];
+  /** The daemon's cache of the submodules was started warming for this workspace. */
+  prewarmed?: boolean;
   /** When the bridge was last probed in the pod, and whether a probe is in flight. */
   lastProbe?: number;
   probing?: boolean;
@@ -684,21 +689,30 @@ export class KubernetesRuntime {
     if (ws.submodulesJob) return;
     const cwd = this.podRoot(ws);
     const notice = (message: string, level?: "info" | "warning" | "error") => ws.notice?.(message, level);
+    const tracker = this.tracker(ws.options.cwd);
     ws.submodulesJob = (async () => {
-      if (!(await submodulesPending(kube, pod, cwd))) return;
+      const state = await podSubmodules(kube, pod, cwd);
+      if (state) tracker.reset(state);
+      if (!(await submodulesPending(kube, pod, cwd))) return tracker.finish(true);
       // a fetch that failed is not tried again at every start: the pod remembers it, with a growing wait
       const wait = await submoduleWait(kube, pod, this.now());
       if (wait.ms > 0) {
+        tracker.finish(false, "an earlier fetch failed; retry with `git submodule update --init` in the pod");
         notice(`Fetching the submodules failed earlier; not trying again for ${Math.ceil(wait.ms / 60_000)} min. Run \`git submodule update --init\` in the pod to retry now.`, "warning");
         return;
       }
       notice("Fetching the submodules in the background...");
-      const r = await initSubmodules(kube, pod, cwd, ws.targets);
+      const r = await initSubmodules(kube, pod, cwd, ws.targets, 6, {
+        paths: ws.submodulePaths,
+        onState: (path, st, progress, message) => tracker.update(path, st, progress, message),
+      });
       if (r.ok) {
         await clearSubmoduleFailure(kube, pod);
+        tracker.finish(true);
         notice("Submodules are ready.");
       } else {
         await recordSubmoduleFailure(kube, pod, this.now(), wait.attempts);
+        tracker.finish(false, r.message);
         notice(`Could not fetch the submodules (run \`git submodule update --init\` in the pod to retry): ${r.message}`, "warning");
       }
     })()
@@ -706,6 +720,61 @@ export class KubernetesRuntime {
       .finally(() => {
         ws.submodulesJob = undefined;
       });
+  }
+
+  /**
+   * Warms the daemon's cache of the project's submodules (at the checkout's HEAD) while the pod is still being scheduled, so
+   * the fetches the pod asks for afterwards find the data on the daemon and only relay it. Best effort, shares the mirror gate.
+   */
+  private prewarmSubmodules(ws: WorkspaceState): void {
+    if (ws.prewarmed) return;
+    ws.prewarmed = true;
+    const { cwd } = ws.options;
+    void (async () => {
+      if (!(await this.deps.getConfig()).gitProxy.enabled) return;
+      const head = await this.git(["rev-parse", "HEAD"], { cwd });
+      const raw = await this.git(["remote", "get-url", "origin"], { cwd });
+      if (head.code !== 0 || raw.code !== 0) return;
+      const targets = (await fetchTargets(this.git, cwd, raw.stdout.trim(), [head.stdout.trim()])).filter((t) => !t.origin);
+      const started = this.now();
+      await Promise.all(targets.map((t) => refreshMirror(this.git, cwd, t).catch(() => undefined)));
+      if (targets.length) this.log(`[kubernetes-runtime] warmed the daemon cache of ${targets.length} submodule(s) of ${ws.id} in ${Math.round((this.now() - started) / 1000)} s`);
+    })().catch(() => undefined);
+  }
+
+  private readonly trackers = new Map<string, { tracker: SubmoduleTracker; token: string }>();
+
+  private tracker(cwd: string): SubmoduleTracker {
+    return this.trackerEntry(cwd).tracker;
+  }
+
+  private trackerEntry(cwd: string) {
+    let entry = this.trackers.get(cwd);
+    if (!entry) {
+      entry = { tracker: new SubmoduleTracker(this.now), token: randomBytes(16).toString("hex") };
+      this.trackers.set(cwd, entry);
+    }
+    return entry;
+  }
+
+  /** The token of the `submodules` MCP server URL of a workspace directory, and its note for the agent's system prompt (undefined when the git proxy is off or the project has no submodules). */
+  async submoduleAccess(cwd: string): Promise<{ token: string; warning: string } | undefined> {
+    if (!(await this.deps.getConfig()).gitProxy.enabled) return undefined;
+    const paths = await this.provisionalSubmodules(cwd);
+    if (paths.length === 0) return undefined;
+    return { token: this.trackerEntry(cwd).token, warning: submoduleWarning(paths) };
+  }
+
+  /** The tracker behind an MCP URL token. */
+  submoduleLookup(token: string): { tracker: SubmoduleTracker; provisional: () => Promise<string[]> } | undefined {
+    for (const [cwd, entry] of this.trackers) if (entry.token === token) return { tracker: entry.tracker, provisional: () => this.provisionalSubmodules(cwd) };
+    return undefined;
+  }
+
+  /** Submodule paths named by the daemon checkout's own `.gitmodules` at HEAD (what the pod will check out, before it has said). */
+  private async provisionalSubmodules(cwd: string): Promise<string[]> {
+    const r = await this.git(["config", "--blob", "HEAD:.gitmodules", "--get-regexp", "^submodule\\..*\\.path$"], { cwd }).catch(() => null);
+    return r?.code === 0 ? gitmodulesPaths(r.stdout) : [];
   }
 
   /** Tells git in the pod which remotes it may fetch from (origin and the submodules at HEAD and at the seed commit). */
@@ -720,8 +789,10 @@ export class KubernetesRuntime {
     const raw = await this.git(["remote", "get-url", "origin"], { cwd }).catch(() => null);
     const originUrl = raw?.code === 0 && raw.stdout.trim() ? raw.stdout.trim() : (await (this.deps.detectRepo ?? detectRepo)(cwd)).url;
     ws.targets = await fetchTargets(this.git, cwd, originUrl, all);
-    const access = (await this.deps.getConfig()).otherRepos;
-    await setupMirrors(kube, pod, this.podRoot(ws), await this.identity(cwd), ws.targets, access.enabled ? access.hosts : []);
+    const config = await this.deps.getConfig();
+    const proxy = repoPolicy(config.otherRepos, config.gitProxy);
+    await setupMirrors(kube, pod, this.podRoot(ws), await this.identity(cwd), ws.targets, proxy.access.enabled ? proxy.prefixes : []);
+    ws.submodulePaths = await submoduleTargets(this.git, cwd, originUrl, all).catch(() => []);
   }
 
   private defaultSeeder = async (cwd: string, plan: ClonePlan | null, currentBranch: string): Promise<SeedBundle> => {
@@ -747,7 +818,8 @@ export class KubernetesRuntime {
           const mirror = request.mirror;
           let targets = ws.targets;
           if (mirror?.startsWith("x:")) {
-            const target = otherRepoTarget(mirror, (await this.deps.getConfig()).otherRepos);
+            const config = await this.deps.getConfig();
+            const target = otherRepoTarget(mirror, repoPolicy(config.otherRepos, config.gitProxy).access);
             if ("refused" in target) return { ok: false, message: `kube-agents: ${target.refused}` };
             targets = [target];
           }
@@ -792,6 +864,7 @@ export class KubernetesRuntime {
     const grows = [...wanted].some((p) => !ws.ports.has(p));
 
     this.lastDemand = this.now();
+    this.prewarmSubmodules(ws);
     if (config.warmPool.enabled && config.warmPool.idleMinutes > 0) void this.maintainPool().catch(() => undefined); // somebody needs a pod: bring the pool back if it had idled out
     // Fast path: the same pod is up and everything this launch needs is already in place.
     if (ws.sandbox && ws.phase === "running" && ws.readyUid && !grows && (!need.command || ws.commands.has(need.command)) && (need.command !== "codex" || ws.commands.has(CODEX_LOGIN)) && (!ops || ws.commands.has(OPS_SHIM))) {
@@ -866,6 +939,11 @@ export class KubernetesRuntime {
       await this.seedProfileDirs(kube, ws, pod, ctx);
       await this.refreshTargets(kube, ws, pod);
       this.startSubmodules(kube, ws, pod);
+      // the submodules are provisioned from the daemon alongside the checkout: give them a moment before the agent starts
+      const waitMs = settings.gitProxy.provisionWaitSeconds * 1000;
+      if (settings.gitProxy.enabled && waitMs > 0 && ws.submodulesJob) {
+        await Promise.race([ws.submodulesJob, (this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(waitMs)]);
+      }
       if (need.command && !ws.commands.has(need.command)) {
         ctx.notice(`Checking ${need.command} in the pod...`);
         await ensureCommand(kube, pod, need.command);

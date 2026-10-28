@@ -17,6 +17,7 @@ import { LABELS_REF_ENV, LabelHandoff, withAgentLabels } from "./server/label-ha
 import { labelsOfAgent, labelsOfWorkspace, sendUnlessBusy, workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
 import { PodRegistry } from "./server/registry.js";
 import { KubernetesRuntime } from "./server/runtime.js";
+import { startSubmoduleMcp } from "./server/submodule-mcp.js";
 import { RUNTIME_ID } from "./shared/runtime-options.js";
 import type { WorkspaceRuntimeHandle, WorkspaceRuntimeRegistration } from "./server/runtime-types.js";
 
@@ -96,13 +97,39 @@ export default function contribute(server: PluginServerContext) {
     const { podOnly } = await getConfig();
     return withAgentLabels(podOnlyWorkspace(request as never, podOnly), RUNTIME_ID) as never;
   });
+  // The submodule tools (`submodule_status`, `submodule_wait`): a loopback MCP server the pods reach through the bridge's tunnel.
+  const submoduleMcp = startSubmoduleMcp({ lookup: (token) => runtime.submoduleLookup(token) }).catch((error: Error) => {
+    console.log(`[kubernetes-runtime] could not start the submodule tools: ${error.message}`);
+    return undefined;
+  });
   server.before("agent.create", async ({ request }) => {
     const { podOnly } = await getConfig();
     podOnlyAgent(request as never, podOnly);
+    let out = request;
+    // an agent in a pod workspace whose project has submodules gets the tools and a warning that they may still be fetching
+    if ((request as { runtimeId?: string | null }).runtimeId === RUNTIME_ID) {
+      try {
+        const mcp = await submoduleMcp;
+        const access = mcp ? await runtime.submoduleAccess(request.config.cwd) : undefined;
+        if (mcp && access) {
+          const config = request.config;
+          out = {
+            ...request,
+            config: {
+              ...config,
+              systemPrompt: [config.systemPrompt, access.warning].filter(Boolean).join("\n\n"),
+              mcpServers: { ...(config.mcpServers ?? {}), submodules: { type: "http", url: `http://127.0.0.1:${mcp.port}/mcp/${access.token}` } },
+            },
+          };
+        }
+      } catch (error) {
+        console.log(`[kubernetes-runtime] submodule tools not added: ${(error as Error).message}`);
+      }
+    }
     // leave the agent's labels for its session hook (see LabelHandoff); only when the daemon gives them
     const labels = (request as { labels?: Record<string, string> }).labels;
-    if (!labels || Object.keys(labels).length === 0) return;
-    return { ...request, env: { ...(request.env ?? {}), [LABELS_REF_ENV]: handoff.issue(labels) } } as never;
+    if (!labels || Object.keys(labels).length === 0) return out === request ? undefined : out;
+    return { ...out, env: { ...(out.env ?? {}), [LABELS_REF_ENV]: handoff.issue(labels) } } as never;
   });
 
   const reaper = new OrphanReaper({
@@ -149,6 +176,7 @@ export default function contribute(server: PluginServerContext) {
 
 
   return async () => {
+    (await submoduleMcp)?.close();
     await runtime.stop();
     reaper.stop();
   };

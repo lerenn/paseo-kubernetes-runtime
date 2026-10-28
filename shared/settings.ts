@@ -144,6 +144,19 @@ export const AutoArchiveSchema = z.object({
   podQuota: z.number().int().min(1).optional(),
 });
 
+/**
+ * The daemon-side git proxy for pods. Every clone, fetch and submodule update of a GitHub repository of an allowed org, in the
+ * pod, goes through the daemon's mirror bridge (its credentials, its cache, its fetch throttling) instead of reaching GitHub
+ * from the pod; the project's own submodules are provisioned the same way, whatever org they are in.
+ */
+export const GitProxySchema = z.object({
+  enabled: z.boolean().default(true),
+  /** GitHub orgs (or users) whose repositories a pod may clone and fetch through the daemon. Narrows `otherRepos` for github.com. */
+  allowOrgs: z.array(z.string().regex(/^[A-Za-z0-9_.-]+$/, "A GitHub org or user name")).default(["anyshift-io", "anyshift-engineering", "lerenn"]),
+  /** The agent's start waits at most this long for the submodules to be checked out; they keep going in the background after it. 0 = never wait. */
+  provisionWaitSeconds: z.number().int().min(0).max(600).default(30),
+});
+
 export const ConfigSchema = z.object({
   /** kubectl context. Unset uses the current context of the daemon's kubeconfig. */
   context: z.string().optional(),
@@ -239,6 +252,8 @@ export const ConfigSchema = z.object({
       allow: z.array(z.string()).default([]),
     })
     .default({ enabled: true, hosts: ["github.com"], allow: [] }),
+  /** The git proxy: allow-listed orgs for clones through the daemon, submodule provisioning and the `submodule_status`/`submodule_wait` tools. */
+  gitProxy: GitProxySchema.default(() => GitProxySchema.parse({})),
   /**
    * Pods kept running ahead of workspaces, so a new workspace starts in seconds instead of waiting for scheduling and a
    * volume (about 15 s of a 33 s start). Each costs its CPU/memory request and a volume while it waits. New workspaces
@@ -295,6 +310,7 @@ export const ConfigSchema = z.object({
 });
 
 export type KubernetesRuntimeConfig = z.infer<typeof ConfigSchema>;
+export type GitProxyConfig = z.infer<typeof GitProxySchema>;
 export type DockerConfig = z.infer<typeof DockerSchema>;
 export type AutoArchiveConfig = z.infer<typeof AutoArchiveSchema>;
 
