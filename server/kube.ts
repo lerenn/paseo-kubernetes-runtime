@@ -84,6 +84,8 @@ export interface SandboxInfo {
   createdAt?: string;
   /** The workspace container's image as the Sandbox asks for it. */
   image?: string;
+  /** The controller's Ready condition, when it has set one. */
+  ready?: { status: string; reason?: string; message?: string };
 }
 
 export interface ClaimInfo {
@@ -104,14 +106,18 @@ export function parseClaimList(json: any): ClaimInfo[] {
 }
 
 export function parseSandboxList(json: any): SandboxInfo[] {
-  return (json?.items ?? []).map((item: any) => ({
-    name: item.metadata.name,
-    labels: item.metadata.labels ?? {},
-    annotations: item.metadata.annotations ?? {},
-    operatingMode: item.spec?.operatingMode === "Suspended" ? "Suspended" : "Running",
-    createdAt: item.metadata.creationTimestamp,
-    ...(item.spec?.podTemplate?.spec?.containers?.[0]?.image ? { image: item.spec.podTemplate.spec.containers[0].image } : {}),
-  }));
+  return (json?.items ?? []).map((item: any) => {
+    const ready = (item.status?.conditions ?? []).find((c: any) => c.type === "Ready");
+    return {
+      name: item.metadata.name,
+      labels: item.metadata.labels ?? {},
+      annotations: item.metadata.annotations ?? {},
+      operatingMode: item.spec?.operatingMode === "Suspended" ? "Suspended" : "Running",
+      createdAt: item.metadata.creationTimestamp,
+      ...(item.spec?.podTemplate?.spec?.containers?.[0]?.image ? { image: item.spec.podTemplate.spec.containers[0].image } : {}),
+      ...(ready ? { ready: { status: String(ready.status), reason: ready.reason, message: ready.message } } : {}),
+    };
+  });
 }
 
 /** A pod, Service or NetworkPolicy listed by label (the Docker sandbox's objects live in a namespace of their own). */
