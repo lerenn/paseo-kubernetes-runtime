@@ -4,7 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { OomLedger, SUMMARY_EVERY_MS } from "../server/oom.js";
 import { buildPodRows } from "../server/status.js";
-import { KubernetesRuntime, liveProviderChildren } from "../server/runtime.js";
+import { KubernetesRuntime, liveProviderChildren, IDLE_BACKGROUND_GRACE_MS } from "../server/runtime.js";
 import { PodRegistry } from "../server/registry.js";
 import type { WorkspaceRuntimeRegistration } from "../server/runtime-types.js";
 import { ConfigSchema } from "../shared/settings.js";
@@ -550,6 +550,39 @@ describe("idle suspension and background work inside an agent's process", () => 
     t.advance(31 * MIN);
     await t.tick();
     expect(t.registry.list()[0]!.state).toBe("suspended");
+  });
+});
+
+describe("idle suspension skips say why, and do not hold a pod forever", () => {
+  it("logs a background-work skip once, keeps the idle clock, and suspends after the grace", async () => {
+    const logs: string[] = [];
+    const t = setup({ podIdleMinutes: 30 }, { log: (m: string) => void logs.push(m) });
+    await t.prepare();
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json\n15483  6433 S    npm run dev", stderr: "" };
+    t.advance(31 * MIN);
+    await t.tick();
+    t.advance(3 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("running");
+    expect(logs.filter((l) => /not suspended: background work: npm run dev/.test(l))).toHaveLength(1);
+    t.advance(IDLE_BACKGROUND_GRACE_MS);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("suspended");
+    expect(logs.some((l) => /suspending it anyway/.test(l))).toBe(true);
+  });
+
+  it("a pod that cannot be looked at is checked again soon, without restarting its idle clock", async () => {
+    const logs: string[] = [];
+    const t = setup({ podIdleMinutes: 30 }, { log: (m: string) => void logs.push(m) });
+    await t.prepare();
+    t.kube.execResult = { code: 1, stdout: "", stderr: "kubectl: timeout" };
+    t.advance(31 * MIN);
+    await t.tick();
+    expect(logs.some((l) => /could not look inside the pod \(kubectl: timeout\)/.test(l))).toBe(true);
+    t.kube.execResult = { code: 0, stdout: " 6433     0 Ssl  claude --output-format stream-json", stderr: "" };
+    t.advance(3 * MIN);
+    await t.tick();
+    expect(t.registry.list()[0]!.state).toBe("suspended"); // 34 min idle, not 3
   });
 });
 

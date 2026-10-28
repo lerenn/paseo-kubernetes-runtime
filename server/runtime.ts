@@ -211,6 +211,9 @@ interface WorkspaceState {
   commands: Set<string>;
   agents: Map<string, AgentActivity>;
   lastActivity: number;
+  /** The last reason an idle pod was not suspended (logged once per reason), and when to look at it again. */
+  idleSkipReason?: string;
+  idleRecheckAt?: number;
   /** The idle clock of auto-archive: the last real activity (input, a turn, an agent at work). Mirrored to the Sandbox. */
   activityAt?: number;
   /** What the Sandbox says `activityAt` was, to write it at most every ACTIVITY_PERSIST_MS. */
@@ -241,6 +244,10 @@ const CODEX_LOGIN = "codex (logged in with OPENAI_API_KEY)";
 const HOST_ICON = "ship-wheel";
 /** Kube execs of the bridge liveness probes and restores that run at once. */
 export const BRIDGE_EXEC_LIMIT = 4;
+/** An idle pod whose only activity is background work inside the agent's process is suspended this long past the idle limit. */
+export const IDLE_BACKGROUND_GRACE_MS = 60 * 60_000;
+/** How soon an idle pod that could not be checked, or had background work, is looked at again. */
+const IDLE_RECHECK_MS = 2 * 60_000;
 const BRIDGE_PROBE_JITTER_MS = 1_500;
 const DESCRIBE_TTL_MS = 2_000;
 
@@ -1334,32 +1341,66 @@ export class KubernetesRuntime {
     for (const ws of this.states.values()) {
       const busy = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
       if (ws.phase === "running" && !busy && this.now() - ws.lastActivity >= limit) {
-        if (config.idleExemptLabels.length && (await this.exemptFromIdle(config, ws))) continue;
+        if (ws.idleRecheckAt !== undefined && this.now() < ws.idleRecheckAt) continue;
+        if (config.idleExemptLabels.length && (await this.exemptFromIdle(config, ws))) {
+          this.idleSkip(ws, "exempt by label");
+          continue;
+        }
         // What this decision is based on. The checks below take a while (Paseo's answer, a look inside the pod), and a
         // prompt can arrive in the meantime: it moves `lastActivity`, and the suspend must not go ahead then.
         const decidedAt = ws.lastActivity;
+        const idleFor = this.now() - decidedAt;
         // The activity events this plugin saw are not the whole story: after a plugin reload it has seen none, and a
-        // turn that started before it keeps running. Ask Paseo; if an agent is running (or it cannot say), wait.
+        // turn that started before it keeps running. Ask Paseo; if an agent is running, that is activity.
         const running = await this.workspaceRunning(ws);
-        // An agent between turns can still be waiting on a background shell, a timer or a watch inside its process
-        // (it shows as idle); suspending would kill that work. Live children of a claude/codex process mean busy.
-        const background = running === false ? await this.hasBackgroundWork(ws).catch(() => true) : false;
-        if (running !== false || background) {
-          if (running === true || background) this.markActive(ws);
-          else ws.lastActivity = this.now(); // Paseo could not say: keep the pod, but that is not activity
+        if (running === true) {
+          this.markActive(ws);
           continue;
+        }
+        // An agent between turns can still be waiting on a background shell, a timer or a watch inside its process
+        // (it shows as idle); suspending would kill that work. Live children of a claude/codex process mean busy, for
+        // up to IDLE_BACKGROUND_GRACE_MS past the idle limit: a forgotten background process must not hold a pod forever.
+        const background = running === false ? await this.backgroundWork(ws).catch((e: Error) => ({ busy: null, detail: e.message })) : null;
+        const overdue = idleFor >= limit + IDLE_BACKGROUND_GRACE_MS;
+        if (running === null || background?.busy !== false) {
+          // A check that failed or found background work is not activity: the idle clock keeps running, and the pod is looked at again soon.
+          const why = running === null ? "Paseo could not say whether an agent runs" : background?.busy === null ? `could not look inside the pod (${clip(background.detail, 120)})` : `background work: ${clip(background!.detail, 160)}`;
+          if (!overdue || running === null) {
+            this.idleSkip(ws, why);
+            ws.idleRecheckAt = this.now() + IDLE_RECHECK_MS;
+            continue;
+          }
+          this.log(`[kubernetes-runtime] ${ws.id} (${ws.sandbox}) idle for ${Math.round(idleFor / 60_000)} min with only ${why}: suspending it anyway`);
         }
         await this.serial(ws, async () => {
           const busyNow = [...ws.agents.values()].some((a) => a.turn || a.pendingPermissions > 0);
           if (ws.phase !== "running" || ws.lastActivity !== decidedAt || busyNow) return; // someone used it since: leave it running
           // Last look before the point of no return: only an idle agent is ever suspended. A turn that started since the
-          // check above (or an answer Paseo cannot give) keeps the pod.
-          if ((await this.workspaceRunning(ws)) !== false) return void this.markActive(ws);
+          // check above keeps the pod; an answer Paseo cannot give is looked at again soon.
+          const last = await this.workspaceRunning(ws);
+          if (last === true) return void this.markActive(ws);
+          if (last === null) {
+            this.idleSkip(ws, "Paseo could not say whether an agent runs");
+            ws.idleRecheckAt = this.now() + IDLE_RECHECK_MS;
+            return;
+          }
           if (ws.phase !== "running" || ws.lastActivity !== decidedAt) return;
           await this.suspend(ws, "idle");
-        }).catch(() => undefined);
+          ws.idleSkipReason = undefined;
+          ws.idleRecheckAt = undefined;
+        }).catch((e: Error) => {
+          this.idleSkip(ws, `suspend failed: ${clip(e.message, 160)}`);
+          ws.idleRecheckAt = this.now() + IDLE_RECHECK_MS;
+        });
       }
     }
+  }
+
+  /** Logs why an idle pod is not suspended, once per reason (human request 2026-10-28: skips must say why). */
+  private idleSkip(ws: WorkspaceState, reason: string): void {
+    if (ws.idleSkipReason === reason) return;
+    ws.idleSkipReason = reason;
+    this.log(`[kubernetes-runtime] ${ws.id} (${ws.sandbox}) idle for ${Math.round((this.now() - ws.lastActivity) / 60_000)} min, not suspended: ${reason}`);
   }
 
   // ---- auto-archive -------------------------------------------------------------------------------------------
@@ -1708,12 +1749,20 @@ export class KubernetesRuntime {
   }
 
   /** Whether a provider process in the pod has live child processes (background shells and timers of an idle agent). */
+  /** Whether the provider process has live children in the pod; true when it cannot tell (keep the pod). */
   private async hasBackgroundWork(ws: WorkspaceState): Promise<boolean> {
-    if (!ws.sandbox) return false;
+    const r = await this.backgroundWork(ws);
+    return r.busy !== false;
+  }
+
+  /** Live children of the provider process in the pod (what they run), or null `busy` when the pod could not be looked at. */
+  private async backgroundWork(ws: WorkspaceState): Promise<{ busy: boolean | null; detail: string }> {
+    if (!ws.sandbox) return { busy: false, detail: "" };
     const config = await this.deps.getConfig();
     const r = await this.deps.kubeFor(config).exec(ws.sandbox, ["ps", "-eo", "pid=,ppid=,stat=,args="]);
-    if (r.code !== 0) return true; // cannot tell: keep the pod
-    return liveProviderChildren(r.stdout);
+    if (r.code !== 0) return { busy: null, detail: clip(r.stderr.trim() || `ps exited with ${r.code}`, 160) };
+    const children = providerChildren(r.stdout);
+    return { busy: children.length > 0, detail: children.slice(0, 3).join("; ") };
   }
 
   /** Pods that run ahead of any workspace, oldest first. */
@@ -2142,22 +2191,31 @@ function slugFor(cwd: string): string {
  * True when a `claude` or `codex` process listed by `ps -eo pid=,ppid=,stat=,args=` has a living (not zombie)
  * descendant: its agent is running background work even if Paseo shows it idle.
  */
+const clip = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
+
 export function liveProviderChildren(psOutput: string): boolean {
+  return providerChildren(psOutput).length > 0;
+}
+
+/** The commands of the live (not zombie) descendants of a claude/codex process in `ps -eo pid=,ppid=,stat=,args=` output. */
+export function providerChildren(psOutput: string): string[] {
   const rows = psOutput
     .split("\n")
     .map((line) => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line))
     .filter((m): m is RegExpExecArray => m !== null)
     .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), stat: m[3]!, args: m[4]! }));
   const provider = new Set(rows.filter((r) => /^(claude|codex)(\s|$)/.test(r.args)).map((r) => r.pid));
-  if (provider.size === 0) return false;
+  if (provider.size === 0) return [];
   const byPid = new Map(rows.map((r) => [r.pid, r]));
-  return rows.some((r) => {
-    if (r.stat.startsWith("Z") || provider.has(r.pid)) return false;
-    for (let at = byPid.get(r.ppid), hops = 0; at && hops < 20; at = byPid.get(at.ppid), hops++) {
-      if (provider.has(at.pid)) return true;
-    }
-    return false;
-  });
+  return rows
+    .filter((r) => {
+      if (r.stat.startsWith("Z") || provider.has(r.pid)) return false;
+      for (let at = byPid.get(r.ppid), hops = 0; at && hops < 20; at = byPid.get(at.ppid), hops++) {
+        if (provider.has(at.pid)) return true;
+      }
+      return false;
+    })
+    .map((r) => r.args);
 }
 
 /** Which options `paseo workspace archive` has: `--reason` and `--if-idle` come with the fork's change. Read from its help. */
