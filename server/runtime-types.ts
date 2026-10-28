@@ -132,6 +132,19 @@ export interface WorkspaceRuntimeExit {
   message?: string;
 }
 
+/** Why a runtime stops an agent's process on purpose (the fork's `WorkspaceRuntimeHandle`). */
+export type WorkspaceRuntimeSuspendReason = "idle" | "quota-eviction" | "manual" | "node-removal";
+
+/**
+ * Returned by `registerWorkspaceRuntime` on a Paseo that has suspended agents. Report a planned stop before the
+ * process stops, so the exit that follows is no error: the agent shows as suspended and its timeline gets `message`.
+ * A Paseo without it returns nothing.
+ */
+export interface WorkspaceRuntimeHandle {
+  reportSuspended(report: { workspaceId: string; agentId?: string; reason: WorkspaceRuntimeSuspendReason; message?: string }): void;
+  reportResumed(report: { workspaceId: string; agentId?: string }): void;
+}
+
 export interface WorkspaceRuntimeProcess {
   stdin: Writable;
   stdout: Readable;

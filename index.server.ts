@@ -18,7 +18,7 @@ import { labelsOfAgent, labelsOfWorkspace, sendUnlessBusy, workspaceAgentsBusy, 
 import { PodRegistry } from "./server/registry.js";
 import { KubernetesRuntime } from "./server/runtime.js";
 import { RUNTIME_ID } from "./shared/runtime-options.js";
-import type { WorkspaceRuntimeRegistration } from "./server/runtime-types.js";
+import type { WorkspaceRuntimeHandle, WorkspaceRuntimeRegistration } from "./server/runtime-types.js";
 
 export default function contribute(server: PluginServerContext) {
   // Before the settings are read: bring over what the plugin kept under its former id, `kube-agents`.
@@ -64,9 +64,10 @@ export default function contribute(server: PluginServerContext) {
     },
   });
   // The workspace runtime API is in Paseo's fork; on a Paseo without it the plugin still loads (settings, credentials) and says why it does nothing.
-  const registerRuntime = (server as unknown as { registerWorkspaceRuntime?: (r: WorkspaceRuntimeRegistration) => void }).registerWorkspaceRuntime;
+  const registerRuntime = (server as unknown as { registerWorkspaceRuntime?: (r: WorkspaceRuntimeRegistration) => WorkspaceRuntimeHandle | void }).registerWorkspaceRuntime;
   if (typeof registerRuntime === "function") {
-    registerRuntime.call(server, runtime.registration());
+    // A Paseo with suspended agents returns a handle to report planned stops through; an older one returns nothing.
+    runtime.attachHandle(registerRuntime.call(server, runtime.registration()) ?? undefined);
     void runtime.start();
   } else {
     console.log("[kubernetes-runtime] this Paseo has no workspace runtimes; update Paseo to run workspaces in pods");

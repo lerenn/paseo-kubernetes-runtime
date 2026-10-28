@@ -17,6 +17,16 @@ describe("classifyStop", () => {
     expect(classifyStop(pod({ oomKilled: true }), "u1").why).toContain("memory");
     expect(classifyStop(pod(), undefined).kind).toBe("failed"); // no known uid to compare with: the pod is healthy
   });
+
+  it("names the cause of an interruption in Paseo's terms, and leaves an out-of-memory kill a failure", () => {
+    expect(classifyStop(pod({ evicted: true, ready: false }), "u1")).toMatchObject({ kind: "interrupted", cause: "quota-eviction" });
+    expect(classifyStop(pod({ disrupted: "PreemptionByScheduler" }), "u1")).toMatchObject({ kind: "interrupted", cause: "quota-eviction" });
+    expect(classifyStop(pod({ disrupted: "DeletionByKarpenter" }), "u1")).toMatchObject({ kind: "interrupted", cause: "node-removal" });
+    expect(classifyStop(pod({ terminating: true }), "u1")).toMatchObject({ kind: "interrupted", cause: "node-removal" });
+    expect(classifyStop(null, "u1")).toMatchObject({ kind: "interrupted", cause: "node-removal" });
+    expect(classifyStop(pod({ oomKilled: true }), "u1")).toMatchObject({ kind: "failed" });
+    expect(classifyStop(pod({ oomKilled: true }), "u1").cause).toBeUndefined();
+  });
 });
 
 describe("ResumeGuard", () => {

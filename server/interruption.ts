@@ -4,8 +4,13 @@ import type { PodInfo } from "./kube.js";
 
 export type StopKind = "interrupted" | "failed";
 
+/** Why the platform took a pod away, as Paseo's suspend reasons name it. */
+export type InterruptionCause = "quota-eviction" | "node-removal";
+
 export interface Stop {
   kind: StopKind;
+  /** Set for `interrupted`: an eviction under resource pressure, or the node going away (Karpenter, a drain, a Spot reclaim, a node loss). */
+  cause?: InterruptionCause;
   /** For people: why the pod is thought to be taken away or why it was not. */
   why: string;
 }
@@ -17,11 +22,15 @@ export interface Stop {
  * a healthy pod means the process itself died (an out-of-memory kill is said so).
  */
 export function classifyStop(info: PodInfo | null, knownUid: string | undefined): Stop {
-  if (!info) return { kind: "interrupted", why: "the pod is gone" };
-  if (knownUid && info.uid && info.uid !== knownUid) return { kind: "interrupted", why: "the pod was replaced" };
-  if (info.disrupted) return { kind: "interrupted", why: `the pod is being disrupted (${info.disrupted})` };
-  if (info.terminating) return { kind: "interrupted", why: "the pod is being deleted" };
-  if (!info.ready) return { kind: "interrupted", why: info.problem ?? "the pod is not ready" };
+  if (!info) return { kind: "interrupted", cause: "node-removal", why: "the pod is gone" };
+  if (info.evicted) return { kind: "interrupted", cause: "quota-eviction", why: "the pod was evicted" };
+  // A pod the scheduler preempted gave its place to another one: resource pressure, like an eviction.
+  if (info.disrupted === "PreemptionByScheduler") return { kind: "interrupted", cause: "quota-eviction", why: `the pod is being disrupted (${info.disrupted})` };
+  if (knownUid && info.uid && info.uid !== knownUid) return { kind: "interrupted", cause: "node-removal", why: "the pod was replaced" };
+  if (info.disrupted) return { kind: "interrupted", cause: "node-removal", why: `the pod is being disrupted (${info.disrupted})` };
+  if (info.terminating) return { kind: "interrupted", cause: "node-removal", why: "the pod is being deleted" };
+  if (!info.ready) return { kind: "interrupted", cause: "node-removal", why: info.problem ?? "the pod is not ready" };
+  // A kill for memory is the process's own failure: it stays an error.
   if (info.oomKilled) return { kind: "failed", why: "the process ran out of memory" };
   return { kind: "failed", why: "the pod is healthy" };
 }
