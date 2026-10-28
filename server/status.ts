@@ -22,9 +22,10 @@ export interface AgentSummary {
 /** The agents Paseo has (not archived), for the Agents column and the busy check. Null when unreadable. */
 export async function paseoAgents(
   exec: (file: string, args: string[], options: { timeout: number }) => Promise<{ stdout: string }> = execFileAsync as never,
+  timeoutMs = 20_000,
 ): Promise<AgentSummary[] | null> {
   try {
-    const { stdout } = await exec("paseo", ["agent", "ls", "--json", "--global", "--background"], { timeout: 20_000 });
+    const { stdout } = await exec("paseo", ["agent", "ls", "--json", "--global", "--background"], { timeout: timeoutMs });
     const list = JSON.parse(stdout) as { id?: string; name?: string; status?: string; cwd?: string }[];
     if (!Array.isArray(list)) return null;
     return list.filter((a) => a.id).map((a) => ({ id: a.id!, title: a.name || a.id!.slice(0, 8), status: a.status ?? "", cwd: a.cwd ?? "" }));
@@ -113,6 +114,21 @@ export function buildPodRows(input: StatusInputs): PodRow[] {
   return rows.sort((a, b) => a.title.localeCompare(b.title));
 }
 
+/** What the cluster says about this daemon's sandboxes, claims and pods. */
+export interface ClusterRead {
+  sandboxes: SandboxInfo[];
+  claims: ClaimInfo[];
+  pods: Map<string, PodInfo | null>;
+}
+
+export async function readCluster(kube: Kube, daemonId: string): Promise<ClusterRead> {
+  const sandboxes = await kube.listSandboxes(`${DAEMON_LABEL}=${daemonId}`);
+  const claims = await kube.listClaims(`${DAEMON_LABEL}=${daemonId}`);
+  const pods = new Map<string, PodInfo | null>();
+  await Promise.all(sandboxes.map(async (s) => pods.set(s.name, await kube.podInfo(s.name).catch(() => null))));
+  return { sandboxes, claims, pods };
+}
+
 /** Reads the cluster for the table. */
 export async function readPodRows(
   kube: Kube,
@@ -124,9 +140,5 @@ export async function readPodRows(
   docker?: ReadonlyMap<string, DockerStatus>,
 ): Promise<PodRow[]> {
   if (!daemonId) return [];
-  const sandboxes = await kube.listSandboxes(`${DAEMON_LABEL}=${daemonId}`);
-  const claims = await kube.listClaims(`${DAEMON_LABEL}=${daemonId}`);
-  const pods = new Map<string, PodInfo | null>();
-  await Promise.all(sandboxes.map(async (s) => pods.set(s.name, await kube.podInfo(s.name).catch(() => null))));
-  return buildPodRows({ sandboxes, claims, pods, entries, titles, agents, oom, docker });
+  return buildPodRows({ ...(await readCluster(kube, daemonId)), entries, titles, agents, oom, docker });
 }

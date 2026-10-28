@@ -69,7 +69,15 @@ export type AutoArchiveStatus = z.infer<typeof AutoArchiveSchema>;
 export const kubeStatus = defineRpc({
   name: "kube.status",
   input: z.object({}),
-  output: z.object({ reaper: ReaperSchema, pods: z.array(PodRowSchema), autoArchive: AutoArchiveSchema.optional() }),
+  output: z.object({
+    reaper: ReaperSchema,
+    pods: z.array(PodRowSchema),
+    autoArchive: AutoArchiveSchema.optional(),
+    /** True when this is an earlier snapshot, served because a refresh is running or slow (never set on a fresh one). */
+    stale: z.boolean().optional(),
+    /** Age of the snapshot in milliseconds. */
+    ageMs: z.number().optional(),
+  }),
 });
 
 /** Keep a workspace from being auto-archived (or let it be again). */
