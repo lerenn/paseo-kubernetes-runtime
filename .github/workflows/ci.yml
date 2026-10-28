@@ -5,9 +5,10 @@ on:
   pull_request:
 jobs:
   ci:
-    # Self-hosted ci-1 runner when the repository variable USE_SELF_HOSTED is 'true', GitHub-hosted otherwise
-    # (the failover; also the default until a runner is registered for this repository).
-    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && fromJSON('["self-hosted","linux","x64","docker"]') || 'ubuntu-latest' }}
+    # Same variable and ci-1 labels as the anyshift-io workflows. Until a ci-1 runner is registered on this
+    # user-owned repository, the default is GitHub-hosted: set USE_GITHUB_HOSTED to 'false' to use ci-1.
+    # Once a runner exists, switch to the org expression (USE_GITHUB_HOSTED == 'true' && 'ubuntu-latest' || self-hosted).
+    runs-on: ${{ vars.USE_GITHUB_HOSTED == 'false' && fromJSON('["self-hosted","linux","x64","docker"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dagger/dagger-for-github@v7
