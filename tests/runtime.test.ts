@@ -768,6 +768,54 @@ describe("reporting a planned stop to Paseo", () => {
     expect(h.calls.some((c) => c.startsWith("suspended:wks_1:manual:"))).toBe(true);
   });
 
+  it("reports a pod found suspended when the plugin starts, again soon after, then rarely", async () => {
+    const t = setup();
+    const h = handle();
+    t.runtime.attachHandle(h);
+    t.kube.sandboxes = [{ name: "pka-old", labels: { "paseo.sh/daemon": "srv_ME", "paseo.sh/workspace-id": "wks_1" }, annotations: { "paseo.sh/cwd": CWD }, operatingMode: "Suspended", image: "img", createdAt: new Date(0).toISOString() }];
+    await t.runtime.start();
+    await t.runtime.reconcileSuspensions();
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0]).toMatch(/^suspended:wks_1:idle:/);
+    t.advance(3 * MIN);
+    await t.runtime.reconcileSuspensions();
+    expect(h.calls).toHaveLength(2);
+    t.advance(3 * MIN);
+    await t.runtime.reconcileSuspensions();
+    expect(h.calls).toHaveLength(2);
+    t.advance(31 * MIN);
+    await t.runtime.reconcileSuspensions();
+    expect(h.calls).toHaveLength(3);
+  });
+
+  it("does not report a running pod, and stops once the workspace is resumed", async () => {
+    const t = setup();
+    const h = handle();
+    t.runtime.attachHandle(h);
+    await t.prepare();
+    h.calls.length = 0;
+    await t.runtime.reconcileSuspensions();
+    expect(h.calls).toEqual([]);
+    await t.runtime.podAction("wks_1", "suspend");
+    await t.runtime.podAction("wks_1", "resume");
+    h.calls.length = 0;
+    t.advance(40 * MIN);
+    await t.runtime.reconcileSuspensions();
+    expect(h.calls).toEqual([]);
+  });
+
+  it("reports the suspended state when a pod fails to start", async () => {
+    const t = setup();
+    const h = handle();
+    t.runtime.attachHandle(h);
+    await t.prepare();
+    await t.runtime.podAction("wks_1", "suspend");
+    h.calls.length = 0;
+    t.kube.pods = [{ uid: "never", ready: false, terminating: false }];
+    await expect(t.prepare()).rejects.toThrow(/could not start the pod/);
+    expect(h.calls.some((c) => c.startsWith("suspended:wks_1:idle:The pod could not start"))).toBe(true);
+  });
+
   it("still suspends on a Paseo that gives no handle", async () => {
     const t = setup({ podIdleMinutes: 30 });
     t.runtime.attachHandle(undefined);
