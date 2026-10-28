@@ -80,6 +80,7 @@ import {
   suspendPatch,
   workspaceClaimName,
 } from "./sandbox.js";
+import { kubeCallStats } from "./kube-cache.js";
 import { createSeed, releaseSeed, seedBundle, type Seed } from "./seed.js";
 import { clonePlan, detectRepo, repoName, type ClonePlan, type RepoRef } from "./workspace.js";
 
@@ -327,6 +328,7 @@ export class KubernetesRuntime {
       void this.checkAutoArchive().catch((e: Error) => this.log(`[kubernetes-runtime] auto-archive check failed: ${e.message}`));
       this.checkBridges();
       this.logProbeStats();
+      this.logKubeStats();
     }, 60_000);
     await this.adopt().catch(() => undefined);
     void this.maintainPool().catch(() => undefined);
@@ -464,6 +466,12 @@ export class KubernetesRuntime {
     const peak = this.bridgeExecs.takePeak();
     if (!s.probes && !s.restores) return;
     this.log(`[kubernetes-runtime] bridge probes last minute: ${s.probes} (down ${s.down}, errors ${s.errors}), latency avg ${s.probes ? Math.round(s.totalMs / s.probes) : 0} ms max ${s.maxMs} ms, restores ${s.restores}, kube execs at once ${peak}/${BRIDGE_EXEC_LIMIT}`);
+  }
+
+  /** One line a minute: how many kubectl processes the plugin started and how many reads the pod snapshot answered. Silent when nothing ran. */
+  logKubeStats(): void {
+    const line = kubeCallStats.take();
+    if (line) this.log(line);
   }
 
   /** Liveness: a running workspace gets its bridge restored when the channel is gone, or when it looks open but the bridge in the pod does not answer (probed at most once a minute). */
@@ -1548,7 +1556,7 @@ export class KubernetesRuntime {
   /** Pods that run ahead of any workspace, oldest first. */
   private async warmPods(kube: Kube, config: KubernetesRuntimeConfig): Promise<SandboxInfo[]> {
     if (!this.deps.daemonId) return [];
-    const all = await kube.listSandboxes(`${DAEMON_LABEL}=${this.deps.daemonId},${STATE_LABEL}=${WARM_STATE}`);
+    const all = await kube.listSandboxes(`${DAEMON_LABEL}=${this.deps.daemonId},${STATE_LABEL}=${WARM_STATE}`, { maxAgeMs: 0 });
     return all.sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? ""));
   }
 
@@ -1561,7 +1569,7 @@ export class KubernetesRuntime {
     const run = this.claims.then(async () => {
       for (const warm of await this.warmPods(kube, config)) {
         if (warm.image !== config.image || warm.operatingMode !== "Running") continue;
-        const info = await kube.podInfo(warm.name).catch(() => null);
+        const info = await kube.podInfo(warm.name, { maxAgeMs: 0 }).catch(() => null);
         if (!info?.ready || info.terminating) continue;
         const meta = this.meta(ws, "running");
         await kube.patchSandbox(warm.name, claimPatch(ws.id, ws.options.cwd, meta, config));

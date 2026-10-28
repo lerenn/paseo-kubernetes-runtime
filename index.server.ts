@@ -9,7 +9,7 @@ import { paseoAgents, readCluster } from "./server/status.js";
 import { PodRowsService } from "./server/status-service.js";
 import { readDaemonId } from "./server/daemon.js";
 import { readStatus, removeCredential, setCredential } from "./server/credentials.js";
-import { Kubectl } from "./server/kube.js";
+import { sharedKube } from "./server/kube-cache.js";
 import { migrateLegacyData } from "./server/migrate.js";
 import { OrphanReaper } from "./server/orphans.js";
 import { podOnlyAgent, podOnlyWorkspace } from "./server/pod-only.js";
@@ -35,7 +35,8 @@ export default function contribute(server: PluginServerContext) {
     if (state.status !== "ready") throw new Error(`Kubernetes Runtime settings are invalid: ${state.error}`);
     return ConfigSchema.parse(state.values);
   };
-  const kubeFor = (c: { context?: string; namespace: string }) => new Kubectl({ context: c.context, namespace: c.namespace });
+  // One CachedKube per namespace, so every caller shares its pod snapshot (see kube-cache.ts)
+  const kubeFor = (c: { context?: string; namespace: string }) => sharedKube(c);
   const registry = new PodRegistry();
   const daemonId = readDaemonId();
 

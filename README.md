@@ -91,6 +91,15 @@ kubectl -n paseo-agents get pods -L paseo.sh/workspace,paseo.sh/agent,paseo.sh/s
 `paseo.sh/workspace-id` and `paseo.sh/daemon` are what the orphan reconciler goes by. Updating the labels of an
 existing pod and claim needs `patch` on them in the daemon's Role; without it only the Sandbox's labels stay current.
 
+## How the plugin reads the cluster
+
+Pod and Sandbox state is read from one shared snapshot per namespace (`kubectl get pod,sandbox -o json`, `server/kube-cache.ts`)
+instead of a `kubectl get pod <name>` per workspace. Concurrent readers share the call in flight, a snapshot is reused for
+5 s (`SNAPSHOT_TTL_MS`), and every write the plugin makes (apply, patch, label, annotate, delete) drops it. Waiting for a pod to
+become ready reads at most 1 s old; the warm-pool claim and the orphan reaper take a snapshot of their own before they act.
+Execs, volume-claim lists and writes still run `kubectl` directly. The log has one line a minute:
+`kube calls last minute: N spawns (snapshots S, direct D), cache hits H, latency avg/max`.
+
 ## Warm pool (off by default)
 
 With "Warm pool" on, the plugin keeps `size` pods (1 to 5) running ahead of any workspace, with the image, placement and a

@@ -67,6 +67,9 @@ export function quotaFailure(block: QuotaBlock): string {
   return `namespace quota '${block.quota}' exceeded (${usage})`;
 }
 
+/** Waiting for readiness reads a snapshot no older than this, whatever the cache TTL is. */
+const POD_WAIT_MAX_AGE_MS = 1_000;
+
 const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -79,7 +82,7 @@ export async function waitPodReady(kube: Kube, name: string, options: WaitOption
   let lastProblem: string | undefined;
   let quota: QuotaBlock | undefined;
   for (;;) {
-    const info = await kube.podInfo(name).catch(() => null);
+    const info = await kube.podInfo(name, { maxAgeMs: POD_WAIT_MAX_AGE_MS }).catch(() => null);
     if (info?.ready && !info.terminating) return info;
     if (!info) {
       // no pod: the controller may be refused by the namespace quota, which it retries by itself

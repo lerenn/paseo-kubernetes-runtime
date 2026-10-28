@@ -7,6 +7,9 @@ import { AGENT_LABEL, DAEMON_LABEL, MANAGED_BY, MANAGED_BY_LABEL, WORKSPACE_ID_L
 
 const execFileAsync = promisify(execFile);
 
+/** The reaper deletes on what it reads: it takes a snapshot of its own rather than one up to a few seconds old. */
+const FRESH = { maxAgeMs: 0 };
+
 export type AgentState = "alive" | "gone" | "unknown";
 
 type Exec = (file: string, args: string[], options: { timeout: number }) => Promise<{ stdout: string; stderr?: string }>;
@@ -162,7 +165,7 @@ export class OrphanReaper {
       const kube = this.deps.kubeFor(config);
       let removed = 0;
 
-      const mine = await kube.listSandboxes(`${DAEMON_LABEL}=${daemonId}`);
+      const mine = await kube.listSandboxes(`${DAEMON_LABEL}=${daemonId}`, FRESH);
       const workspaceKey = (s: { labels: Record<string, string> }) =>
         s.labels[WORKSPACE_ID_LABEL] ?? (s.labels[WORKSPACE_LABEL]?.startsWith("wks_") ? s.labels[WORKSPACE_LABEL] : undefined);
       let names: Map<string, string> | null = null;
@@ -195,7 +198,7 @@ export class OrphanReaper {
       }
 
       // A claim outlives its sandbox only if garbage collection lags; delete it when its sandbox is gone.
-      const live = new Set((await kube.listSandboxes(`${DAEMON_LABEL}=${daemonId}`)).map((s) => s.name));
+      const live = new Set((await kube.listSandboxes(`${DAEMON_LABEL}=${daemonId}`, FRESH)).map((s) => s.name));
       for (const claim of await kube.listClaims(`${DAEMON_LABEL}=${daemonId}`)) {
         const owner = claim.name.replace(/^workspace-/, "");
         if (live.has(owner) || now() - created(claim.createdAt) < grace) continue;
@@ -208,7 +211,7 @@ export class OrphanReaper {
       const unlabelledGrace = this.deps.unlabelledGraceMs ?? 15 * 60_000;
       const active = this.deps.activeSandboxes?.() ?? new Set<string>();
       const left: string[] = [];
-      for (const sandbox of (await kube.listSandboxes(`${MANAGED_BY_LABEL}=${MANAGED_BY}`)).filter((s) => !s.labels[DAEMON_LABEL])) {
+      for (const sandbox of (await kube.listSandboxes(`${MANAGED_BY_LABEL}=${MANAGED_BY}`, FRESH)).filter((s) => !s.labels[DAEMON_LABEL])) {
         const sweepable = config.sweepUnlabelled && sandbox.name.startsWith("pka-") && !active.has(sandbox.name) && now() - created(sandbox.createdAt) >= unlabelledGrace;
         if (!sweepable) {
           left.push(sandbox.name);
@@ -220,7 +223,7 @@ export class OrphanReaper {
         removed++;
       }
       if (config.sweepUnlabelled) {
-        const sandboxNames = new Set((await kube.listSandboxes(`${MANAGED_BY_LABEL}=${MANAGED_BY}`)).map((s) => s.name));
+        const sandboxNames = new Set((await kube.listSandboxes(`${MANAGED_BY_LABEL}=${MANAGED_BY}`, FRESH)).map((s) => s.name));
         for (const claim of await kube.listClaims()) {
           if (claim.labels[DAEMON_LABEL] || !claim.name.startsWith("workspace-pka-")) continue;
           if (sandboxNames.has(claim.name.replace(/^workspace-/, "")) || now() - created(claim.createdAt) < unlabelledGrace) continue;

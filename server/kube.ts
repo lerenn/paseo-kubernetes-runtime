@@ -140,6 +140,23 @@ export function parseObjectList(json: any, kind: ListableKind): ObjectInfo[] {
   }));
 }
 
+/** Every pod and Sandbox of a namespace, as one `kubectl get pod,sandbox -o json` returns them. */
+export interface NamespaceRead {
+  pods: ObjectInfo[];
+  sandboxes: SandboxInfo[];
+}
+
+export function parseNamespaceRead(json: any): NamespaceRead {
+  const items: any[] = json?.items ?? [];
+  const ofKind = (kind: string) => items.filter((i) => String(i?.kind ?? "").toLowerCase() === kind);
+  return { pods: parseObjectList({ items: ofKind("pod") }, "pod"), sandboxes: parseSandboxList({ items: ofKind("sandbox") }) };
+}
+
+/** How fresh an answer must be: a cached snapshot no older than this is good enough (default: the cache's own TTL). */
+export interface FreshnessOptions {
+  maxAgeMs?: number;
+}
+
 export interface ExecResult {
   code: number;
   stdout: string;
@@ -150,7 +167,7 @@ export interface ExecResult {
 export interface Kube {
   apply(manifest: Record<string, unknown>): Promise<void>;
   /** Current state of a pod, or null when it does not exist (yet). */
-  podInfo(name: string): Promise<PodInfo | null>;
+  podInfo(name: string, options?: FreshnessOptions): Promise<PodInfo | null>;
   exec(pod: string, argv: string[]): Promise<ExecResult>;
   /** Merge-patches a Sandbox (suspend, resume, claim from the pool). */
   patchSandbox(name: string, patch: Record<string, unknown>): Promise<void>;
@@ -159,9 +176,9 @@ export interface Kube {
   /** Sets and removes annotations on a pod (`kubectl annotate --overwrite`, `key-`); removing a missing one is fine. */
   annotatePod(name: string, set: Record<string, string>, remove?: string[]): Promise<void>;
   /** Sandboxes matching a label selector. */
-  listSandboxes(selector: string): Promise<SandboxInfo[]>;
+  listSandboxes(selector: string, options?: FreshnessOptions): Promise<SandboxInfo[]>;
   /** Pods, Services or NetworkPolicies matching a label selector. */
-  listObjects(kind: ListableKind, selector: string): Promise<ObjectInfo[]>;
+  listObjects(kind: ListableKind, selector: string, options?: FreshnessOptions): Promise<ObjectInfo[]>;
   /** Volume claims matching a label selector (all claims in the namespace when omitted). */
   listClaims(selector?: string): Promise<ClaimInfo[]>;
   /** Runs a command in the pod with `input` on its stdin (used to copy files in over the Kubernetes API). */
@@ -349,6 +366,12 @@ export class Kubectl implements Kube {
   async annotatePod(name: string, set: Record<string, string>, remove: string[] = []): Promise<void> {
     const args = [...Object.entries(set).map(([k, v]) => `${k}=${v}`), ...remove.map((k) => `${k}-`)];
     if (args.length) await this.ok(["annotate", "pod", name, "--overwrite", ...args]);
+  }
+
+  /** All pods and Sandboxes of the namespace in one call (what CachedKube shares between its callers). */
+  async readNamespace(): Promise<NamespaceRead> {
+    const result = await this.ok(["get", "pod,sandbox", "-o", "json"]);
+    return parseNamespaceRead(JSON.parse(result.stdout));
   }
 
   async listSandboxes(selector: string): Promise<SandboxInfo[]> {
