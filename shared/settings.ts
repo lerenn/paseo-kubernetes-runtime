@@ -45,7 +45,7 @@ export const ExtraSecretSchema = z.object({
 
 export const ProfileSchema = z.object({
   /** The workspace gets a per-workspace Docker sandbox (see `docker` in the settings): a privileged dind pod on its own node. */
-  docker: z.boolean().optional(),
+  docker: z.union([z.boolean(), z.enum(["sandbox", "sidecar"])]).optional(),
   /** Secret keys exposed as environment variables on pods of this profile only (e.g. OPENAI_API_KEY for a codex profile). */
   extraSecrets: z.array(ExtraSecretSchema).optional(),
   /** Copied into the volume the first time the workspace starts; a marker on the volume keeps it from being copied again. */
@@ -66,6 +66,22 @@ export const ProfileSchema = z.object({
       limits: z.record(z.string(), z.string()).optional(),
     })
     .optional(),
+});
+
+/**
+ * The privileged dind sidecar container (`dockerd`) a workspace pod gets in `sidecar` Docker mode. A privileged container is
+ * root on the node: the isolation risk is accepted explicitly (see the README).
+ */
+export const DockerSidecarSchema = z.object({
+  /** The dind image; the Docker sandbox's `docker.image` when absent. */
+  image: z.string().min(1).optional(),
+  /** Tiny requests (it does not change the pod's own), a memory limit and an ephemeral-storage limit so a build cannot fill the node's disk. */
+  resources: z
+    .object({
+      requests: z.record(z.string(), z.string()).default({ cpu: "10m", memory: "64Mi" }),
+      limits: z.record(z.string(), z.string()).default({ memory: "8Gi", "ephemeral-storage": "20Gi" }),
+    })
+    .default(() => ({ requests: { cpu: "10m", memory: "64Mi" }, limits: { memory: "8Gi", "ephemeral-storage": "20Gi" } })),
 });
 
 /** The per-workspace Docker sandbox: a privileged `docker:dind` pod on a dedicated node, for workspaces whose profile has `docker: true`. */
@@ -201,6 +217,10 @@ export const ConfigSchema = z.object({
   storage: StorageSchema.default({ mode: "persistent", size: "10Gi" }),
   /** Settings of the Docker sandbox that profiles with `docker: true` get. */
   docker: DockerSchema.default(() => DockerSchema.parse({})),
+  /** The Docker mode of a workspace whose profile does not say (and of one with no profile): none, a privileged dind sidecar in its pod, or the separate Docker sandbox pod. */
+  dockerDefault: z.enum(["off", "sidecar", "sandbox"]).default("off"),
+  /** Settings of the dind sidecar container (mode `sidecar`). */
+  dockerSidecar: DockerSidecarSchema.default(() => DockerSidecarSchema.parse({})),
   /**
    * Also delete this plugin's sandboxes that carry no daemon label (made before labelling existed) and match no
    * agent of this daemon, after 15 minutes. Turn off where several daemons share one namespace.
@@ -294,9 +314,19 @@ export function projectProfileFor(projectProfiles: Record<string, string>, dir: 
   return best;
 }
 
-/** Whether a workspace's profile asks for a Docker sandbox. */
+export type DockerMode = "off" | "sidecar" | "sandbox";
+
+/** A workspace's Docker mode: its profile's `docker` (`true` is `sandbox`) when set, else `dockerDefault`; workspaces without a profile get the default. */
+export function dockerMode(config: KubernetesRuntimeConfig, profile: string | undefined): DockerMode {
+  const d = profile ? config.profiles[profile]?.docker : undefined;
+  if (d === undefined) return config.dockerDefault;
+  if (d === true || d === "sandbox") return "sandbox";
+  return d === "sidecar" ? "sidecar" : "off";
+}
+
+/** Whether a workspace gets the separate Docker sandbox pod (mode `sandbox`). */
 export function dockerEnabled(config: KubernetesRuntimeConfig, profile: string | undefined): boolean {
-  return Boolean(profile && config.profiles[profile]?.docker);
+  return dockerMode(config, profile) === "sandbox";
 }
 
 /** The configuration a workspace runs with: the settings, with its profile's image, storage and resources applied. */

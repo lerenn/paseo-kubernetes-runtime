@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
-import { applyProfile, dockerEnabled, projectProfileFor } from "../shared/settings.js";
+import { applyProfile, dockerMode, projectProfileFor } from "../shared/settings.js";
+import { waitDockerSidecar } from "./docker-sidecar.js";
 import { DockerSandboxes, type DockerStatus } from "./docker-sandbox.js";
 import { OomLedger, oomResumePrompt, parsePeak } from "./oom.js";
 import { checkpointPrompt, classifyStop, ResumeGuard, resumePrompt } from "./interruption.js";
@@ -60,6 +61,7 @@ import {
   CWD_ANNOTATION,
   DAEMON_LABEL,
   DOCKER_LABEL,
+  DOCKER_SIDECAR_LABEL,
   LAYOUT_ANNOTATION,
   MAPPED_CHECKOUT,
   STATE_LABEL,
@@ -364,7 +366,7 @@ export class KubernetesRuntime {
       ws.sandbox = sandbox.name;
       ws.image = sandbox.image;
       ws.layout = sandbox.annotations[LAYOUT_ANNOTATION] === "mapped" ? "mapped" : "legacy";
-      ws.docker = sandbox.labels[DOCKER_LABEL] === "1";
+      ws.docker = sandbox.labels[DOCKER_LABEL] === "1" && sandbox.labels[DOCKER_SIDECAR_LABEL] !== "1";
       ws.cwdFixed = true;
       this.syncFromSandbox(ws, sandbox);
       this.setPhase(ws, sandbox.operatingMode === "Suspended" ? "suspended" : "running");
@@ -751,7 +753,9 @@ export class KubernetesRuntime {
     const profile = await this.profileName(settings, ws);
     const config = applyProfile(settings, profile);
     const kube = this.deps.kubeFor(config);
-    const dockerOn = dockerEnabled(settings, profile);
+    const mode = dockerMode(settings, profile);
+    const dockerOn = mode === "sandbox";
+    const sidecarOn = mode === "sidecar";
     ws.docker = dockerOn;
     const { cwd } = ws.options;
     const ops = opsEnv(need.env);
@@ -782,7 +786,7 @@ export class KubernetesRuntime {
       ws.repoUrl = repo.url;
       const serviceAccount = serviceAccountFor(config, this.agentLabels(ws));
       // a running pod cannot change ServiceAccount, so only a pod without one is taken from the warm pool
-      const warm = layout === "mapped" && !serviceAccount && !profile ? await this.claimWarm(kube, config, ws) : undefined;
+      const warm = layout === "mapped" && !serviceAccount && !profile && mode === "off" ? await this.claimWarm(kube, config, ws) : undefined;
       if (warm) {
         ctx.notice("Using a pod that was already running...");
         ws.sandbox = warm.name;
@@ -792,7 +796,7 @@ export class KubernetesRuntime {
       } else {
         ctx.notice("Starting the pod...");
         const name = sandboxName(ws.id, repoName(repo.url), ws.options.slug);
-        await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, layout, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running"), serviceAccount, docker: dockerOn }));
+        await kube.apply(buildSandbox({ name, workspaceId: ws.id, cwd, layout, config, daemonId: this.deps.daemonId, meta: this.meta(ws, "running"), serviceAccount, docker: dockerOn, dockerSidecar: sidecarOn }));
         ws.labelled = this.metaKey(this.meta(ws, "running"));
         ws.sandbox = name;
         ws.image = config.image;
@@ -805,7 +809,7 @@ export class KubernetesRuntime {
       if (sandbox.operatingMode === "Suspended") {
         ctx.notice("Resuming the pod...");
         this.setPhase(ws, "resuming");
-        await kube.patchSandbox(sandbox.name, resumePatch(config, ws.layout === "mapped" ? undefined : cwd, this.resumeServiceAccount(config, ws, sandbox), dockerOn ? { sandbox: sandbox.name } : undefined));
+        await kube.patchSandbox(sandbox.name, resumePatch(config, ws.layout === "mapped" ? undefined : cwd, this.resumeServiceAccount(config, ws, sandbox), dockerOn ? { sandbox: sandbox.name } : undefined, sidecarOn));
         // the check taken at suspend is about a pod that is no longer asleep
         ws.probe = undefined;
         if (sandbox.annotations[PROBE_ANNOTATION]) await kube.patchSandbox(sandbox.name, { metadata: { annotations: { [PROBE_ANNOTATION]: null } } }).catch(() => undefined);
@@ -849,6 +853,7 @@ export class KubernetesRuntime {
       ws.lastActivity = this.now();
       await this.syncLabels(kube, ws, "running");
       if (dockerOn) await this.startDocker(ws, config, ctx);
+      if (sidecarOn) await this.waitSidecar(kube, pod);
     } catch (error) {
       ws.readyUid = undefined;
       // Left suspended-looking so the next input retries from a clean state; the volume and the sandbox stay.
@@ -861,6 +866,12 @@ export class KubernetesRuntime {
       ctx.notice(`Could not start the pod: ${message}`, "error");
       throw new Error(`kube: could not start the pod: ${message}`);
     }
+  }
+
+  /** Waits up to 60 s for the pod's dockerd sidecar; a slow one only costs a log line, the workspace starts anyway. */
+  private async waitSidecar(kube: Kube, pod: string): Promise<void> {
+    const seconds = await waitDockerSidecar(kube, pod, { sleep: this.deps.sleep, now: this.deps.now });
+    this.log(seconds === undefined ? `[kubernetes-runtime] docker sidecar of ${pod} not ready after 60 s (docker commands retry until it is)` : `[kubernetes-runtime] docker sidecar ready in ${seconds} s`);
   }
 
   /**
@@ -1828,7 +1839,7 @@ export class KubernetesRuntime {
       const kube = this.deps.kubeFor(config);
       ws.bridge?.close();
       for (const sandbox of await kube.listSandboxes(`${WORKSPACE_ID_LABEL}=${ws.id}`)) {
-        if (ws.docker || sandbox.labels[DOCKER_LABEL] === "1") await this.docker.destroy(sandbox.name, config);
+        if (ws.docker || (sandbox.labels[DOCKER_LABEL] === "1" && sandbox.labels[DOCKER_SIDECAR_LABEL] !== "1")) await this.docker.destroy(sandbox.name, config);
         await kube.delete("sandbox", sandbox.name);
         await kube.delete("pvc", workspaceClaimName(sandbox.name)).catch(() => undefined);
       }
@@ -1872,7 +1883,7 @@ export class KubernetesRuntime {
       ws?.bridge?.close();
       this.states.delete(id);
       this.deps.registry?.delete(id);
-      if (sandbox.labels[DOCKER_LABEL] === "1") await this.docker.destroy(sandbox.name, config).catch(() => undefined);
+      if (sandbox.labels[DOCKER_LABEL] === "1" && sandbox.labels[DOCKER_SIDECAR_LABEL] !== "1") await this.docker.destroy(sandbox.name, config).catch(() => undefined);
       await kube.delete("sandbox", sandbox.name).catch(() => undefined);
       await kube.delete("pvc", workspaceClaimName(sandbox.name)).catch(() => undefined);
     }

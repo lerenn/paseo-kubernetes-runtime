@@ -191,6 +191,28 @@ published to `ghcr.io/lerenn/paseo-kubernetes-runtime-default`; `DEFAULT_IMAGE` 
 (the workflow prints the new digest in its summary). A custom image needs node and git; claude, codex and a verified jq are
 installed on first use when missing.
 
+## Docker sidecar (opt-in, privileged)
+
+Besides the separate sandbox pod below, a workspace pod can run Docker itself: a **privileged `docker:dind` sidecar container** named `dockerd` in the same pod. No extra node, and the pod's own requests do not change.
+
+**Risk, accepted by the human owner** (decision 3230bc70, "It's okay if unsafe"): a privileged container is root on the node. The lab relaxes Pod Security for the agents namespace in a separate lab change; its admission policy keys on the pod label `paseo.sh/docker-sidecar=1`, the container name `dockerd` and the image.
+
+```json
+"dockerDefault": "off",
+"profiles": { "ci": { "docker": "sidecar" } },
+"dockerSidecar": {
+  "image": "<dind image>",
+  "resources": { "requests": { "cpu": "10m", "memory": "64Mi" }, "limits": { "memory": "8Gi", "ephemeral-storage": "20Gi" } }
+}
+```
+
+- **Mode.** A profile's `docker` is `true` or `"sandbox"` (the sandbox pod, unchanged), `"sidecar"`, or `false`. `dockerDefault` (`"off"` by default, `"sidecar"`, `"sandbox"`) applies when the profile does not say, and to workspaces with no profile at all. Settings are read live. `sidecar` never creates the sandbox pod, Service or NetworkPolicy.
+- **Container.** `dockerd` listens on `tcp://127.0.0.1:2375` only (TLS off), so no other pod can reach it; the agent container gets `DOCKER_HOST=tcp://127.0.0.1:2375` and the label `paseo.sh/docker=1`. `/var/lib/docker` is an emptyDir. `dockerSidecar.image` defaults to `docker.image`; limits cap memory (8Gi) and ephemeral storage (20Gi) so a build cannot fill the node's disk.
+- **Bind mounts work.** The sidecar mounts the same workspace volume at the same paths as the agent (`/workspace` and the checkout path), so `docker run -v <checkout>:...` and compose bind mounts see the agent's files; no `docker-sync`.
+- **Existing workspaces** get the sidecar the next time they resume (the resume patch rewrites the containers), and lose it again at the next resume if the mode is switched off. A pod that is running keeps what it has until then.
+- **Readiness.** The pod becomes Ready without waiting for dockerd. After the pod is ready the runtime waits up to 60 s (not fatal) for `docker info` to answer and logs `docker sidecar ready in N s`. Workspaces in `sidecar` mode do not take warm-pool pods.
+- Suspend, idle and auto-archive are unchanged: the sidecar dies with the pod.
+
 ## Docker sandbox (opt-in per profile)
 
 Agents that need `docker` (build images, run `docker compose`) get a per-workspace engine in its own pod, never inside the agent
