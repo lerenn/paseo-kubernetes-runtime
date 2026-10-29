@@ -70,3 +70,15 @@ describe("profile nodeSelector", () => {
     expect(applyProfile(config, undefined).nodeSelector["karpenter.sh/capacity-type"]).toBe("spot");
   });
 });
+
+describe("profile memory request above the global limit (prbr-picky, 2026-10-29)", () => {
+  it("raises the limit to the request, and leaves a fitting one alone", async () => {
+    const { fitMemoryLimit, quantityBytes } = await import("../shared/settings.js");
+    expect(quantityBytes("768Mi")).toBe(768 * 2 ** 20);
+    expect(quantityBytes("1G")).toBe(1e9);
+    expect(Number.isNaN(quantityBytes("lots"))).toBe(true);
+    expect(fitMemoryLimit({ requests: { cpu: "1", memory: "4Gi" }, limits: { memory: "3Gi" } })).toEqual({ requests: { cpu: "1", memory: "4Gi" }, limits: { memory: "4Gi" } });
+    const ok = { requests: { memory: "2Gi" }, limits: { memory: "3Gi" } };
+    expect(fitMemoryLimit(ok)).toBe(ok);
+  });
+});

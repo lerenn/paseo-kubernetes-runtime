@@ -357,6 +357,25 @@ export function dockerEnabled(config: KubernetesRuntimeConfig, profile: string |
 }
 
 /** The configuration a workspace runs with: the settings, with its profile's image, storage and resources applied. */
+/** Bytes of a Kubernetes quantity (`768Mi`, `4Gi`, `1G`, `500000`); NaN when it is not one. */
+export function quantityBytes(q: string): number {
+  const m = /^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|k|M|G|T)?$/.exec(q.trim());
+  if (!m) return NaN;
+  const unit: Record<string, number> = { Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, k: 1e3, M: 1e6, G: 1e9, T: 1e12 };
+  return Number(m[1]) * (m[2] ? unit[m[2]]! : 1);
+}
+
+/**
+ * A profile that raises the memory request keeps the global limit (resources merge per section), and Kubernetes rejects a pod
+ * whose request is above its limit: the limit is raised to the request then.
+ */
+export function fitMemoryLimit<R extends { requests?: Record<string, string>; limits?: Record<string, string> }>(r: R): R {
+  const request = r.requests?.memory;
+  const limit = r.limits?.memory;
+  if (!request || !limit || !(quantityBytes(request) > quantityBytes(limit))) return r;
+  return { ...r, limits: { ...r.limits, memory: request } };
+}
+
 export function applyProfile(config: KubernetesRuntimeConfig, profile: string | undefined): KubernetesRuntimeConfig {
   if (!profile) return config;
   const p = config.profiles[profile];
@@ -366,7 +385,7 @@ export function applyProfile(config: KubernetesRuntimeConfig, profile: string | 
     ...(p.image ? { image: p.image } : {}),
     ...(p.extraSecrets ? { extraSecrets: p.extraSecrets } : {}),
     ...(p.nodeSelector ? { nodeSelector: { ...config.nodeSelector, ...p.nodeSelector } } : {}),
-    ...(p.resources ? { resources: { ...config.resources, ...p.resources } } : {}),
+    ...(p.resources ? { resources: fitMemoryLimit({ ...config.resources, ...p.resources }) } : {}),
     storage: { ...config.storage, ...(p.storage?.size ? { size: p.storage.size } : {}), ...(p.storage?.storageClassName ? { storageClassName: p.storage.storageClassName } : {}) },
   };
 }
