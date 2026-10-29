@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { labelsOfAgent, sendUnlessBusy, workspaceAgentsBusy } from "../server/agent-activity.js";
+import { directoryBusy, labelsOfAgent, listAgents, sendUnlessBusy, workspaceAgentsBusy } from "../server/agent-activity.js";
 
 const api = (entries: unknown[] | Error) => ({ agents: { list: async () => (entries instanceof Error ? Promise.reject(entries) : { entries }) } });
 const agent = (over: object) => ({ agent: { id: "a", workspaceId: "wks_1", status: "idle", activeTurn: null, pendingPermissions: [], archivedAt: null, ...over } });
@@ -60,5 +60,33 @@ describe("sendUnlessBusy", () => {
   it("passes other errors on", async () => {
     await expect(sendUnlessBusy(host([], async () => { throw new Error("agent not found"); }), "a", "go")).rejects.toThrow("agent not found");
     await expect(sendUnlessBusy(null, "a", "go")).rejects.toThrow(/not reached/);
+  });
+});
+
+describe("listAgents / directoryBusy (in-process, no `paseo agent ls` process)", () => {
+  const apiOf = (agents: unknown[]) => ({ agents: { list: async () => ({ entries: agents.map((agent) => ({ agent })) }) } });
+  const agents = [
+    { id: "a1", title: "Impl", status: "running", cwd: "/src/mono", workspaceId: "w1" },
+    { id: "a2", status: "idle", cwd: "/src/lab", workspaceId: "w2" },
+    { id: "a3", status: "running", cwd: "/src/lab", workspaceId: "w3", archivedAt: "2026-10-29T00:00:00Z" },
+  ];
+
+  it("lists live agents with title, status and cwd", async () => {
+    expect(await listAgents(apiOf(agents))).toEqual([
+      { id: "a1", title: "Impl", status: "running", cwd: "/src/mono" },
+      { id: "a2", title: "a2", status: "idle", cwd: "/src/lab" },
+    ]);
+  });
+
+  it("is busy only for a running live agent in the directory or under it", async () => {
+    expect(await directoryBusy(apiOf(agents), "/src/mono/")).toBe(true);
+    expect(await directoryBusy(apiOf(agents), "/src")).toBe(true);
+    expect(await directoryBusy(apiOf(agents), "/src/lab")).toBe(false);
+  });
+
+  it("returns null when the list cannot be read", async () => {
+    const broken = { agents: { list: async () => { throw new Error("Daemon client closed"); } } };
+    expect(await listAgents(broken)).toBeNull();
+    expect(await directoryBusy(broken, "/src")).toBeNull();
   });
 });
