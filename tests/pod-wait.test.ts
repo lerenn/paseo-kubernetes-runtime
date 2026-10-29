@@ -70,3 +70,13 @@ describe("waitPodReady with a full quota", () => {
     await expect(waitPodReady(none.kube, "pka-x", none.options)).rejects.toThrow("(it does not exist)");
   });
 });
+
+describe("waitPodReady with a pod spec Kubernetes rejects", () => {
+  it("fails at once with the reason instead of waiting for a pod that never comes", async () => {
+    let polls = 0;
+    const kube = { podInfo: async () => (polls++, null) } as any;
+    const sandbox = { name: "pka-x", labels: {}, annotations: {}, operatingMode: "Running", ready: { status: "False", reason: "InvalidConfiguration", message: 'Pod "pka-x" is invalid: requests: Invalid value: "4Gi": must be less than or equal to memory limit of 3Gi' } } as SandboxInfo;
+    await expect(waitPodReady(kube, "pka-x", { timeoutSeconds: 900, pollMs: 1000, sleep: async () => undefined, now: () => 0, sandbox: async () => sandbox })).rejects.toThrow(/invalid and cannot be created: .*memory limit of 3Gi/);
+    expect(polls).toBe(1);
+  });
+});

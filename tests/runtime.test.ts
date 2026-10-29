@@ -4,7 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { OomLedger, SUMMARY_EVERY_MS } from "../server/oom.js";
 import { buildPodRows } from "../server/status.js";
-import { KubernetesRuntime, liveProviderChildren, IDLE_BACKGROUND_GRACE_MS } from "../server/runtime.js";
+import { KubernetesRuntime, liveProviderChildren, IDLE_BACKGROUND_GRACE_MS, specRejected } from "../server/runtime.js";
 import { PodRegistry } from "../server/registry.js";
 import type { WorkspaceRuntimeRegistration } from "../server/runtime-types.js";
 import { ConfigSchema } from "../shared/settings.js";
@@ -1250,6 +1250,13 @@ describe("suspend, resume and destroy", () => {
     expect(seeds()).toBe(before);
     expect(t.registry.list()[0]!.state).toBe("running");
     expect(t.notices.map((n) => n[0])).toContain("Resuming the pod...");
+  });
+
+  it("treats a Running sandbox whose pod Kubernetes rejected as one to rebuild, and nothing else", () => {
+    expect(specRejected({ operatingMode: "Running", ready: { status: "False", reason: "InvalidConfiguration", message: "requests above the memory limit" } })).toBe(true);
+    expect(specRejected({ operatingMode: "Suspended", ready: { status: "False", reason: "InvalidConfiguration", message: "x" } })).toBe(false);
+    expect(specRejected({ operatingMode: "Running", ready: { status: "False", reason: "ReconcilerError", message: "exceeded quota" } })).toBe(false);
+    expect(specRejected({ operatingMode: "Running" })).toBe(false);
   });
 
   it("beforeInput on a running workspace changes nothing", async () => {

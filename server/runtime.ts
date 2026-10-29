@@ -964,8 +964,12 @@ export class KubernetesRuntime {
       ws.image = sandbox.image ?? ws.image;
       ws.layout = sandbox.annotations[LAYOUT_ANNOTATION] === "mapped" ? "mapped" : "legacy";
       ws.repo ??= sandbox.labels[REPO_LABEL];
-      if (sandbox.operatingMode === "Suspended") {
-        ctx.notice("Resuming the pod...");
+      // A pod spec Kubernetes rejected (the Sandbox is "Running" but its pod can never be created) is rebuilt from today's
+      // settings, as a resume would: retrying the same spec waits the whole timeout for nothing.
+      const invalid = specRejected(sandbox);
+      if (invalid) this.log(`[kubernetes-runtime] ${sandbox.name}: its pod spec was rejected (${sandbox.ready?.message ?? "invalid"}); applying today's settings`);
+      if (sandbox.operatingMode === "Suspended" || invalid) {
+        ctx.notice(invalid ? "Fixing the pod's configuration..." : "Resuming the pod...");
         this.setPhase(ws, "resuming");
         await kube.patchSandbox(sandbox.name, resumePatch(config, ws.layout === "mapped" ? undefined : cwd, this.resumeServiceAccount(config, ws, sandbox), dockerOn ? { sandbox: sandbox.name } : undefined, sidecarOn));
         // the check taken at suspend is about a pod that is no longer asleep
@@ -2248,6 +2252,11 @@ function slugFor(cwd: string): string {
  * True when a `claude` or `codex` process listed by `ps -eo pid=,ppid=,stat=,args=` has a living (not zombie)
  * descendant: its agent is running background work even if Paseo shows it idle.
  */
+/** A Sandbox that is not suspended but whose pod Kubernetes refuses to create: its spec must be rebuilt, waiting changes nothing. */
+export function specRejected(sandbox: Pick<SandboxInfo, "operatingMode" | "ready">): boolean {
+  return sandbox.operatingMode !== "Suspended" && sandbox.ready?.reason === "InvalidConfiguration";
+}
+
 const clip = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
 export function liveProviderChildren(psOutput: string): boolean {

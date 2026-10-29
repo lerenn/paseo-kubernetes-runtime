@@ -86,7 +86,10 @@ export async function waitPodReady(kube: Kube, name: string, options: WaitOption
     if (info?.ready && !info.terminating) return info;
     if (!info) {
       // no pod: the controller may be refused by the namespace quota, which it retries by itself
-      const block = parseQuotaBlock((await options.sandbox?.().catch(() => undefined))?.ready);
+      const ready = (await options.sandbox?.().catch(() => undefined))?.ready;
+      // a pod spec Kubernetes rejects (a memory request above its limit, a bad field) never comes right by waiting: say so now
+      if (ready?.reason === "InvalidConfiguration") throw new Error(`Pod ${name} is invalid and cannot be created: ${ready.message ?? "invalid configuration"}`);
+      const block = parseQuotaBlock(ready);
       if (block) quota = block;
     } else quota = undefined;
     const problem = quota ? quotaNotice(quota) : info?.terminating ? "Pod is being replaced" : info?.problem;
