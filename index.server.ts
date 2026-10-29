@@ -5,7 +5,7 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { credentialsRemove, credentialsSet, credentialsStatus } from "./shared/credentials.js";
 import { ConfigSchema, kubeSettings } from "./shared/settings.js";
 import { kubeKeep, kubePodAction, kubeReconcile, kubeStatus } from "./shared/status.js";
-import { paseoWorkspaces } from "./server/orphans.js";
+import { paseoWorkspaceBusy, paseoWorkspaces } from "./server/orphans.js";
 import { paseoAgents, readCluster } from "./server/status.js";
 import { PodRowsService } from "./server/status-service.js";
 import { readDaemonId } from "./server/daemon.js";
@@ -15,7 +15,7 @@ import { migrateLegacyData } from "./server/migrate.js";
 import { OrphanReaper } from "./server/orphans.js";
 import { podOnlyAgent, podOnlyWorkspace } from "./server/pod-only.js";
 import { LABELS_REF_ENV, LabelHandoff, withAgentLabels } from "./server/label-handoff.js";
-import { labelsOfAgent, labelsOfWorkspace, sendUnlessBusy, workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
+import { directoryBusy, labelsOfAgent, labelsOfWorkspace, listAgents, sendUnlessBusy, workspaceAgentsBusy, type AgentListApi } from "./server/agent-activity.js";
 import { registerPodControl } from "./server/pod-control.js";
 import { PodRegistry } from "./server/registry.js";
 import { KubernetesRuntime } from "./server/runtime.js";
@@ -49,6 +49,8 @@ export default function contribute(server: PluginServerContext) {
     if (ctx?.paseo && !paseoApi) paseoApi = ctx.paseo as AgentListApi;
   };
   const runtime = new KubernetesRuntime({ getConfig, kubeFor, daemonId, registry, agentsBusy: (workspaceId) => workspaceAgentsBusy(paseoApi, workspaceId),
+    // The CLI only until a context gave us the in-process API (right after a plugin reload).
+    workspaceBusy: (cwd) => (paseoApi ? directoryBusy(paseoApi, cwd) : paseoWorkspaceBusy(cwd)),
     recoveryStateFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "interruptions.json"),
     autoArchiveLogFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "auto-archive.json"),
     workspaceLabels: (workspaceId) => labelsOfWorkspace(paseoApi, workspaceId),
@@ -157,7 +159,7 @@ export default function contribute(server: PluginServerContext) {
   // Polled by several screens: read once at a time and kept a few seconds, each source with its own timeout (see PodRowsService)
   const podRows = new PodRowsService({
     titles: () => paseoWorkspaces(undefined, 5_000),
-    agents: () => paseoAgents(undefined, 5_000),
+    agents: () => (paseoApi ? listAgents(paseoApi) : paseoAgents(undefined, 5_000)),
     cluster: async () => (daemonId ? readCluster(kubeFor(await getConfig()), daemonId) : { sandboxes: [], claims: [], pods: new Map() }),
     docker: async () => runtime.dockerStatuses(await getConfig()),
     entries: () => registry.list(),

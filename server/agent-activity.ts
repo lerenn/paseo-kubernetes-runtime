@@ -5,6 +5,8 @@ export interface AgentListApi {
 
 interface AgentLike {
   id?: string;
+  title?: string | null;
+  cwd?: string;
   workspaceId?: string | null;
   status?: string;
   archivedAt?: string | null;
@@ -97,4 +99,38 @@ export async function labelsOfWorkspace(paseo: AgentListApi | null, workspaceId:
   } catch {
     return null;
   }
+}
+
+/** An agent of the list, with the fields the Agents column and the directory check read. */
+export interface ListedAgent {
+  id: string;
+  title: string;
+  status: string;
+  cwd: string;
+}
+
+/**
+ * The live (not archived) agents, from Paseo's in-process API instead of a `paseo agent ls` process: on a 2-vCPU daemon
+ * host each of those Node processes cost a second of CPU, and the idle check started one per idle workspace every 30 s.
+ * Null when the list cannot be read.
+ */
+export async function listAgents(paseo: AgentListApi): Promise<ListedAgent[] | null> {
+  try {
+    const result = (await paseo.agents.list({})) as { entries?: { agent?: AgentLike }[] } | AgentLike[];
+    const entries = Array.isArray(result) ? result : (result.entries ?? []);
+    return entries
+      .map((e) => ((e as { agent?: AgentLike }).agent ?? e) as AgentLike)
+      .filter((a) => a.id && !a.archivedAt)
+      .map((a) => ({ id: a.id!, title: a.title || a.id!.slice(0, 8), status: a.status ?? "", cwd: a.cwd ?? "" }));
+  } catch {
+    return null;
+  }
+}
+
+/** Whether an agent is `running` in this directory or under it (see paseoWorkspaceBusy), from the in-process API. */
+export async function directoryBusy(paseo: AgentListApi, cwd: string): Promise<boolean | null> {
+  const agents = await listAgents(paseo);
+  if (!agents) return null;
+  const root = cwd.replace(/\/+$/, "");
+  return agents.some((a) => a.status === "running" && (a.cwd === root || a.cwd.startsWith(`${root}/`)));
 }
