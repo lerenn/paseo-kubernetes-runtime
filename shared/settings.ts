@@ -297,6 +297,17 @@ export const ConfigSchema = z.object({
       checkpointNudge: z.boolean().default(true),
     })
     .default({ interruptedExit: false, autoResume: true, checkpointNudge: true }),
+  /**
+   * One mail (through Agents Mail) when an agent's pod fails: an out-of-memory kill, a pod that cannot start or pull its image, or
+   * an eviction the automatic resume gave up on. Deduped per agent and reason for `dedupeMinutes`. Off: only the log, as before.
+   */
+  errorMail: z
+    .object({
+      enabled: z.boolean().default(true),
+      to: z.string().min(1).default("@assistant"),
+      dedupeMinutes: z.number().int().min(1).default(30),
+    })
+    .default({ enabled: true, to: "@assistant", dedupeMinutes: 30 }),
   /** A workspace whose agents have all been idle this long has its pod deleted (the volume stays); any input brings it back. 0 = never. */
   podIdleMinutes: z.number().int().min(0).default(30),
   autoArchive: AutoArchiveSchema.default(() => AutoArchiveSchema.parse({})),

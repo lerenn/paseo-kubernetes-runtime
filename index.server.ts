@@ -1,3 +1,4 @@
+import { agentsMailSender } from "./server/error-mail.js";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
@@ -52,6 +53,8 @@ export default function contribute(server: PluginServerContext) {
     autoArchiveLogFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "auto-archive.json"),
     workspaceLabels: (workspaceId) => labelsOfWorkspace(paseoApi, workspaceId),
     oomStateFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "oom.json"),
+    mail: agentsMailSender(),
+    errorMailStateFile: path.join(process.env.PASEO_HOME ?? path.join(homedir(), ".paseo"), "plugin-data", "kubernetes-runtime", "error-mail.json"),
     // `skip` is the fork's (not in the published SDK's types); a host without it is handled in sendUnlessBusy
     messenger: {
       async send(agentId, text, behavior) {
