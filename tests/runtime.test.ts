@@ -311,7 +311,7 @@ describe("recovery from a node reclaim", () => {
     await flush();
     expect(messages).toHaveLength(1); // two processes of the pod, one resume
     expect(messages[0]).toMatchObject({ agentId: "agent-1", behavior: "skip" });
-    expect(messages[0]!.text).toContain("interrupted by a node reclaim");
+    expect(messages[0]!.text).toContain("Your pod was replaced");
   });
 
   it("keeps runtime-lost while interruptedExit is off, and does not resume an agent that was idle", async () => {
@@ -1447,6 +1447,56 @@ describe("OOM counters", () => {
     expect(t.runtime.oomStats().get("wks_1")!.count).toBe(2);
     const row = buildPodRows({ sandboxes: t.kube.sandboxes, claims: [], pods: new Map(), entries: [], titles: null, agents: [], oom: t.runtime.oomStats() })[0]!;
     expect(row.oom).toMatchObject({ limit: "3Gi" });
+  });
+
+  it("mails one error per agent and reason, with the last log lines, when the pod runs out of memory", async () => {
+    const mails: { to: string; subject: string; body: string }[] = [];
+    const mail = async (to: string, subject: string, body: string) => (mails.push({ to, subject, body }), true);
+    const t = setup({}, { messenger, mail, recoveryStateFile: path.join(dir, "rec-mail.json") });
+    await t.reg.create!(t.base, t.ctx);
+    t.activity("turn_started", "agent-1");
+    await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.kube.pods = [oomPod];
+    t.kube.procs[0]!.end(137);
+    await flush();
+    expect(mails).toHaveLength(1);
+    expect(mails[0]).toMatchObject({ to: "@assistant" });
+    expect(mails[0]!.subject).toContain("ran out of memory");
+    expect(mails[0]!.body).toContain("Workspace: wks_1");
+    // a second kill within 30 minutes: no second mail
+    t.activity("turn_started", "agent-1");
+    await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.kube.pods = [{ ...oomPod, oomAt: "2026-10-27T10:05:00Z" }];
+    t.kube.procs[1]!.end(137);
+    await flush();
+    expect(mails).toHaveLength(1);
+  });
+
+  it("mails one out-of-memory error for three kills 11 minutes apart (within the 30-minute window)", async () => {
+    const mails: string[] = [];
+    const t = setup({}, { messenger, mail: async (_t: string, s: string) => (mails.push(s), true), recoveryStateFile: path.join(dir, "rec-giveup.json") });
+    await t.reg.create!(t.base, t.ctx);
+    for (let i = 0; i < 3; i++) {
+      t.activity("turn_started", "agent-1");
+      await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+      t.kube.pods = [{ ...oomPod, oomAt: `2026-10-27T10:0${i}:00Z` }];
+      t.kube.procs[i]!.end(137);
+      await flush();
+      t.advance(11 * 60_000);
+    }
+    expect(mails.filter((s) => s.includes("ran out of memory"))).toHaveLength(1);
+  });
+
+  it("sends no error mail when the setting is off", async () => {
+    const mails: string[] = [];
+    const t = setup({ errorMail: { enabled: false } }, { messenger, mail: async (_t: string, s: string) => (mails.push(s), true) });
+    await t.reg.create!(t.base, t.ctx);
+    t.activity("turn_started", "agent-1");
+    await t.reg.exec({ ...t.base, purpose: "session", argv: ["claude"], env: {} } as never, t.ctx);
+    t.kube.pods = [oomPod];
+    t.kube.procs[0]!.end(137);
+    await flush();
+    expect(mails).toEqual([]);
   });
 
   it("does not resume when autoResume is off, and an idle agent is never resumed", async () => {

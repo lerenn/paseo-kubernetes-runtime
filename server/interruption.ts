@@ -86,15 +86,15 @@ export class ResumeGuard {
   }
 
   /** Call when an agent's turn was cut by an interruption. Returns whether a resume may be sent, and why not. */
-  allow(agentId: string, now: number): { ok: true } | { ok: false; reason: string } {
+  allow(agentId: string, now: number): { ok: true } | { ok: false; reason: string; gaveUp: boolean } {
     const r = this.record(agentId);
     r.resumes = r.resumes.filter((t) => now - t < 3_600_000);
     const last = r.resumes[r.resumes.length - 1];
     if (last !== undefined && now - last < FAILED_RESUME_WINDOW_MS) r.failures += 1;
     this.save();
-    if (r.failures >= MAX_FAILED_RESUMES) return { ok: false, reason: `interrupted again right after ${r.failures} resumes: not trying again` };
-    if (last !== undefined && now - last < RESUME_MIN_GAP_MS) return { ok: false, reason: "resumed less than 10 minutes ago" };
-    if (r.resumes.length >= RESUME_PER_HOUR) return { ok: false, reason: `resumed ${RESUME_PER_HOUR} times in the last hour` };
+    if (r.failures >= MAX_FAILED_RESUMES) return { ok: false, reason: `interrupted again right after ${r.failures} resumes: not trying again`, gaveUp: true };
+    if (last !== undefined && now - last < RESUME_MIN_GAP_MS) return { ok: false, reason: "resumed less than 10 minutes ago", gaveUp: false };
+    if (r.resumes.length >= RESUME_PER_HOUR) return { ok: false, reason: `resumed ${RESUME_PER_HOUR} times in the last hour`, gaveUp: true };
     return { ok: true };
   }
 
@@ -113,8 +113,8 @@ export class ResumeGuard {
   }
 }
 
-export const resumePrompt = (at: Date) =>
-  `Your previous turn was interrupted by a node reclaim at ${at.toISOString().slice(11, 16)}Z. Resume from your saved state (git and files on the volume): check what is committed and what is not, and carry on.`;
+export const resumePrompt = (at: Date, why?: string) =>
+  `Your pod was replaced at ${at.toISOString().slice(11, 16)}Z${why ? ` (${why})` : " (a node reclaim)"} and your previous turn was cut short. Continue: resume from your saved state (git and files on the volume), check what is committed and what is not, and carry on.`;
 
 export const checkpointPrompt =
   "A node reclaim is under way: commit and push your work now (a WIP commit is fine). You may be stopped within about two minutes.";

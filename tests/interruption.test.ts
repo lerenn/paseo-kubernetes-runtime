@@ -35,12 +35,12 @@ describe("ResumeGuard", () => {
     const g = new ResumeGuard(null);
     expect(g.allow("a", 0)).toEqual({ ok: true });
     g.sent("a", 0);
-    expect(g.allow("a", 5 * MIN)).toMatchObject({ ok: false, reason: expect.stringContaining("10 minutes") });
+    expect(g.allow("a", 5 * MIN)).toMatchObject({ ok: false, gaveUp: false, reason: expect.stringContaining("10 minutes") });
     expect(g.allow("a", RESUME_MIN_GAP_MS + 1).ok).toBe(true);
     g.sent("a", RESUME_MIN_GAP_MS + 1);
     expect(g.allow("a", 21 * MIN).ok).toBe(true);
     g.sent("a", 21 * MIN);
-    expect(g.allow("a", 40 * MIN)).toMatchObject({ ok: false, reason: expect.stringContaining("3 times") });
+    expect(g.allow("a", 40 * MIN)).toMatchObject({ ok: false, gaveUp: true, reason: expect.stringContaining("3 times") });
     expect(g.allow("a", 62 * MIN).ok).toBe(true); // the first resume is more than an hour old
   });
 
@@ -49,7 +49,7 @@ describe("ResumeGuard", () => {
     g.sent("a", 0);
     expect(g.allow("a", 1 * MIN).ok).toBe(false); // right after a resume: failure 1 (and the gap)
     g.sent("a", 20 * MIN);
-    expect(g.allow("a", 21 * MIN)).toMatchObject({ ok: false, reason: expect.stringContaining("not trying again") }); // failure 2
+    expect(g.allow("a", 21 * MIN)).toMatchObject({ ok: false, gaveUp: true, reason: expect.stringContaining("not trying again") }); // failure 2
     g.healthy("a");
     expect(g.allow("a", 40 * MIN).ok).toBe(true);
   });

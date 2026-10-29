@@ -5,6 +5,7 @@ import { waitDockerSidecar } from "./docker-sidecar.js";
 import { DockerSandboxes, type DockerStatus } from "./docker-sandbox.js";
 import { OomLedger, oomResumePrompt, parsePeak } from "./oom.js";
 import { checkpointPrompt, classifyStop, ResumeGuard, resumePrompt } from "./interruption.js";
+import { ErrorMailer, isImagePull, type ErrorEvent, type MailSender } from "./error-mail.js";
 import { parseRuntimeOptions, type RuntimeOptions } from "../shared/runtime-options.js";
 import { gitMirrorStats, mirrorGate } from "./mirror-gate.js";
 import { applyFetch, fetchTargets, otherRepoTarget, pushToMirror, refreshMirror, repoPolicy, serveFetchChunk, submoduleTargets, type FetchTarget } from "./mirrors.js";
@@ -125,6 +126,9 @@ export interface RuntimeDeps {
   recoveryStateFile?: string;
   /** Where the OOM counters are kept (survives a restart). */
   oomStateFile?: string;
+  /** Where the error-mail dedupe is kept, and how a mail is sent (the plugin passes Agents Mail; absent: none is sent). */
+  errorMailStateFile?: string;
+  mail?: MailSender;
   /** Whether an agent of this workspace (by id) has a turn open, from Paseo's agent list; null when it cannot say. */
   agentsBusy?: (workspaceId: string) => Promise<boolean | null>;
   /** Archives a workspace in Paseo (the delete action's option, and auto-archive, which adds a reason and `ifIdle`); injected for tests. */
@@ -303,6 +307,7 @@ export class KubernetesRuntime {
   /** What `describeWorkspace` answered, by workspace, for a couple of seconds: apps ask for it often. */
   private readonly describeCache = new Map<string, { at: number; value: WorkspaceRuntimeDisplay | null }>();
   private readonly docker: DockerSandboxes;
+  private readonly errorMail: ErrorMailer;
   private stopInterruptTicker: () => void = () => undefined;
 
   constructor(private readonly deps: RuntimeDeps) {
@@ -312,6 +317,7 @@ export class KubernetesRuntime {
     this.now = deps.now ?? Date.now;
     this.lastDemand = this.now();
     this.oom = new OomLedger(deps.oomStateFile ?? null, this.now());
+    this.errorMail = new ErrorMailer(deps.errorMailStateFile ?? null, deps.mail ?? (async () => false), (line) => this.log(line));
     this.docker = new DockerSandboxes({
       getConfig: () => deps.getConfig(),
       kubeFor: (c) => deps.kubeFor(c),
@@ -1023,6 +1029,8 @@ export class KubernetesRuntime {
       this.reportSuspended(ws, "idle", "The pod could not start and is suspended; it is tried again on the next message.");
       const message = (error as Error).message;
       ctx.notice(`Could not start the pod: ${message}`, "error");
+      const problem = (await kube.podInfo(ws.sandbox).catch(() => null))?.problem ?? "";
+      void this.mailError(ws, [...ws.agents.keys()], { reason: isImagePull(`${message} ${problem}`) ? "image-pull" : "pod-start", detail: message, logs: problem });
       throw new Error(`kube: could not start the pod: ${message}`);
     }
   }
@@ -1227,8 +1235,8 @@ export class KubernetesRuntime {
     for (const [, a] of ws.agents) a.turn = false; // its processes are gone: no turn is open any more
     this.log(`[kubernetes-runtime] pod ${pod} was interrupted (${why}); agents mid-turn: ${cut.map((id) => id.slice(0, 8)).join(", ") || "none"}`);
     const { recovery } = await this.deps.getConfig();
-    if (!recovery.autoResume) return;
-    await this.resumeAgents(ws, cut, resumePrompt(at), "the interruption");
+    if (!recovery.autoResume) return void this.mailError(ws, cut, { reason: "eviction", pod, detail: `${why}; automatic resume is off` });
+    await this.resumeAgents(ws, cut, resumePrompt(at, why), "the interruption");
   }
 
   /** One resume prompt (with `skip`) to each agent, through the guard that keeps the automatic resume from looping. */
@@ -1239,6 +1247,8 @@ export class KubernetesRuntime {
       if (!verdict.ok) {
         this.log(`[kubernetes-runtime] not resuming agent ${agentId.slice(0, 8)}: ${verdict.reason}`);
         ws.notice?.(`Not resuming the agent after ${after}: ${verdict.reason}`, "warning");
+        // a give-up needs a person; a resume that only waits for the 10-minute gap does not
+        if (verdict.gaveUp) void this.mailError(ws, [agentId], { reason: "resume-stopped", detail: `not resumed after ${after}: ${verdict.reason}` });
         continue;
       }
       this.guard.sent(agentId, this.now());
@@ -1247,11 +1257,20 @@ export class KubernetesRuntime {
     }
   }
 
+  /** One error mail per agent (or the workspace when none had a turn open), when the setting is on; never throws. */
+  private async mailError(ws: WorkspaceState, agentIds: readonly string[], e: Omit<ErrorEvent, "agentId" | "workspaceId">): Promise<void> {
+    const { errorMail } = await this.deps.getConfig();
+    if (!errorMail?.enabled) return;
+    for (const agentId of agentIds.length ? agentIds : ["-"]) {
+      await this.errorMail.notify({ ...e, agentId, workspaceId: ws.id, pod: e.pod ?? ws.sandbox }, { to: errorMail.to, windowMs: errorMail.dedupeMinutes * 60_000, now: this.now() }).catch(() => false);
+    }
+  }
+
   /**
    * A process died of an out-of-memory kill in a healthy pod. Counted per workspace and agent (the agents with a turn open),
    * logged, and those agents get ONE resume prompt through the same guard. Several processes report one kill: handled once.
    */
-  private async onOom(ws: WorkspaceState, pod: string, info: PodInfo): Promise<void> {
+  private async onOom(ws: WorkspaceState, pod: string, info: PodInfo, tail = ""): Promise<void> {
     const key = `${info.uid}:${info.oomAt ?? ""}`;
     if (ws.oomKey === key) return;
     ws.oomKey = key;
@@ -1261,6 +1280,7 @@ export class KubernetesRuntime {
     const peak = await kube.exec(pod, ["sh", "-c", "cat /sys/fs/cgroup/memory.peak 2>/dev/null || cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes 2>/dev/null"]).then((r) => (r.code === 0 ? parsePeak(r.stdout) : undefined), () => undefined);
     this.oom.record(ws.id, cut, this.now(), { limit: info.memoryLimit, peakBytes: peak });
     for (const id of cut.length ? cut : ["-"]) this.log(`[kubernetes-runtime] OOM: ${ws.id} agent ${id} limit ${info.memoryLimit ?? "unknown"}${peak ? ` peak ${Math.round(peak / 2 ** 20)}Mi` : ""}`);
+    void this.mailError(ws, cut, { reason: "oom", pod, detail: `memory limit ${info.memoryLimit ?? "unknown"}${peak ? `, peak ${Math.round(peak / 2 ** 20)}Mi` : ""}`, logs: tail });
     if (!(await this.deps.getConfig()).recovery.autoResume) return;
     await this.resumeAgents(ws, cut, oomResumePrompt, "the out-of-memory kill");
   }
@@ -2200,7 +2220,7 @@ export class KubernetesRuntime {
           return { code, signal, reason: "runtime-lost" as const, message: "The pod was lost; the next message brings it back" };
         }
         if (code !== 0 && info?.oomKilled) {
-          void this.onOom(ws, pod, info).catch(() => undefined);
+          void this.onOom(ws, pod, info, scrub(stderrTail.trim())).catch(() => undefined);
           return { code, signal, reason: "exited" as const, message: "The process ran out of memory (the pod's memory limit)" };
         }
         return { code, signal, reason: "exited" as const };
