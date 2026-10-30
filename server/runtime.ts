@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
-import { applyProfile, dockerMode, projectProfileFor } from "../shared/settings.js";
+import { applyProfile, dockerMode, projectProfileFor, type SubmoduleCheckout } from "../shared/settings.js";
 import { waitDockerSidecar } from "./docker-sidecar.js";
 import { DockerSandboxes, type DockerStatus } from "./docker-sandbox.js";
 import { OomLedger, oomResumePrompt, parsePeak } from "./oom.js";
@@ -199,6 +199,8 @@ interface WorkspaceState {
   docker?: boolean;
   /** The submodule checkout running in the background, if any. */
   submodulesJob?: Promise<void>;
+  /** Where its submodules are checked out (`gitProxy.submoduleCheckout`, after the profile). */
+  submoduleCheckout?: SubmoduleCheckout;
   /** Submodule paths and the fetch targets serving them, from `.gitmodules` at the seeded commit. */
   submodulePaths?: { path: string; targetId: string }[];
   /** The daemon's cache of the submodules was started warming for this workspace. */
@@ -759,9 +761,11 @@ export class KubernetesRuntime {
         return;
       }
       notice("Fetching the submodules in the background...");
+      const checkout = ws.submoduleCheckout ?? "pinned";
       const r = await initSubmodules(kube, pod, cwd, ws.targets, 6, {
         paths: ws.submodulePaths,
-        onState: (path, st, progress, message) => tracker.update(path, st, progress, message),
+        checkout,
+        onState: (path, st, progress, message, commit) => tracker.update(path, st, progress, message, commit),
       });
       if (r.ok) {
         await clearSubmoduleFailure(kube, pod);
@@ -799,7 +803,7 @@ export class KubernetesRuntime {
     })().catch(() => undefined);
   }
 
-  private readonly trackers = new Map<string, { tracker: SubmoduleTracker; token: string }>();
+  private readonly trackers = new Map<string, { tracker: SubmoduleTracker; token: string; checkout?: SubmoduleCheckout }>();
 
   private tracker(cwd: string): SubmoduleTracker {
     return this.trackerEntry(cwd).tracker;
@@ -816,10 +820,12 @@ export class KubernetesRuntime {
 
   /** The token of the `submodules` MCP server URL of a workspace directory, and its note for the agent's system prompt (undefined when the git proxy is off or the project has no submodules). */
   async submoduleAccess(cwd: string): Promise<{ token: string; warning: string } | undefined> {
-    if (!(await this.deps.getConfig()).gitProxy.enabled) return undefined;
+    const config = await this.deps.getConfig();
+    if (!config.gitProxy.enabled) return undefined;
     const paths = await this.provisionalSubmodules(cwd);
     if (paths.length === 0) return undefined;
-    return { token: this.trackerEntry(cwd).token, warning: submoduleWarning(paths) };
+    const entry = this.trackerEntry(cwd);
+    return { token: entry.token, warning: submoduleWarning(paths, entry.checkout ?? config.gitProxy.submoduleCheckout) };
   }
 
   /** The tracker behind an MCP URL token. */
@@ -999,6 +1005,8 @@ export class KubernetesRuntime {
       await this.seedIfEmpty(kube, ws, pod, ctx);
       await this.seedProfileDirs(kube, ws, pod, ctx);
       await this.refreshTargets(kube, ws, pod);
+      ws.submoduleCheckout = config.gitProxy.submoduleCheckout;
+      this.trackerEntry(cwd).checkout = ws.submoduleCheckout;
       this.startSubmodules(kube, ws, pod);
       // the submodules are provisioned from the daemon alongside the checkout: give them a moment before the agent starts
       const waitMs = settings.gitProxy.provisionWaitSeconds * 1000;

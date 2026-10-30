@@ -69,6 +69,15 @@ describe("profile nodeSelector", () => {
     expect(applyProfile(config, "builder").nodeSelector).toEqual({ pool: "agents", "karpenter.sh/capacity-type": "on-demand" });
     expect(applyProfile(config, undefined).nodeSelector["karpenter.sh/capacity-type"]).toBe("spot");
   });
+
+  it("a profile can check submodules out at their remote tip; the default stays the gitlink", async () => {
+    const { applyProfile } = await import("../shared/settings.js");
+    const config = ConfigSchema.parse({ profiles: { worker: { submoduleCheckout: "remote" }, plain: {} } });
+    expect(config.gitProxy.submoduleCheckout).toBe("pinned");
+    expect(applyProfile(config, "worker").gitProxy).toMatchObject({ submoduleCheckout: "remote", enabled: true, provisionWaitSeconds: 30 });
+    expect(applyProfile(config, "plain").gitProxy.submoduleCheckout).toBe("pinned");
+    expect(ConfigSchema.parse({ gitProxy: { submoduleCheckout: "remote" } }).gitProxy.submoduleCheckout).toBe("remote");
+  });
 });
 
 describe("profile memory request above the global limit (prbr-picky, 2026-10-29)", () => {

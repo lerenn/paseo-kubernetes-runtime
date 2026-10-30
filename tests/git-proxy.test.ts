@@ -16,7 +16,7 @@ const sh = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, 
 describe("gitProxy setting", () => {
   it("is on by default for the three orgs, with a submodule wait", () => {
     const c = ConfigSchema.parse({});
-    expect(c.gitProxy).toEqual({ enabled: true, allowOrgs: ["anyshift-io", "anyshift-engineering", "lerenn"], provisionWaitSeconds: 30 });
+    expect(c.gitProxy).toEqual({ enabled: true, allowOrgs: ["anyshift-io", "anyshift-engineering", "lerenn"], provisionWaitSeconds: 30, submoduleCheckout: "pinned" });
   });
 });
 
@@ -70,8 +70,8 @@ describe("submodule tracking", () => {
     const sha = "a".repeat(40);
     expect(parseSubmoduleStatus(`-${sha} infra/tf-aws\n ${sha} misc/x (heads/main)\n+${sha} y (v1)\n`)).toEqual([
       { path: "infra/tf-aws", checkedOut: false },
-      { path: "misc/x", checkedOut: true },
-      { path: "y", checkedOut: true },
+      { path: "misc/x", checkedOut: true, sha },
+      { path: "y", checkedOut: true, sha },
     ]);
     expect(gitmodulesPaths("submodule.a.path  infra/tf-aws\nsubmodule.b.path misc/x")).toEqual(["infra/tf-aws", "misc/x"]);
   });
@@ -114,6 +114,19 @@ describe("submodule tracking", () => {
     expect(w).toContain("submodule_status");
     expect(w).toContain("submodule_wait");
     expect(w).toContain("- infra/tf-aws");
+    // the commit it is at is said, so an agent does not take a stale gitlink for the submodule's main
+    expect(w).toMatch(/gitlink.*far behind the submodule's own main/);
+    expect(w).toContain("git -C <path> fetch origin && git -C <path> checkout --detach origin/HEAD");
+    expect(submoduleWarning(["infra/tf-aws"], "remote")).toMatch(/tip of its remote default branch/);
+  });
+
+  it("keeps the commit a ready submodule is at across a reset", () => {
+    const tracker = new SubmoduleTracker();
+    tracker.reset([{ path: "a", checkedOut: false }]);
+    tracker.update("a", "ready", 1, undefined, { sha: "b".repeat(40), pinned: "c".repeat(40), at: "remote" });
+    expect(tracker.report().submodules[0]).toMatchObject({ sha: "b".repeat(40), pinned: "c".repeat(40), at: "remote" });
+    tracker.reset([{ path: "a", checkedOut: true, sha: "b".repeat(40) }]);
+    expect(tracker.report().submodules[0]).toMatchObject({ state: "ready", sha: "b".repeat(40), at: "remote" });
   });
 });
 
