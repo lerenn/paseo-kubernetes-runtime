@@ -633,6 +633,8 @@ export class KubernetesRuntime {
     }
     ws ??= this.newState(request.workspaceId, given);
     if (cwd) ws.cwdFixed = true;
+    // options for another directory are the caller's, inherited at every call: its profile, labels and name are not this workspace's
+    if (ws.cwdFixed && given.cwd !== ws.options.cwd) return ws;
     ws.options = ws.cwdFixed ? { ...given, cwd: ws.options.cwd, slug: ws.options.slug, ref: ws.options.ref, title: ws.options.title ?? given.title } : given;
     return ws;
   }
@@ -2150,8 +2152,10 @@ export class KubernetesRuntime {
         ws.options = { ...ws.options, cwd: listed.cwd };
         ws.cwdFixed = true;
       } else {
-        const options = parseRuntimeOptions({ ...(listed.options ?? {}), cwd: listed.cwd });
-        this.newState(listed.workspaceId, { ...options, cwd: listed.cwd }).cwdFixed = true;
+        // options for another directory were inherited from the workspace's creator (see `workspace`)
+        const own = listed.options && (listed.options as { cwd?: unknown }).cwd === listed.cwd;
+        const options = own ? parseRuntimeOptions({ ...listed.options, cwd: listed.cwd }) : { cwd: listed.cwd, slug: slugFor(listed.cwd), ref: null };
+        this.newState(listed.workspaceId, options).cwdFixed = true;
       }
     }
     if (!this.deps.daemonId) return;
