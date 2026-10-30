@@ -40,7 +40,7 @@ function setup(settings: object, git?: (args: string[], o?: { cwd?: string }) =>
   const prepare = (cwd: string, profile?: string) =>
     runtime.registration().prepare!({ workspaceId: "wks_1", options: { cwd, slug: "ws", ref: null, ...(profile ? { profile } : {}) }, purpose: "session", argv: ["claude"], env: { PASEO_AGENT_ID: "a1" } } as never, ctx);
   const image = () => JSON.stringify(kube.applied);
-  return { prepare, image, logs };
+  return { runtime, ctx, prepare, image, logs };
 }
 
 const settings = { profiles: { builder: { image: "builder:1" }, other: { image: "other:1" } }, projectProfiles: { [PROJECT]: "builder" } };
@@ -78,6 +78,39 @@ describe("projectProfiles", () => {
     const t = setup(settings);
     await t.prepare(WORKTREE);
     expect(t.image()).toContain("default:1");
+  });
+
+  it("does not take the profile of a caller's options that a worktree workspace inherited, on any call", async () => {
+    const git = async (args: string[], o?: { cwd?: string }) =>
+      args.includes("--git-common-dir") && o?.cwd === WORKTREE ? { code: 0, stdout: `${PROJECT}/.git\n`, stderr: "" } : { code: 1, stdout: "", stderr: "" };
+    const t = setup(settings, git);
+    const reg = t.runtime.registration();
+    const inherited = { cwd: "/home/paseo/src/github.com/anyshift-io/lab", slug: "caller", ref: null, title: "Caller", profile: "other" };
+    await reg.create!({ workspaceId: "wks_1", options: inherited, cwd: WORKTREE } as never, t.ctx);
+    await reg.prepare!({ workspaceId: "wks_1", options: inherited, workspaceCwd: WORKTREE, purpose: "session", argv: ["claude"], env: { PASEO_AGENT_ID: "a1" } } as never, t.ctx);
+    expect(t.image()).toContain("builder:1");
+    expect(t.image()).not.toContain("other:1");
+  });
+
+  it("does not take an inherited profile after a reconcile either", async () => {
+    const git = async (args: string[], o?: { cwd?: string }) =>
+      args.includes("--git-common-dir") && o?.cwd === WORKTREE ? { code: 0, stdout: `${PROJECT}/.git\n`, stderr: "" } : { code: 1, stdout: "", stderr: "" };
+    const t = setup(settings, git);
+    const reg = t.runtime.registration();
+    const inherited = { cwd: "/home/paseo/src/github.com/anyshift-io/lab", slug: "caller", ref: null, profile: "other" };
+    await reg.reconcile!({ workspaces: [{ workspaceId: "wks_1", options: inherited, cwd: WORKTREE }] } as never, t.ctx);
+    await reg.prepare!({ workspaceId: "wks_1", options: inherited, workspaceCwd: WORKTREE, purpose: "session", argv: ["claude"], env: { PASEO_AGENT_ID: "a1" } } as never, t.ctx);
+    expect(t.image()).toContain("builder:1");
+    expect(t.image()).not.toContain("other:1");
+  });
+
+  it("keeps the workspace's own explicit profile on later calls", async () => {
+    const t = setup(settings);
+    const reg = t.runtime.registration();
+    const own = { cwd: PROJECT, slug: "ws", ref: null, profile: "other" };
+    await reg.create!({ workspaceId: "wks_1", options: own, cwd: PROJECT } as never, t.ctx);
+    await reg.prepare!({ workspaceId: "wks_1", options: own, workspaceCwd: PROJECT, purpose: "session", argv: ["claude"], env: { PASEO_AGENT_ID: "a1" } } as never, t.ctx);
+    expect(t.image()).toContain("other:1");
   });
 
   it("falls back to no profile, with a log line, when the listed profile is not defined", async () => {
