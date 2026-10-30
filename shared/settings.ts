@@ -43,7 +43,12 @@ export const ExtraSecretSchema = z.object({
   optional: z.boolean().default(true),
 });
 
+export const SubmoduleCheckoutSchema = z.enum(["pinned", "remote"]);
+export type SubmoduleCheckout = z.infer<typeof SubmoduleCheckoutSchema>;
+
 export const ProfileSchema = z.object({
+  /** Overrides `gitProxy.submoduleCheckout` for workspaces of this profile (for example `remote` for Factory workers that read current code). */
+  submoduleCheckout: SubmoduleCheckoutSchema.optional(),
   /** The workspace gets a per-workspace Docker sandbox (see `docker` in the settings): a privileged dind pod on its own node. */
   docker: z.union([z.boolean(), z.enum(["sandbox", "sidecar"])]).optional(),
   /** Secret keys exposed as environment variables on pods of this profile only (e.g. OPENAI_API_KEY for a codex profile). */
@@ -155,6 +160,12 @@ export const GitProxySchema = z.object({
   allowOrgs: z.array(z.string().regex(/^[A-Za-z0-9_.-]+$/, "A GitHub org or user name")).default(["anyshift-io", "anyshift-engineering", "lerenn"]),
   /** The agent's start waits at most this long for the submodules to be checked out; they keep going in the background after it. 0 = never wait. */
   provisionWaitSeconds: z.number().int().min(0).max(600).default(30),
+  /**
+   * Which commit a new workspace's submodules are checked out at. `pinned`: the gitlink the seeded commit records, as
+   * `git submodule update` does (it can be weeks behind the submodule's own main in a superproject that bumps them rarely).
+   * `remote`: the tip of the submodule's remote default branch (or the `branch` `.gitmodules` names), fetched at provisioning.
+   */
+  submoduleCheckout: SubmoduleCheckoutSchema.default("pinned"),
 });
 
 export const ConfigSchema = z.object({
@@ -386,6 +397,7 @@ export function applyProfile(config: KubernetesRuntimeConfig, profile: string | 
     ...(p.extraSecrets ? { extraSecrets: p.extraSecrets } : {}),
     ...(p.nodeSelector ? { nodeSelector: { ...config.nodeSelector, ...p.nodeSelector } } : {}),
     ...(p.resources ? { resources: fitMemoryLimit({ ...config.resources, ...p.resources }) } : {}),
+    ...(p.submoduleCheckout ? { gitProxy: { ...config.gitProxy, submoduleCheckout: p.submoduleCheckout } } : {}),
     storage: { ...config.storage, ...(p.storage?.size ? { size: p.storage.size } : {}), ...(p.storage?.storageClassName ? { storageClassName: p.storage.storageClassName } : {}) },
   };
 }

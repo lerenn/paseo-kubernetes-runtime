@@ -6,7 +6,16 @@ export interface SubmoduleStatus {
   /** 0 to 1: pending 0, fetching 0.1 to 0.7 (the daemon relays the history), checking out 0.7 to 1. */
   progress: number;
   message?: string;
+  /** The commit checked out (once ready), so an agent can quote the code it read. */
+  sha?: string;
+  /** The gitlink the project records for it, when the checkout moved to the remote tip. */
+  pinned?: string;
+  /** `pinned`: at the project's gitlink; `remote`: at the tip of the submodule's remote branch, fetched at provisioning. */
+  at?: "pinned" | "remote";
 }
+
+/** What a ready submodule is checked out at. */
+export type SubmoduleCommit = Pick<SubmoduleStatus, "sha" | "pinned" | "at">;
 
 export interface SubmoduleReport {
   submodules: (SubmoduleStatus & { etaSeconds?: number })[];
@@ -16,12 +25,15 @@ export interface SubmoduleReport {
   provisional?: boolean;
 }
 
-/** `git submodule status` lines: `-<sha> path` (not checked out), ` <sha> path (desc)`, `+<sha> path (desc)`. */
-export function parseSubmoduleStatus(text: string): { path: string; checkedOut: boolean }[] {
-  const out: { path: string; checkedOut: boolean }[] = [];
+/**
+ * `git submodule status` lines: `-<sha> path` (not checked out), ` <sha> path (desc)`, `+<sha> path (desc)`. The sha of a
+ * checked-out one is its HEAD (`+`: not the gitlink).
+ */
+export function parseSubmoduleStatus(text: string): { path: string; checkedOut: boolean; sha?: string }[] {
+  const out: { path: string; checkedOut: boolean; sha?: string }[] = [];
   for (const line of text.split("\n")) {
-    const m = /^([-+U ])[0-9a-f]{40}\s+(\S+?)(?:\s+\(.*\))?$/.exec(line);
-    if (m) out.push({ path: m[2]!, checkedOut: m[1] !== "-" });
+    const m = /^([-+U ])([0-9a-f]{40})\s+(\S+?)(?:\s+\(.*\))?$/.exec(line);
+    if (m) out.push(m[1] === "-" ? { path: m[3]!, checkedOut: false } : { path: m[3]!, checkedOut: true, sha: m[2]! });
   }
   return out;
 }
@@ -41,11 +53,12 @@ export class SubmoduleTracker {
   constructor(private readonly now: () => number = Date.now) {}
 
   /** Sets the list: what is checked out is ready, the rest pending. Keeps the progress of paths it already knows. */
-  reset(items: readonly { path: string; checkedOut: boolean }[]): void {
+  reset(items: readonly { path: string; checkedOut: boolean; sha?: string }[]): void {
     const next = new Map<string, SubmoduleStatus>();
-    for (const { path, checkedOut } of items) {
+    for (const { path, checkedOut, sha } of items) {
       const old = this.entries.get(path);
-      next.set(path, checkedOut ? { path, state: "ready", progress: 1 } : old && old.state !== "ready" ? old : { path, state: "pending", progress: 0 });
+      const ready = (): SubmoduleStatus => ({ ...(old?.state === "ready" ? old : {}), path, state: "ready", progress: 1, ...(sha ? { sha } : {}) });
+      next.set(path, checkedOut ? ready() : old && old.state !== "ready" ? old : { path, state: "pending", progress: 0 });
     }
     this.entries = next;
     this.known = true;
@@ -53,8 +66,8 @@ export class SubmoduleTracker {
     this.notify();
   }
 
-  update(path: string, state: SubmoduleState, progress: number, message?: string): void {
-    this.entries.set(path, { path, state, progress, ...(message ? { message } : {}) });
+  update(path: string, state: SubmoduleState, progress: number, message?: string, commit: SubmoduleCommit = {}): void {
+    this.entries.set(path, { path, state, progress, ...(message ? { message } : {}), ...commit });
     this.notify();
   }
 
@@ -152,11 +165,14 @@ export function gitmodulesPaths(config: string): string[] {
 }
 
 /** The note added to an agent's system prompt in a pod workspace whose project has submodules. */
-export function submoduleWarning(paths: readonly string[]): string {
+export function submoduleWarning(paths: readonly string[], checkout: "pinned" | "remote" = "pinned"): string {
   const list = paths.slice(0, 20).map((p) => `- ${p}`).join("\n") + (paths.length > 20 ? `\n- ... and ${paths.length - 20} more` : "");
   return [
     "This workspace runs in a pod. Its git submodules are provisioned by the daemon in the background and may still be fetching when you start, so an empty submodule directory does not mean the submodule is empty or missing.",
     "Before you read a submodule, call the `submodule_status` tool (MCP server `submodules`); if it is not ready, call `submodule_wait` with its path. Do not fall back to the GitHub API or clone it yourself.",
+    checkout === "remote"
+      ? "Each submodule is checked out at the tip of its remote default branch as fetched when the workspace was provisioned (`submodule_status` gives its `sha` and the `pinned` gitlink); run `git -C <path> fetch origin && git -C <path> checkout --detach origin/HEAD` to catch up later, and quote the sha you read (`git -C <path> rev-parse HEAD`) in your findings."
+      : "Each submodule is checked out at the commit this project records for it (its gitlink, `sha` in `submodule_status`), which can be far behind the submodule's own main. To read its current code, run `git -C <path> fetch origin && git -C <path> checkout --detach origin/HEAD` first, and quote the sha you read (`git -C <path> rev-parse HEAD`) in your findings.",
     "Submodules of this project:",
     list,
   ].join("\n");

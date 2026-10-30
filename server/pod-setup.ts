@@ -7,6 +7,8 @@ import { BRIDGE_SCRIPT, FS_SCRIPT, INSTALLABLE_CLIS, GIT_REMOTE_HELPER, MIRROR_P
 import { MIRROR_SETUP_SCRIPT, mirrorSetupArgs, type FetchTarget } from "./mirrors.js";
 import type { Kube } from "./kube.js";
 import type { Seed } from "./seed.js";
+import type { SubmoduleCheckout } from "../shared/settings.js";
+import type { SubmoduleCommit } from "./submodule-status.js";
 import { parseSubmoduleStatus } from "./submodule-status.js";
 
 const write = async (kube: Kube, pod: string, rel: string, content: string, mode: string) => {
@@ -55,7 +57,9 @@ export async function setupMirrors(kube: Kube, pod: string, cwd: string, identit
 export interface SubmoduleProgress {
   /** Submodule path and the fetch target (mirror id) its remote is served by; known when the daemon read `.gitmodules` at the seeded commit. */
   paths?: readonly { path: string; targetId: string }[];
-  onState?: (path: string, state: "pending" | "fetching" | "ready" | "failed", progress: number, message?: string) => void;
+  onState?: (path: string, state: "pending" | "fetching" | "ready" | "failed", progress: number, message?: string, commit?: SubmoduleCommit) => void;
+  /** `remote`: move each checked-out submodule to the tip of its remote branch (see `gitProxy.submoduleCheckout`). Default `pinned`. */
+  checkout?: SubmoduleCheckout;
   /** Tries per submodule before it is reported failed (default 3). */
   attempts?: number;
   /** A pod command that has not answered in this long is given up on (default 10 min). */
@@ -77,7 +81,38 @@ const withTimeout = <T>(promise: Promise<T>, ms: number, what: string): Promise<
 const BOUNDED_UPDATE = 'if command -v timeout >/dev/null 2>&1; then exec timeout -k 5 "$3" git -C "$1" submodule update -- "$2"; else exec git -C "$1" submodule update -- "$2"; fi';
 
 /**
- * Checks out the submodules recorded in the seeded commit at their pinned commits. Plain `git submodule update` does the
+ * Run in a checked-out submodule (`$1` the checkout, `$2` the path, `$3` pinned or remote): with `remote`, fetches it and
+ * moves it, detached, to the branch `.gitmodules` names for it or to its remote's default branch (origin/HEAD, else main or
+ * master). Prints `<gitlink> <HEAD>`; a failed move leaves it at the gitlink and prints the error on stderr, exit 3.
+ */
+export const SUBMODULE_TIP = `cd "$1/$2" || exit 1
+pinned=$(git rev-parse HEAD) || exit 1
+[ "$3" = remote ] || { echo "$pinned $pinned"; exit 0; }
+name=$(git -C "$1" config -f .gitmodules --get-regexp '^submodule\\..*\\.path$' | awk -v p="$2" '$2 == p { sub(/^submodule\\./, "", $1); sub(/\\.path$/, "", $1); print $1; exit }')
+branch=$([ -n "$name" ] && git -C "$1" config -f .gitmodules --get "submodule.$name.branch" 2>/dev/null)
+moved() {
+  git fetch -q origin || return 1
+  if [ -n "$branch" ] && [ "$branch" != . ]; then git checkout -q --detach "origin/$branch" && return 0; return 1; fi
+  git remote set-head origin -a >/dev/null 2>&1
+  for ref in origin/HEAD origin/main origin/master; do
+    git rev-parse -q --verify "$ref^{commit}" >/dev/null && { git checkout -q --detach "$ref"; return; }
+  done
+  echo "no remote default branch" >&2; return 1
+}
+moved || { echo "$pinned $pinned"; exit 3; }
+echo "$pinned $(git rev-parse HEAD)"`;
+
+/** What `SUBMODULE_TIP` printed: the commit the submodule is at, and the gitlink when it moved. */
+export function submoduleCommit(stdout: string, checkout: SubmoduleCheckout): SubmoduleCommit {
+  const [pinned, head] = stdout.trim().split(/\s+/);
+  if (!pinned || !head || !/^[0-9a-f]{40}$/.test(head)) return {};
+  if (checkout !== "remote") return { sha: head, at: "pinned" };
+  return { sha: head, at: "remote", ...(head !== pinned ? { pinned } : {}) };
+}
+
+/**
+ * Checks out the submodules recorded in the seeded commit at their pinned commits (then, with `checkout: "remote"`, at
+ * their remote branch tip). Plain `git submodule update` does the
  * work from the mirrors the bridge filled (the bridge call retries and has a timeout of its own). A submodule that fails is tried again, and one
  * failing does not stop the others.
  */
@@ -95,6 +130,7 @@ export async function initSubmodules(
   const timeoutMs = watch.timeoutMs ?? 10 * 60_000;
   const attempts = watch.attempts ?? 3;
   const sleep = watch.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const checkoutMode = watch.checkout ?? "pinned";
   if (paths.length === 0) {
     // the submodules are not known one by one: fill the mirrors, then update all of them
     const queue = targets.filter((t) => !t.origin);
@@ -108,6 +144,12 @@ export async function initSubmodules(
     await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, worker));
     if (failure) return { ok: false, message: failure };
     const r = await withTimeout(kube.exec(pod, ["git", "-C", cwd, "submodule", "update", "--init", "--jobs", String(concurrency + 2)]), timeoutMs, "git submodule update").catch((e: Error) => ({ code: 1, stdout: "", stderr: e.message }));
+    if (r.code === 0 && checkoutMode === "remote") {
+      // best effort: a submodule that cannot move stays at its gitlink
+      for (const { path } of (await podSubmodules(kube, pod, cwd)) ?? []) {
+        await withTimeout(kube.exec(pod, ["sh", "-c", SUBMODULE_TIP, "sh", cwd, path, "remote"]), timeoutMs, `moving ${path} to its remote tip`).catch(() => undefined);
+      }
+    }
     return { ok: r.code === 0, message: r.code === 0 ? "" : r.stderr.trim() };
   }
   // register every submodule first (it writes .git/config, which parallel updates must not do)
@@ -143,7 +185,11 @@ export async function initSubmodules(
         const r = await withTimeout(kube.exec(pod, ["sh", "-c", BOUNDED_UPDATE, "sh", cwd, path, String(Math.round(timeoutMs / 1000))]), timeoutMs + Math.min(15_000, timeoutMs), `git submodule update ${path}`).catch((e: Error) => ({ code: 1, stdout: "", stderr: e.message }));
         if (r.code === 0) {
           last = "";
-          watch.onState?.(path, "ready", 1);
+          // the commit it is at (and, in remote mode, the move to the remote tip; a failed move keeps the gitlink)
+          const tip = await withTimeout(kube.exec(pod, ["sh", "-c", SUBMODULE_TIP, "sh", cwd, path, checkoutMode]), timeoutMs, `moving ${path} to its remote tip`).catch((e: Error) => ({ code: 3, stdout: "", stderr: e.message }));
+          const commit = submoduleCommit(tip.stdout, checkoutMode);
+          const note = tip.code !== 0 && checkoutMode === "remote" ? `at the pinned commit: could not move to the remote tip: ${tip.stderr.trim().split("\n").slice(-2).join(" ") || "failed"}` : undefined;
+          watch.onState?.(path, "ready", 1, note, tip.code !== 0 && checkoutMode === "remote" ? { ...commit, at: "pinned" } : commit);
           break;
         }
         last = r.stderr.trim().split("\n").slice(-3).join(" ") || `could not check out ${path}`;

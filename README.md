@@ -190,6 +190,7 @@ Everything git in a pod goes through the daemon; the pod never reaches GitHub. S
 | `enabled` | `true` | Turns the scoping, the cache warm-up and the submodule tools below on. Off: the old "Other repositories" behaviour (a whole host). |
 | `allowOrgs` | `anyshift-io`, `anyshift-engineering`, `lerenn` | GitHub orgs whose repositories a pod may clone and fetch. The pod's `url.<paseo://github.com/<org>/>.insteadOf` rules cover `https://github.com/<org>/`, `git@github.com:<org>/` and `ssh://git@github.com/<org>/`; other orgs are not rewritten and not reachable. It narrows `otherRepos` for github.com (which `allow` still narrows further). |
 | `provisionWaitSeconds` | `30` | How long an agent's start waits for the submodules to be checked out; 0 never waits. They keep going in the background after it. |
+| `submoduleCheckout` | `pinned` | Which commit a new workspace's submodules are checked out at. `pinned`: the gitlink the seeded commit records, as `git submodule update` does. `remote`: then fetched and moved (detached) to the tip of the submodule's remote default branch, or the `branch` `.gitmodules` names. A profile can override it (`profiles.<name>.submoduleCheckout`). |
 
 - **On-demand mirrors.** A clone, fetch or submodule update of an allowed repository (a submodule of the project is always
   allowed) is served from the daemon's cache of that repository, made on first use and refreshed with the daemon's
@@ -198,6 +199,13 @@ Everything git in a pod goes through the daemon; the pod never reaches GitHub. S
   while the pod is still being scheduled, so the pod's own fetches only relay data the daemon already has.
 - **Provisioning.** After the checkout is seeded, the submodules at the pinned commits are fetched through the bridge and
   checked out one by one (each is `ready` as soon as it is), and the start of the agent waits for them up to `provisionWaitSeconds`.
+  In a superproject that bumps its gitlinks rarely, the pinned commit can be weeks behind the submodule's main (an
+  investigator read a tf-aws three weeks and 180 PRs old): with `submoduleCheckout: remote` each one is then moved to its
+  remote tip; one that cannot move stays at the gitlink, `ready`, with the reason. Either way `submodule_status` gives the
+  `sha` each is at (`pinned`: the gitlink it left, `at`: `pinned` or `remote`) and the agent's note says which it is and how
+  to catch up (`git -C <path> fetch origin && git -C <path> checkout --detach origin/HEAD`). A moved submodule shows as
+  modified (`+`) in the superproject's `git status`; do not commit that gitlink by accident. Only a fresh checkout is moved:
+  a resumed pod keeps what its agent checked out.
 - **Safety net.** Agents of a pod workspace whose project has submodules get a note in their system prompt listing them and
   telling them to check before reading, and an MCP server `submodules` (loopback, tunnelled like the other MCP servers)
   with `submodule_status` (per path: `pending`/`fetching`/`ready`/`failed`, progress 0 to 1, estimated seconds left) and

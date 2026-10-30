@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { BRIDGE_SCRIPT } from "../server/pod-assets.js";
-import { initSubmodules } from "../server/pod-setup.js";
+import { SUBMODULE_TIP, initSubmodules } from "../server/pod-setup.js";
 import { SubmoduleTracker } from "../server/submodule-status.js";
 
 const servers: Server[] = [];
@@ -97,7 +97,7 @@ describe("pod bridge fetch call", () => {
 });
 
 /** A pod whose commands are scripted by the first word they run. */
-function fakeKube(handler: (argv: string[]) => { code: number; stderr?: string } | Promise<{ code: number; stderr?: string }>) {
+function fakeKube(handler: (argv: string[]) => { code: number; stdout?: string; stderr?: string } | Promise<{ code: number; stdout?: string; stderr?: string }>) {
   const calls: string[][] = [];
   return {
     calls,
@@ -105,7 +105,7 @@ function fakeKube(handler: (argv: string[]) => { code: number; stderr?: string }
       exec: async (_pod: string, argv: string[]) => {
         calls.push(argv);
         const r = await handler(argv);
-        return { code: r.code, stdout: "", stderr: r.stderr ?? "" };
+        return { code: r.code, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
       },
     } as never,
   };
@@ -192,5 +192,100 @@ describe("a wait on a failed submodule", () => {
     tracker.reset([{ path: "a", checkedOut: false }]);
     tracker.update("a", "failed", 0.1, "x");
     await expect(tracker.wait("a", 100)).resolves.toMatchObject({ state: "failed" });
+  });
+});
+
+describe("submodule checkout: pinned or remote tip (ANY-2753 investigator read a three-week-old gitlink)", () => {
+  const paths = [{ path: "infra/tf-aws", targetId: "a" }];
+  const noSleep = async () => undefined;
+  const [pin, tip] = ["1".repeat(40), "2".repeat(40)];
+  const isTip = (argv: string[]) => argv[2] === SUBMODULE_TIP;
+
+  it("pinned (default): stays at the gitlink and reports its sha", async () => {
+    const { kube, calls } = fakeKube((argv) => (isTip(argv) ? { code: 0, stdout: `${pin} ${pin}\n` } : { code: 0 }));
+    const ready: unknown[] = [];
+    await initSubmodules(kube, "pod", "/w", [], 1, { paths, sleep: noSleep, onState: (_p, s, _n, m, c) => s === "ready" && ready.push({ m, c }) });
+    expect(calls.find(isTip)?.slice(-1)).toEqual(["pinned"]);
+    expect(ready).toEqual([{ m: undefined, c: { sha: pin, at: "pinned" } }]);
+  });
+
+  it("remote: reports the tip it moved to and the gitlink it left", async () => {
+    const { kube, calls } = fakeKube((argv) => (isTip(argv) ? { code: 0, stdout: `${pin} ${tip}\n` } : { code: 0 }));
+    const ready: unknown[] = [];
+    await initSubmodules(kube, "pod", "/w", [], 1, { paths, checkout: "remote", sleep: noSleep, onState: (_p, s, _n, m, c) => s === "ready" && ready.push({ m, c }) });
+    expect(calls.find(isTip)?.slice(-3)).toEqual(["/w", "infra/tf-aws", "remote"]);
+    expect(ready).toEqual([{ m: undefined, c: { sha: tip, pinned: pin, at: "remote" } }]);
+  });
+
+  it("remote: a failed move leaves it ready at the gitlink, with the reason", async () => {
+    const { kube } = fakeKube((argv) => (isTip(argv) ? { code: 3, stdout: `${pin} ${pin}\n`, stderr: "fatal: could not read from remote" } : { code: 0 }));
+    const ready: { m?: string; c?: unknown }[] = [];
+    const r = await initSubmodules(kube, "pod", "/w", [], 1, { paths, checkout: "remote", sleep: noSleep, onState: (_p, s, _n, m, c) => s === "ready" && ready.push({ m, c }) });
+    expect(r.ok).toBe(true);
+    expect(ready[0]?.c).toEqual({ sha: pin, at: "pinned" });
+    expect(ready[0]?.m).toMatch(/at the pinned commit: could not move to the remote tip: fatal: could not read from remote/);
+  });
+});
+
+describe("SUBMODULE_TIP in a real checkout", () => {
+  const env = { ...process.env, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "protocol.file.allow", GIT_CONFIG_VALUE_0: "always", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { env, encoding: "utf8" }).trim();
+  const tipScript = (cwd: string, path: string, mode: string) => {
+    try {
+      return { code: 0, out: execFileSync("sh", ["-c", SUBMODULE_TIP, "sh", cwd, path, mode], { env, encoding: "utf8" }).trim() };
+    } catch (e) {
+      return { code: (e as { status: number }).status, out: String((e as { stdout: string }).stdout).trim() };
+    }
+  };
+  /** An upstream with main two commits ahead of what the superproject pins, and a `release` branch. */
+  function setup(branch?: string) {
+    const root = mkdtempSync(join(tmpdir(), "kube-subtip-"));
+    const up = join(root, "up");
+    mkdirSync(up);
+    git(up, "init", "-q", "-b", "main");
+    git(up, "commit", "-q", "--allow-empty", "-m", "one");
+    const pinned = git(up, "rev-parse", "HEAD");
+    git(up, "branch", "release");
+    git(up, "commit", "-q", "--allow-empty", "-m", "two");
+    git(up, "commit", "-q", "--allow-empty", "-m", "three");
+    const main = git(up, "rev-parse", "HEAD");
+    const sup = join(root, "sup");
+    mkdirSync(sup);
+    git(sup, "init", "-q", "-b", "main");
+    git(sup, "submodule", "add", "-q", up, "infra/tf-aws");
+    git(join(sup, "infra/tf-aws"), "checkout", "-q", pinned);
+    if (branch) git(sup, "config", "-f", ".gitmodules", "submodule.infra/tf-aws.branch", branch);
+    git(sup, "add", "-A");
+    git(sup, "commit", "-q", "-m", "pin");
+    const work = join(root, "work");
+    execFileSync("git", ["clone", "-q", sup, work], { env });
+    git(work, "submodule", "update", "-q", "--init");
+    return { work, up, pinned, main, release: git(up, "rev-parse", "release") };
+  }
+
+  it("pinned: prints the gitlink twice and moves nothing", () => {
+    const { work, pinned } = setup();
+    expect(tipScript(work, "infra/tf-aws", "pinned")).toEqual({ code: 0, out: `${pinned} ${pinned}` });
+    expect(git(join(work, "infra/tf-aws"), "rev-parse", "HEAD")).toBe(pinned);
+  });
+
+  it("remote: moves to the remote default branch tip, detached", () => {
+    const { work, pinned, main } = setup();
+    expect(tipScript(work, "infra/tf-aws", "remote")).toEqual({ code: 0, out: `${pinned} ${main}` });
+    const sub = join(work, "infra/tf-aws");
+    expect(git(sub, "rev-parse", "HEAD")).toBe(main);
+    expect(git(sub, "rev-parse", "--abbrev-ref", "HEAD")).toBe("HEAD"); // detached, as git checks submodules out
+  });
+
+  it("remote: follows the branch .gitmodules names", () => {
+    const { work, pinned, release } = setup("release");
+    expect(tipScript(work, "infra/tf-aws", "remote")).toEqual({ code: 0, out: `${pinned} ${release}` });
+  });
+
+  it("remote: a remote that cannot be fetched leaves the gitlink and exits 3", () => {
+    const { work, pinned } = setup();
+    git(join(work, "infra/tf-aws"), "remote", "set-url", "origin", join(tmpdir(), "nowhere-" + Date.now()));
+    expect(tipScript(work, "infra/tf-aws", "remote")).toEqual({ code: 3, out: `${pinned} ${pinned}` });
+    expect(git(join(work, "infra/tf-aws"), "rev-parse", "HEAD")).toBe(pinned);
   });
 });
