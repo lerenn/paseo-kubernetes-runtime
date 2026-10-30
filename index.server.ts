@@ -181,7 +181,8 @@ export default function contribute(server: PluginServerContext) {
   server.handle(kubeReconcile, async () => ({ reaper: await reaper.run() }));
 
 
-  // Other plugins (the Factory's run suspend) suspend and wake a pod through this; removed on stop so a reload leaves no stale closure
+  // Other plugins (the Factory's run suspend) suspend and wake a pod through the workspace-control capability (and, for one
+  // release, the legacy kubernetes-runtime key); removed on stop so a reload leaves no stale closure
   const removePodControl = registerPodControl(runtime);
 
   return async () => {
